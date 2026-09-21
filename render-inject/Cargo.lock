@@ -215,6 +215,7 @@ dependencies = [
  "minhook",
  "render-core",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]

@@ -25,7 +25,7 @@ use render_core::render::{draw_glyphs_onto, draw_text_onto, glyph_run_coverage_l
 use render_core::{tables_for, Aa, Ft, Profile, Tables};
 use windows::core::{s, w, Interface, BOOL, GUID, HRESULT};
 use windows::Win32::Foundation::{HINSTANCE, RECT};
-use windows::Win32::Graphics::Direct2D::{ID2D1GdiInteropRenderTarget, ID2D1RenderTarget, D2D1_DC_INITIALIZE_MODE_COPY};
+use windows::Win32::Graphics::Direct2D::{ID2D1Brush, ID2D1GdiInteropRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_DC_INITIALIZE_MODE_COPY};
 use windows_numerics::Vector2;
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFontFile, DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN, DWRITE_MATRIX,
@@ -497,6 +497,7 @@ static mut ORIG_D2DCF: Option<FnD2DCreateFactory> = None;
 static mut ORIG_DCRT: Option<FnCreateDCRT> = None;
 static mut ORIG_HWNDRT: Option<FnCreateHwndRT> = None;
 static D2D_DGR_ORIG: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None); // rt vtable -> orig DrawGlyphRun
+static D2D_CAPTURED: AtomicBool = AtomicBool::new(false); // log the first D2D substitution once
 
 unsafe fn patch_slot(slot: *mut usize, newv: usize) -> Option<usize> {
     let mut oldp = PAGE_PROTECTION_FLAGS(0);
@@ -547,7 +548,7 @@ unsafe fn patch_rt_dgr(rt: *mut c_void) {
 }
 
 unsafe extern "system" fn d2d_dgr_detour(this: *mut c_void, baseline: Vector2, run: *const DWRITE_GLYPH_RUN, brush: *mut c_void, measuring: i32) {
-    if !run.is_null() && d2d_substitute(this, baseline, &*run).is_some() {
+    if !run.is_null() && d2d_substitute(this, baseline, &*run, brush).is_some() {
         return;
     }
     let vptr = *(this as *const usize); // this's vtable pointer
@@ -558,7 +559,20 @@ unsafe extern "system" fn d2d_dgr_detour(this: *mut c_void, baseline: Vector2, r
     }
 }
 
-unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_RUN) -> Option<()> {
+/// Read the run's ink color from the D2D brush. D2D DrawGlyphRun paints with
+/// the given brush, so mirroring the GDI/DWrite paths means honoring it — a
+/// solid-color brush yields its RGB; anything else falls back to black. Colors
+/// are premultiplied-free sRGB floats in 0..1.
+unsafe fn d2d_brush_ink(brush: *mut c_void) -> Ink {
+    if brush.is_null() { return Ink::default(); }
+    let Some(b) = ID2D1Brush::from_raw_borrowed(&brush) else { return Ink::default() };
+    let Ok(scb) = b.cast::<ID2D1SolidColorBrush>() else { return Ink::default() };
+    let c = scb.GetColor();
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    Ink { fg: [to8(c.r), to8(c.g), to8(c.b)] }
+}
+
+unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_RUN, brush: *mut c_void) -> Option<()> {
     let ft = FT.as_ref()?;
     let tables = TABLES.as_ref()?;
     let profile = PROFILE.as_ref()?;
@@ -601,13 +615,17 @@ unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_
     let _ = BitBlt(memdc, 0, 0, rw, rh, Some(hdc), rx, ry, SRCCOPY);
     let dib = std::slice::from_raw_parts_mut(bits as *mut u8, (rw * rh * 4) as usize);
     let mut canvas = Canvas::from_bgra_topdown(rw as usize, rh as usize, dib);
-    draw_glyphs_onto(&mut canvas, ft, tables, profile, Ink::default(), glyphs, px, (bx - rx, by - ry), None);
+    let ink = d2d_brush_ink(brush);
+    draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, (bx - rx, by - ry), None);
     canvas.blit_to_bgra_topdown(dib);
     let _ = BitBlt(hdc, rx, ry, rw, rh, Some(memdc), 0, 0, SRCCOPY);
     SelectObject(memdc, old);
     let _ = DeleteObject(hbmp.into());
     let _ = DeleteDC(memdc);
     let _ = gi.ReleaseDC(None);
+    if !D2D_CAPTURED.swap(true, Ordering::SeqCst) {
+        log(&format!("substituted D2D DrawGlyphRun via render-core ({} glyphs, {px}px)", glyphs.len()));
+    }
     Some(())
 }
 
