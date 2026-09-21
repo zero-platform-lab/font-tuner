@@ -15,7 +15,9 @@
 param(
   # PowerShell だけ / ドキュメントだけ に絞る
   [switch]$ScriptsOnly,
-  [switch]$DocsOnly
+  [switch]$DocsOnly,
+  # textlint を --fix で走らせる（npm run lint:text:fix から使う）
+  [switch]$Fix
 )
 $ErrorActionPreference = 'Stop'
 $global:PSNativeCommandUseErrorActionPreference = $false
@@ -67,21 +69,31 @@ if (-not $ScriptsOnly) {
     $md = Get-ChildItem -Path $PSScriptRoot -Filter *.md -Recurse -File |
       Where-Object { $_.FullName -notmatch $skip } |
       Where-Object {
-        $t = Get-Content $_.FullName -Raw -Encoding UTF8
+        # 空ファイルでは -Raw が $null を返し、regex が投げる。
+        # $ErrorActionPreference = 'Stop' なのでそこで全体が止まるため、先に '' にする。
+        $t = (Get-Content $_.FullName -Raw -Encoding UTF8) ?? ''
         $kana = ([regex]::Matches($t, '[\p{IsHiragana}\p{IsKatakana}]')).Count
         $body = ($t -replace '\s', '').Length
         $body -gt 0 -and ($kana / $body) -ge 0.05
       }
-    if (-not $md) { Write-Host '  対象の日本語ドキュメントなし'; $md = @() }
-    $out = & $tl --config (Join-Path $PSScriptRoot '.textlintrc.json') -f compact @($md.FullName) 2>&1
-    $rc = $LASTEXITCODE
-    if ($out) { $out | ForEach-Object { "  $_" } }
-    if ($rc -ne 0 -and -not $out) {
-      # 指摘が 1 件も出ていないのに非ゼロ = textlint 自体が動いていない。
-      Write-Warning "  textlint を実行できない (exit $rc)。npm install をやり直す"
-      $fail = 1
-    } elseif ($rc -ne 0) { $fail = 1 }
-    else { Write-Host '  指摘なし' }
+    if (-not $md) {
+      # ファイルを渡さずに起動すると textlint は usage を出して 0 で終わる。
+      # それを指摘なしと報告しないよう、ここで打ち切る。
+      Write-Host '  対象の日本語ドキュメントなし'
+    } else {
+      # $args は自動変数なので使わない
+      $tlArgs = @('--config', (Join-Path $PSScriptRoot '.textlintrc.json'), '-f', 'compact')
+      if ($Fix) { $tlArgs += '--fix' }
+      $out = & $tl @tlArgs @($md.FullName) 2>&1
+      $rc = $LASTEXITCODE
+      if ($out) { $out | ForEach-Object { "  $_" } }
+      if ($rc -ne 0 -and -not $out) {
+        # 指摘が 1 件も出ていないのに非ゼロ = textlint 自体が動いていない。
+        Write-Warning "  textlint を実行できない (exit $rc)。npm install をやり直す"
+        $fail = 1
+      } elseif ($rc -ne 0) { $fail = 1 }
+      else { Write-Host '  指摘なし' }
+    }
   }
 }
 

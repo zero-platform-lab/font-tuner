@@ -2,10 +2,10 @@
   "name": "font-tuner-docs",
   "version": "0.0.0",
   "private": true,
-  "description": "font-tuner の日本語ドキュメント (README/NOTICE/AGENTS) の textlint 設定。配布物ではない",
+  "description": "font-tuner の日本語ドキュメントの textlint 設定。対象の選択は check-lint.ps1 に一本化している。配布物ではない",
   "scripts": {
-    "lint:text": "textlint README.md NOTICE.md AGENTS.md",
-    "lint:text:fix": "textlint --fix README.md NOTICE.md AGENTS.md"
+    "lint:text": "pwsh -NoProfile -File check-lint.ps1 -DocsOnly",
+    "lint:text:fix": "pwsh -NoProfile -File check-lint.ps1 -DocsOnly -Fix"
   },
   "devDependencies": {
     "textlint": "^15.8.0",
