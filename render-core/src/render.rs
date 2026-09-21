@@ -1,6 +1,22 @@
 //! Compositing: lay out a string and blend each glyph's coverage into an RGB
 //! canvas with the profile's tables. Greyscale and LCD paths mirror
 //! `FreeTypeDrawBitmapGray` / `FreeTypeDrawBitmapPixelModeLCD` (ft.cpp).
+//!
+//! The `as` casts here are pixel coordinates and buffer indices, each
+//! bounds-checked before use (`in_bounds`, or an explicit `0 <= v < limit`),
+//! and image dimensions that fit u32; hence the scoped cast allows.
+//!
+//! `too_many_arguments` and `many_single_char_names` are allowed too: the
+//! public render entry points take the font, tables, profile, ink, background,
+//! text, size, pen and dx as distinct parameters, and the compositing loops
+//! use the graphics-conventional `x/y/w/h/l/t/r/b` names.
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments,
+    clippy::many_single_char_names
+)]
 
 use crate::config::Profile;
 use crate::filter::Tables;
@@ -21,8 +37,9 @@ impl Canvas {
     /// A canvas filled with a solid background colour.
     pub fn filled(w: usize, h: usize, bg: [u8; 3]) -> Canvas {
         let mut rgb = vec![0u8; w * h * 3];
-        for px in rgb.chunks_exact_mut(3) {
-            px.copy_from_slice(&bg);
+        let (chunks, _) = rgb.as_chunks_mut::<3>();
+        for px in chunks {
+            *px = bg;
         }
         Canvas { w, h, rgb, clip: None }
     }
@@ -83,12 +100,9 @@ impl Canvas {
 /// Text colour, black by default. Only the greyscale/LCD-black case is fully
 /// exercised by the verification; arbitrary colours use the same per-channel
 /// blend.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Ink {
     pub fg: [u8; 3],
-}
-impl Default for Ink {
-    fn default() -> Ink { Ink { fg: [0, 0, 0] } }
 }
 
 /// Render `text` at `px` pixels onto a fresh `bg`-filled canvas using `profile`.
@@ -119,7 +133,7 @@ pub fn draw_text_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: &P
     let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
     for (i, ch) in text.chars().enumerate() {
         if let Some(g) = ft.render(ch, px, profile) {
-            blit_glyph(canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
+            blit_glyph(canvas, &Blit { tables, ink, pen_x, base_y, lcd, bgr }, &g);
             pen_x += advance_of(dx, i, g.advance_px);
         }
     }
@@ -133,7 +147,7 @@ pub fn draw_glyphs_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: 
     let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
     for (i, &gi) in glyphs.iter().enumerate() {
         if let Some(g) = ft.render_glyph(gi, px, profile) {
-            blit_glyph(canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
+            blit_glyph(canvas, &Blit { tables, ink, pen_x, base_y, lcd, bgr }, &g);
             pen_x += advance_of(dx, i, g.advance_px);
         }
     }
@@ -179,57 +193,76 @@ pub fn glyph_run_coverage_lcd(ft: &Ft, profile: &Profile, glyphs: &[u16], px: i3
     cov
 }
 
+/// Where and how to composite a glyph: the profile's tables, the ink, the pen
+/// baseline, and the LCD subpixel choice. Bundled so the blit helpers take one
+/// context instead of eight positional arguments.
+struct Blit<'a> {
+    tables: &'a Tables,
+    ink: Ink,
+    pen_x: i32,
+    base_y: i32,
+    lcd: bool,
+    bgr: bool,
+}
+
 /// Blit one rendered glyph onto the canvas at the pen position.
-fn blit_glyph(canvas: &mut Canvas, tables: &Tables, ink: Ink, g: &ft::Glyph,
-              pen_x: i32, base_y: i32, lcd: bool, bgr: bool) {
-    if g.rows == 0 || g.buffer.is_empty() {
+fn blit_glyph(canvas: &mut Canvas, blit: &Blit, glyph: &ft::Glyph) {
+    if glyph.rows == 0 || glyph.buffer.is_empty() {
         return;
     }
-    if lcd && g.pixel_mode == PIXEL_MODE_LCD {
-        blend_lcd(canvas, tables, ink, g, pen_x, base_y, bgr);
-    } else if !lcd && g.pixel_mode == PIXEL_MODE_GRAY {
-        blend_gray(canvas, tables, ink, g, pen_x, base_y);
+    if blit.lcd && glyph.pixel_mode == PIXEL_MODE_LCD {
+        blend_lcd(canvas, blit, glyph);
+    } else if !blit.lcd && glyph.pixel_mode == PIXEL_MODE_GRAY {
+        blend_gray(canvas, blit, glyph);
     }
 }
 
-fn blend_gray(c: &mut Canvas, t: &Tables, ink: Ink, g: &ft::Glyph, pen_x: i32, base_y: i32) {
-    for row in 0..g.rows {
-        for col in 0..g.width {
-            let cov = g.buffer[(row * g.pitch + col) as usize];
-            if cov == 0 { continue; }
-            let x = pen_x + g.left + col;
-            let y = base_y - g.top + row;
-            if !c.in_bounds(x, y) { continue; }
-            let idx = (y as usize * c.w + x as usize) * 3;
+fn blend_gray(canvas: &mut Canvas, blit: &Blit, glyph: &ft::Glyph) {
+    for row in 0..glyph.rows {
+        for col in 0..glyph.width {
+            let cov = glyph.buffer[(row * glyph.pitch + col) as usize];
+            if cov == 0 {
+                continue;
+            }
+            let x = blit.pen_x + glyph.left + col;
+            let y = blit.base_y - glyph.top + row;
+            if !canvas.in_bounds(x, y) {
+                continue;
+            }
+            let idx = (y as usize * canvas.w + x as usize) * 3;
             for k in 0..3 {
-                c.rgb[idx + k] = t.blend(c.rgb[idx + k], ink.fg[k], cov);
+                canvas.rgb[idx + k] = blit.tables.blend(canvas.rgb[idx + k], blit.ink.fg[k], cov);
             }
         }
     }
 }
 
-fn blend_lcd(c: &mut Canvas, t: &Tables, ink: Ink, g: &ft::Glyph, pen_x: i32, base_y: i32, bgr: bool) {
-    let cells = g.width / 3;
-    for row in 0..g.rows {
-        let base = (row * g.pitch) as usize;
+fn blend_lcd(canvas: &mut Canvas, blit: &Blit, glyph: &ft::Glyph) {
+    let cells = glyph.width / 3;
+    for row in 0..glyph.rows {
+        let base = (row * glyph.pitch) as usize;
         for cell in 0..cells {
             let i = base + (cell * 3) as usize;
             // ft.cpp FreeTypeDrawBitmapPixelModeLCD: assign local alphaR/G/B by
             // subpixel order, then doAB(bg, alphaB, alphaG, alphaR) maps
             // arg1->R, arg2->G, arg3->B.
-            let (a_r, a_g, a_b) = if bgr {
-                (g.buffer[i + 2], g.buffer[i + 1], g.buffer[i])
+            let (a_r, a_g, a_b) = if blit.bgr {
+                (glyph.buffer[i + 2], glyph.buffer[i + 1], glyph.buffer[i])
             } else {
-                (g.buffer[i], g.buffer[i + 1], g.buffer[i + 2])
+                (glyph.buffer[i], glyph.buffer[i + 1], glyph.buffer[i + 2])
             };
-            if a_r == 0 && a_g == 0 && a_b == 0 { continue; }
-            let x = pen_x + g.left + cell;
-            let y = base_y - g.top + row;
-            if !c.in_bounds(x, y) { continue; }
-            let idx = (y as usize * c.w + x as usize) * 3;
-            c.rgb[idx]     = t.blend(c.rgb[idx],     ink.fg[0], a_b); // R
-            c.rgb[idx + 1] = t.blend(c.rgb[idx + 1], ink.fg[1], a_g); // G
-            c.rgb[idx + 2] = t.blend(c.rgb[idx + 2], ink.fg[2], a_r); // B
+            if a_r == 0 && a_g == 0 && a_b == 0 {
+                continue;
+            }
+            let x = blit.pen_x + glyph.left + cell;
+            let y = blit.base_y - glyph.top + row;
+            if !canvas.in_bounds(x, y) {
+                continue;
+            }
+            let idx = (y as usize * canvas.w + x as usize) * 3;
+            canvas.rgb[idx] = blit.tables.blend(canvas.rgb[idx], blit.ink.fg[0], a_b); // R
+            canvas.rgb[idx + 1] = blit.tables.blend(canvas.rgb[idx + 1], blit.ink.fg[1], a_g); // G
+            canvas.rgb[idx + 2] = blit.tables.blend(canvas.rgb[idx + 2], blit.ink.fg[2], a_r); // B
         }
     }
 }

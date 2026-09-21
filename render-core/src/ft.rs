@@ -9,17 +9,28 @@
 //! (`vendor/freetype/include/freetype/{freetype,ftimage}.h`). Note that
 //! `FT_Long` / `FT_Pos` / `FT_Fixed` are C `long`, i.e. **32-bit on Windows
 //! x64** — hence `c_long`, never `i64`.
+//!
+//! The `FT_*` type names mirror the C ABI, and the numeric `as` casts here sit
+//! at the FFI boundary (Rust ints ↔ C `long`/`uint`); the layout tests and the
+//! render tests guard them. Hence the scoped allows.
+#![allow(
+    non_camel_case_types,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
 
 use std::cell::{Cell, UnsafeCell};
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_long, c_short, c_uchar, c_uint, c_ulong, c_ushort, c_void};
+use std::os::raw::{c_long, c_uint, c_ulong};
 
 use crate::config::{Aa, Profile};
 
 // ---- FreeType ABI ---------------------------------------------------------
 
 mod sys {
-    use super::*;
+    use std::os::raw::{c_char, c_int, c_long, c_short, c_uchar, c_uint, c_ulong, c_ushort, c_void};
 
     pub type FT_Library = *mut c_void;
     pub type FT_Face = *mut FT_FaceRec;
@@ -148,7 +159,11 @@ mod sys {
     }
 }
 
-use sys::*;
+use sys::{
+    FT_Done_Face, FT_Done_FreeType, FT_Face, FT_Get_Char_Index, FT_Init_FreeType, FT_Library, FT_Library_SetLcdFilter,
+    FT_Load_Glyph, FT_New_Face, FT_New_Memory_Face, FT_Outline_EmboldenXY, FT_Render_Glyph, FT_Select_Charmap,
+    FT_Set_Pixel_Sizes, FT_ENCODING_UNICODE, FT_GLYPH_FORMAT_OUTLINE,
+};
 
 // FreeType constants (stable public ABI).
 const FT_LOAD_NO_HINTING: i32 = 0x2;
@@ -191,12 +206,15 @@ impl Ft {
     /// Initialise FreeType and open a face from a font file.
     pub fn open(path: &str, face_index: i64) -> Result<Ft, i32> {
         let mut lib: FT_Library = std::ptr::null_mut();
-        let r = unsafe { FT_Init_FreeType(&mut lib) };
+        // SAFETY: `lib` is an out-param FreeType fills; checked before use.
+        let r = unsafe { FT_Init_FreeType(&raw mut lib) };
         if r != 0 { return Err(r); }
         let ft = Ft { lib, face: Cell::new(std::ptr::null_mut()), membuf: UnsafeCell::new(Vec::new()) };
         let c = CString::new(path).map_err(|_| -1)?;
         let mut face: FT_Face = std::ptr::null_mut();
-        let r = unsafe { FT_New_Face(lib, c.as_ptr(), face_index as c_long, &mut face) };
+        // SAFETY: `lib` is live, `c` is a NUL-terminated path, `face` is an
+        // out-param; a non-zero return means `face` was not set.
+        let r = unsafe { FT_New_Face(lib, c.as_ptr(), face_index as c_long, &raw mut face) };
         if r != 0 { return Err(r); }
         ft.adopt(face);
         Ok(ft)
@@ -206,6 +224,7 @@ impl Ft {
     fn adopt(&self, face: FT_Face) {
         self.drop_face();
         if !face.is_null() {
+            // SAFETY: `face` is a live FT_Face we just took ownership of.
             unsafe { FT_Select_Charmap(face, FT_ENCODING_UNICODE); }
         }
         self.face.set(face);
@@ -214,6 +233,7 @@ impl Ft {
     fn drop_face(&self) {
         let f = self.face.replace(std::ptr::null_mut());
         if !f.is_null() {
+            // SAFETY: `f` is the face we owned; nothing references it now.
             unsafe { FT_Done_Face(f); }
         }
     }
@@ -239,21 +259,32 @@ impl Ft {
         if !want_family.is_empty() {
             // Probe face -1 for the face count, then open each to compare names.
             let mut probe: FT_Face = std::ptr::null_mut();
-            let perr = unsafe { FT_New_Memory_Face(self.lib, base, len, -1, &mut probe) };
+            // SAFETY: `base`/`len` describe the staged bytes, live for this
+            // call; face index -1 asks FreeType for the face count.
+            let perr = unsafe { FT_New_Memory_Face(self.lib, base, len, -1, &raw mut probe) };
+            // SAFETY: `probe` is live iff the call returned 0.
             let n = if perr == 0 { unsafe { (*probe).num_faces } } else { 1 };
-            if perr == 0 { unsafe { FT_Done_Face(probe); } }
+            if perr == 0 {
+                // SAFETY: closing the probe face we opened.
+                unsafe { FT_Done_Face(probe); }
+            }
             for i in 0..n {
                 let mut f: FT_Face = std::ptr::null_mut();
-                if unsafe { FT_New_Memory_Face(self.lib, base, len, i, &mut f) } != 0 { continue; }
+                // SAFETY: as for the probe; `f` is set only on a 0 return.
+                if unsafe { FT_New_Memory_Face(self.lib, base, len, i, &raw mut f) } != 0 { continue; }
+                // SAFETY: `f` is a live face; `family_name` may be null.
                 let name = unsafe { (*f).family_name };
                 let matched = !name.is_null()
+                    // SAFETY: `name` is non-null and NUL-terminated per FreeType.
                     && unsafe { CStr::from_ptr(name) }.to_bytes().eq_ignore_ascii_case(want_family.as_bytes());
+                // SAFETY: closing the face we opened for the name compare.
                 unsafe { FT_Done_Face(f); }
                 if matched { chosen = i; break; }
             }
         }
         let mut face: FT_Face = std::ptr::null_mut();
-        let r = unsafe { FT_New_Memory_Face(self.lib, base, len, chosen, &mut face) };
+        // SAFETY: `base`/`len` are the staged bytes; `face` is an out-param.
+        let r = unsafe { FT_New_Memory_Face(self.lib, base, len, chosen, &raw mut face) };
         if r != 0 { return Err(r); }
         self.adopt(face);
         Ok(())
@@ -264,7 +295,8 @@ impl Ft {
     pub fn reface_memory_index(&self, data: &[u8], index: i64) -> Result<(), i32> {
         let (base, len) = self.stage_memory(data);
         let mut face: FT_Face = std::ptr::null_mut();
-        let r = unsafe { FT_New_Memory_Face(self.lib, base, len, index as c_long, &mut face) };
+        // SAFETY: `base`/`len` are the staged bytes; `face` is an out-param.
+        let r = unsafe { FT_New_Memory_Face(self.lib, base, len, index as c_long, &raw mut face) };
         if r != 0 { return Err(r); }
         self.adopt(face);
         Ok(())
@@ -272,6 +304,7 @@ impl Ft {
 
     /// filter: FT_LCD_FILTER_* (0 NONE, 1 DEFAULT, 2 LIGHT, 3 LEGACY1, 16 LEGACY)
     fn set_lcd_filter(&self, filter: i32) {
+        // SAFETY: `self.lib` is a live FreeType library.
         unsafe { FT_Library_SetLcdFilter(self.lib, filter as c_uint); }
     }
 
@@ -301,6 +334,7 @@ impl Ft {
     pub fn render(&self, ch: char, px: i32, p: &Profile) -> Option<Glyph<'_>> {
         let face = self.face.get();
         if face.is_null() { return None; }
+        // SAFETY: `face` is a live FT_Face (null-checked above).
         let gi = unsafe { FT_Get_Char_Index(face, ch as c_ulong) };
         self.emit(gi, px, p)
     }
@@ -321,7 +355,7 @@ impl Ft {
             if FT_Load_Glyph(face, gi, flags) != 0 { return None; }
             let slot = (*face).glyph;
             if (*slot).format == FT_GLYPH_FORMAT_OUTLINE && p.embolden != 0 {
-                FT_Outline_EmboldenXY(&mut (*slot).outline, p.embolden as c_long, p.embolden as c_long);
+                FT_Outline_EmboldenXY(&raw mut (*slot).outline, p.embolden as c_long, p.embolden as c_long);
             }
             if FT_Render_Glyph(slot, render_mode as c_uint) != 0 { return None; }
             let s = &*slot;
@@ -346,6 +380,7 @@ impl Ft {
 impl Drop for Ft {
     fn drop(&mut self) {
         self.drop_face();
+        // SAFETY: called once, from Drop, after the face is released.
         unsafe { FT_Done_FreeType(self.lib); }
     }
 }
