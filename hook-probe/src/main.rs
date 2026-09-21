@@ -5,25 +5,26 @@
 //!   * `render-core.png` — our ExtTextOutW hook renders with render-core and
 //!                         blits the result into the DIB, skipping GDI.
 //!
-//! Stage 3b: the font is now resolved from the DC — pixel size from the
-//! selected LOGFONT and the actual font bytes via GetFontData ('ttcf' tag for
-//! TTCs, matching the family for the right sub-face). Text is black on white,
-//! string path only; colour/opacity and the glyph-index path are later stages.
+//! Stage 3b/3c: the font is resolved from the DC — pixel size from the selected
+//! LOGFONT and the actual font bytes via GetFontData ('ttcf' tag for TTCs,
+//! matching the family for the right sub-face). Both the string path and the
+//! ETO_GLYPH_INDEX path (how real apps draw) are handled. Text is black on
+//! white; colour/opacity, clipping, alignment and dx spacing are later stages.
 
 use core::ffi::c_void;
 use std::ptr::null_mut;
 
 use minhook::MinHook;
-use render_core::render::{render_text, Ink};
+use render_core::render::{render_glyphs, render_text, Ink};
 use render_core::{tables_for, Ft, Profile, Tables};
 use windows::core::{s, w, PCWSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, ExtTextOutW,
-    GetCurrentObject, GetFontData, GetObjectW, GetTextMetricsW, SelectObject, SetBkMode,
-    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, ETO_OPTIONS, FONT_CHARSET,
-    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, LOGFONTW, OBJ_FONT,
-    TEXTMETRICW, TRANSPARENT,
+    GetCurrentObject, GetFontData, GetGlyphIndicesW, GetObjectW, GetTextMetricsW, SelectObject,
+    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, ETO_OPTIONS,
+    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC,
+    LOGFONTW, OBJ_FONT, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -94,11 +95,17 @@ unsafe extern "system" fn detour(
     }
 
     // Render the whole DIB-sized canvas with the text at the draw origin;
-    // baseline = y + ascent so the text cell top lands at y.
-    let canvas = render_text(
-        ft, tables, profile, Ink::default(), [255, 255, 255],
-        &text, px, (x, y + ASCENT), (W as usize, H as usize),
-    );
+    // baseline = y + ascent so the text cell top lands at y. When the draw uses
+    // ETO_GLYPH_INDEX the buffer holds glyph indices, not characters.
+    const ETO_GLYPH_INDEX: u32 = 0x0010;
+    let canvas = if _options & ETO_GLYPH_INDEX != 0 {
+        let glyphs = std::slice::from_raw_parts(str_ptr, count as usize);
+        render_glyphs(ft, tables, profile, Ink::default(), [255, 255, 255],
+                      glyphs, px, (x, y + ASCENT), (W as usize, H as usize))
+    } else {
+        render_text(ft, tables, profile, Ink::default(), [255, 255, 255],
+                    &text, px, (x, y + ASCENT), (W as usize, H as usize))
+    };
     // Copy canvas (RGB, top-down) into the DIB (BGRA, top-down).
     let dib = std::slice::from_raw_parts_mut(DIB, (W * H * 4) as usize);
     for i in 0..(W * H) as usize {
@@ -107,7 +114,9 @@ unsafe extern "system" fn detour(
         dib[i * 4 + 2] = canvas.rgb[i * 3]; // R
         dib[i * 4 + 3] = 255; // A
     }
-    println!("[writeback] rendered {text:?} font={face:?} px={px} at ({x},{y}) via render-core");
+    let mode = if _options & ETO_GLYPH_INDEX != 0 { "glyph-index" } else { "string" };
+    println!("[writeback] {mode} count={count} font={face:?} px={px} at ({x},{y}) via render-core");
+    let _ = &text;
     1 // skip GDI
 }
 
@@ -200,6 +209,15 @@ fn main() {
 
         draw(memdc);
         save_dib("render-core.png");
+
+        // --- hooked, glyph-index path (as real apps draw) ---
+        fill_white();
+        let mut gi = vec![0u16; wtext.len()];
+        GetGlyphIndicesW(memdc, PCWSTR(wtext.as_ptr()), wtext.len() as i32,
+                         gi.as_mut_ptr(), 0);
+        let _ = ExtTextOutW(memdc, 12, 14, ETO_OPTIONS(0x0010), None,
+                            PCWSTR(gi.as_ptr()), gi.len() as u32, None);
+        save_dib("render-core-glyph.png");
 
         let _ = MinHook::disable_all_hooks();
         let _ = DeleteObject(font.into());

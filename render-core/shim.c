@@ -70,15 +70,12 @@ int shim_set_lcd_filter(int filter) {
     return FT_Library_SetLcdFilter(g_lib, (FT_LcdFilter)filter);
 }
 
-/* charcode: unicode. load_flags/render_mode: FT_LOAD_* / FT_RENDER_MODE_*.
-   embolden_x/y: 26.6 outline embolden strength (0 = none). */
-int shim_render(unsigned int charcode, int pixel_height,
-                int load_flags, int render_mode,
-                int embolden_x, int embolden_y, ShimGlyph* out) {
+/* Load + render a specific glyph index into `out`. */
+static int emit_glyph(FT_UInt gi, int pixel_height, int load_flags, int render_mode,
+                      int embolden_x, int embolden_y, ShimGlyph* out) {
     if (!g_face) return -1;
     int err = FT_Set_Pixel_Sizes(g_face, 0, pixel_height);
     if (err) return err;
-    FT_UInt gi = FT_Get_Char_Index(g_face, charcode);
     err = FT_Load_Glyph(g_face, gi, load_flags);
     if (err) return err;
     FT_GlyphSlot slot = g_face->glyph;
@@ -96,6 +93,24 @@ int shim_render(unsigned int charcode, int pixel_height,
     out->advance_x  = (int)slot->advance.x;
     out->buffer     = slot->bitmap.buffer;
     return 0;
+}
+
+/* charcode: unicode. load_flags/render_mode: FT_LOAD_* / FT_RENDER_MODE_*.
+   embolden_x/y: 26.6 outline embolden strength (0 = none). */
+int shim_render(unsigned int charcode, int pixel_height,
+                int load_flags, int render_mode,
+                int embolden_x, int embolden_y, ShimGlyph* out) {
+    if (!g_face) return -1;
+    FT_UInt gi = FT_Get_Char_Index(g_face, charcode);
+    return emit_glyph(gi, pixel_height, load_flags, render_mode, embolden_x, embolden_y, out);
+}
+
+/* Same, but render a glyph index directly (for ETO_GLYPH_INDEX draws). */
+int shim_render_glyph(unsigned int glyph_index, int pixel_height,
+                      int load_flags, int render_mode,
+                      int embolden_x, int embolden_y, ShimGlyph* out) {
+    return emit_glyph((FT_UInt)glyph_index, pixel_height, load_flags, render_mode,
+                      embolden_x, embolden_y, out);
 }
 
 void shim_done(void) {
