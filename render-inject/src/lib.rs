@@ -17,7 +17,7 @@ use std::io::Write;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering, AtomicU32};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use std::collections::HashMap;
 
@@ -58,7 +58,10 @@ type FnEto = unsafe extern "system" fn(
     isize, i32, i32, u32, *const c_void, *const u16, u32, *const i32,
 ) -> i32;
 
-static mut ORIG: Option<FnEto> = None;
+/// Trampoline to the real ExtTextOutW, published before the detour goes live.
+/// `OnceLock` gives set-once semantics and a safe read, so a second attach
+/// cannot overwrite it with a pointer to our own jump.
+static ORIG: OnceLock<FnEto> = OnceLock::new();
 
 /// Everything a draw needs, behind one lock.
 ///
@@ -110,7 +113,7 @@ static CAPTURED: AtomicBool = AtomicBool::new(false);
 type FnDrawGlyphRun = unsafe extern "system" fn(
     *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
 ) -> HRESULT;
-static mut ORIG_DGR: Option<FnDrawGlyphRun> = None;
+static ORIG_DGR: OnceLock<FnDrawGlyphRun> = OnceLock::new();
 
 // DirectWrite glyph-run *analysis* path (Chromium/Skia / VS Code): capture the
 // run at CreateGlyphRunAnalysis, substitute coverage at CreateAlphaTexture.
@@ -120,9 +123,10 @@ type FnCreateGlyphRunAnalysis = unsafe extern "system" fn(
 type FnCreateAlphaTexture = unsafe extern "system" fn(
     *mut c_void, i32, *const RECT, *mut u8, u32,
 ) -> HRESULT;
-static mut ORIG_CGRA: Option<FnCreateGlyphRunAnalysis> = None;
-static mut ORIG_CAT: Option<FnCreateAlphaTexture> = None;
-static mut CAT_SLOT: *mut usize = std::ptr::null_mut();
+static ORIG_CGRA: OnceLock<FnCreateGlyphRunAnalysis> = OnceLock::new();
+/// Also the "CreateAlphaTexture is patched" flag: it is published before the
+/// vtable write, and the detour can only run once that write has happened.
+static ORIG_CAT: OnceLock<FnCreateAlphaTexture> = OnceLock::new();
 static ANALYSES: Mutex<Option<HashMap<usize, RunInfo>>> = Mutex::new(None);
 
 struct RunInfo {
@@ -144,12 +148,26 @@ fn log(msg: &str) {
     }
 }
 
-static mut SELF_HINST: HINSTANCE = HINSTANCE(std::ptr::null_mut());
+/// A detour's trampoline back to the real function.
+///
+/// Every `ORIG_*` is published before the corresponding patch goes live, so a
+/// detour that is running always finds it. If it somehow did not, the process
+/// has already jumped into our code with no way back, and this aborts rather
+/// than calling a null pointer.
+#[inline]
+fn orig<F: Copy>(cell: &OnceLock<F>) -> F {
+    *cell.get().expect("detour ran before its trampoline was published")
+}
+
+/// This DLL's module handle, stored as an address because `HINSTANCE` is not
+/// `Sync`. Set in DllMain before any other thread of ours starts.
+static SELF_HINST: OnceLock<usize> = OnceLock::new();
 
 /// Directory this DLL was loaded from (the install dir: font-tuner.ini + ini\).
 unsafe fn self_dir() -> Option<PathBuf> {
+    let hinst = HINSTANCE(*SELF_HINST.get()? as *mut c_void);
     let mut buf = [0u16; 260];
-    let n = GetModuleFileNameW(Some(SELF_HINST.into()), &mut buf);
+    let n = GetModuleFileNameW(Some(hinst.into()), &mut buf);
     if n == 0 { return None; }
     PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])).parent().map(|p| p.to_path_buf())
 }
@@ -249,13 +267,13 @@ unsafe extern "system" fn detour(
     // Guard against re-entrancy (our own GDI calls, or nested draws) on this
     // thread only.
     if IN_DETOUR.with(|f| f.replace(true)) {
-        return (ORIG.unwrap())(hdc_i, x, y, options, rect, str_ptr, count, dx);
+        return (orig(&ORIG))(hdc_i, x, y, options, rect, str_ptr, count, dx);
     }
     let r = render_into_dc(hdc_i, x, y, options, rect, str_ptr, count, dx);
     IN_DETOUR.with(|f| f.set(false));
     match r {
         Some(v) => v,
-        None => (ORIG.unwrap())(hdc_i, x, y, options, rect, str_ptr, count, dx),
+        None => (orig(&ORIG))(hdc_i, x, y, options, rect, str_ptr, count, dx),
     }
 }
 
@@ -406,7 +424,7 @@ unsafe extern "system" fn dgr_detour(
     if !run.is_null() && dgr_render(this, &*run, bx, by, color).is_some() {
         return HRESULT(0); // S_OK
     }
-    (ORIG_DGR.unwrap())(this, bx, by, mm, run, rp, color, bbox)
+    (orig(&ORIG_DGR))(this, bx, by, mm, run, rp, color, bbox)
 }
 
 unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, color: u32) -> Option<()> {
@@ -477,7 +495,7 @@ unsafe fn setup_dwrite_hook() {
     if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() {
         return;
     }
-    ORIG_DGR = Some(std::mem::transmute::<usize, FnDrawGlyphRun>(*slot));
+    let _ = ORIG_DGR.set(std::mem::transmute::<usize, FnDrawGlyphRun>(*slot));
     *slot = dgr_detour as usize;
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
     log("hook installed on DrawGlyphRun");
@@ -488,7 +506,7 @@ unsafe fn setup_dwrite_hook() {
     let fslot = (*(factory.as_raw() as *mut *mut usize)).add(23);
     let mut fp = PAGE_PROTECTION_FLAGS(0);
     if VirtualProtect(fslot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut fp).is_ok() {
-        ORIG_CGRA = Some(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis>(*fslot));
+        let _ = ORIG_CGRA.set(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis>(*fslot));
         *fslot = cgra_detour as usize;
         let _ = VirtualProtect(fslot as *const c_void, 8, fp, &mut fp);
         log("hook installed on CreateGlyphRunAnalysis");
@@ -501,7 +519,7 @@ unsafe extern "system" fn cgra_detour(
     this: *mut c_void, run: *const DWRITE_GLYPH_RUN, ppd: f32, transform: *const DWRITE_MATRIX,
     rmode: i32, mmode: i32, bx: f32, by: f32, out: *mut *mut c_void,
 ) -> HRESULT {
-    let hr = (ORIG_CGRA.unwrap())(this, run, ppd, transform, rmode, mmode, bx, by, out);
+    let hr = (orig(&ORIG_CGRA))(this, run, ppd, transform, rmode, mmode, bx, by, out);
     if hr.is_ok() && !out.is_null() && !(*out).is_null() && !run.is_null() {
         let r = &*run;
         if let Some((bytes, index)) = dwrite_font_bytes(r) {
@@ -525,18 +543,17 @@ unsafe extern "system" fn cgra_detour(
 }
 
 unsafe fn patch_cat_vtable(analysis: *mut c_void) {
-    if !CAT_SLOT.is_null() { return; } // fast path, no lock once patched
+    if ORIG_CAT.get().is_some() { return; } // fast path, no lock once patched
     let _guard = VTABLE_PATCH_LOCK.lock();
-    if !CAT_SLOT.is_null() { return; } // re-check under the lock
+    if ORIG_CAT.get().is_some() { return; } // re-check under the lock
     let vtbl = *(analysis as *mut *mut usize);
     let slot = vtbl.add(4);
     let mut oldp = PAGE_PROTECTION_FLAGS(0);
     if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() { return; }
-    ORIG_CAT = Some(std::mem::transmute::<usize, FnCreateAlphaTexture>(*slot));
+    // Publish the trampoline before the vtable write: cat_detour reads ORIG_CAT,
+    // and it can only run once the slot below points at it.
+    let _ = ORIG_CAT.set(std::mem::transmute::<usize, FnCreateAlphaTexture>(*slot));
     *slot = cat_detour as usize;
-    // Publish CAT_SLOT last: cat_detour keys off ORIG_CAT, and another thread's
-    // fast-path check keys off CAT_SLOT, so ORIG_CAT must be set before CAT_SLOT.
-    CAT_SLOT = slot;
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
     log("hook installed on CreateAlphaTexture");
 }
@@ -552,7 +569,7 @@ unsafe extern "system" fn cat_detour(
         }
         return HRESULT(0);
     }
-    (ORIG_CAT.unwrap())(this, tex_type, bounds, alpha, size)
+    (orig(&ORIG_CAT))(this, tex_type, bounds, alpha, size)
 }
 
 unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Option<()> {
@@ -592,9 +609,9 @@ type FnD2DCreateFactory = unsafe extern "system" fn(i32, *const GUID, *const c_v
 type FnCreateDCRT = unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
 type FnCreateHwndRT = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
 type FnD2DDrawGlyphRun = unsafe extern "system" fn(*mut c_void, Vector2, *const DWRITE_GLYPH_RUN, *mut c_void, i32);
-static mut ORIG_D2DCF: Option<FnD2DCreateFactory> = None;
-static mut ORIG_DCRT: Option<FnCreateDCRT> = None;
-static mut ORIG_HWNDRT: Option<FnCreateHwndRT> = None;
+static ORIG_D2DCF: OnceLock<FnD2DCreateFactory> = OnceLock::new();
+static ORIG_DCRT: OnceLock<FnCreateDCRT> = OnceLock::new();
+static ORIG_HWNDRT: OnceLock<FnCreateHwndRT> = OnceLock::new();
 static D2D_DGR_ORIG: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None); // rt vtable -> orig DrawGlyphRun
 static D2D_CAPTURED: AtomicBool = AtomicBool::new(false); // log the first D2D substitution once
 
@@ -608,18 +625,18 @@ unsafe fn patch_slot(slot: *mut usize, newv: usize) -> Option<usize> {
 }
 
 unsafe extern "system" fn d2dcf_detour(ftype: i32, riid: *const GUID, opts: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    let hr = (ORIG_D2DCF.unwrap())(ftype, riid, opts, out);
+    let hr = (orig(&ORIG_D2DCF))(ftype, riid, opts, out);
     if hr.is_ok() && !out.is_null() && !(*out).is_null() {
         let vtbl = *(*out as *mut *mut usize);
         // ID2D1Factory: CreateHwndRenderTarget = slot 14, CreateDCRenderTarget = slot 16.
         // Serialise the one-time patch: two threads creating factories at once
         // must not both capture the "original" (see VTABLE_PATCH_LOCK).
         let _guard = VTABLE_PATCH_LOCK.lock();
-        if ORIG_HWNDRT.is_none() {
-            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { ORIG_HWNDRT = Some(std::mem::transmute(o)); }
+        if ORIG_HWNDRT.get().is_none() {
+            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { let _ = ORIG_HWNDRT.set(std::mem::transmute(o)); }
         }
-        if ORIG_DCRT.is_none() {
-            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { ORIG_DCRT = Some(std::mem::transmute(o)); }
+        if ORIG_DCRT.get().is_none() {
+            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { let _ = ORIG_DCRT.set(std::mem::transmute(o)); }
         }
         log("hook installed on D2D1Factory render-target creation");
     }
@@ -627,12 +644,12 @@ unsafe extern "system" fn d2dcf_detour(ftype: i32, riid: *const GUID, opts: *con
 }
 
 unsafe extern "system" fn create_dc_detour(this: *mut c_void, props: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    let hr = (ORIG_DCRT.unwrap())(this, props, out);
+    let hr = (orig(&ORIG_DCRT))(this, props, out);
     if hr.is_ok() && !out.is_null() && !(*out).is_null() { patch_rt_dgr(*out); }
     hr
 }
 unsafe extern "system" fn create_hwnd_detour(this: *mut c_void, p1: *const c_void, p2: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    let hr = (ORIG_HWNDRT.unwrap())(this, p1, p2, out);
+    let hr = (orig(&ORIG_HWNDRT))(this, p1, p2, out);
     if hr.is_ok() && !out.is_null() && !(*out).is_null() { patch_rt_dgr(*out); }
     hr
 }
@@ -808,7 +825,7 @@ unsafe fn setup_d2d_hook() {
     };
     let Some(target) = GetProcAddress(d2d1, s!("D2D1CreateFactory")) else { return };
     if let Some(tramp) = install_hook(target as *const (), d2dcf_detour as *const ()) {
-        ORIG_D2DCF = Some(std::mem::transmute::<*const (), FnD2DCreateFactory>(tramp));
+        let _ = ORIG_D2DCF.set(std::mem::transmute::<*const (), FnD2DCreateFactory>(tramp));
         log("hook installed on D2D1CreateFactory");
     } else {
         log("D2D1CreateFactory hook failed");
@@ -853,7 +870,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     let Ok(gdi32) = GetModuleHandleW(w!("gdi32.dll")) else { return 1 };
     let Some(target) = GetProcAddress(gdi32, s!("ExtTextOutW")) else { return 1 };
     if let Some(tramp) = install_hook(target as *const (), detour as *const ()) {
-        ORIG = Some(std::mem::transmute::<*const (), FnEto>(tramp));
+        let _ = ORIG.set(std::mem::transmute::<*const (), FnEto>(tramp));
         log("hook installed on ExtTextOutW");
     } else {
         log("ExtTextOutW hook failed");
@@ -867,7 +884,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
 pub extern "system" fn DllMain(hinst: HINSTANCE, reason: u32, _reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
-            SELF_HINST = hinst;
+            let _ = SELF_HINST.set(hinst.0 as usize);
             // Pin ourselves for the life of the process. This DLL is mapped
             // into every GUI process by the tray's WH_GETMESSAGE hook; when
             // that hook goes away (tray off / exit / MSI upgrade / uninstall)
