@@ -108,4 +108,15 @@ mod tests {
             prev = v;
         }
     }
+
+    /// Black-on-white greyscale blend at gamma 1.25 — values captured from the
+    /// C++ oracle (verify/), so this guards the LUT + blend against drift
+    /// without needing the C++ harness.
+    #[test]
+    fn greyscale_regression_g125() {
+        let t = Tables::build(1.25, 1.0, 1.0, 0);
+        for &(cov, expect) in &[(0u8, 255u8), (32, 229), (64, 202), (128, 146), (192, 83), (255, 0)] {
+            assert_eq!(t.blend(255, 0, cov), expect, "cov={cov}");
+        }
+    }
 }

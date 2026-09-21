@@ -48,19 +48,26 @@ Rendering is serialised by a mutex (one shared FreeType face, re-faced per draw)
   injection via the shared-vtable patch.
 - **Auto-injection** via a WH_GETMESSAGE hook (MacType's mechanism), scoped to a
   target process for safety; safe DLL unload.
-- **Profiles** driven by font-tuner's own `.ini` files (`Profile::from_ini`).
+- **Profiles** driven by font-tuner's own `.ini` files (`Profile::from_ini`),
+  re-read live when the file changes (tray profile switch).
+- **GDI fidelity**: `ETO_OPAQUE` / `ETO_CLIPPED` / `lpDx` honoured in
+  `render-inject`.
+- **Performance**: the font file is extracted + re-faced only when the font
+  actually changes (cached), not per draw.
+- **Tests**: `render-core` has `cargo test` units for the blend (a regression
+  guard against the C++ oracle values) and `Profile::from_ini`, plus the
+  bit-exact golden harness in `verify/`.
 
 ## Not done / known limits
 
 - Direct2D / GPU DirectWrite (`ID2D1RenderTarget::DrawGlyphRun`, glyph-run
-  analysis) — only the GDI-interop bitmap path is hooked.
-- `ETO_OPAQUE` / `ETO_CLIPPED` / `lpDx` are handled in `hook-probe` but not yet
-  carried into `render-inject`; DPI transforms and non-natural measuring modes.
+  analysis) — only the GDI-interop bitmap path is hooked. GPU-rendered text is a
+  different-class problem (rasterisation happens on the GPU) and is out of scope.
+- DPI transforms and non-natural DirectWrite measuring modes.
 - Coloured LCD is only exercised for black/greyscale text in verification.
 - System-wide auto-injection (all processes) is intentionally not wired into the
   tray; the loader stays per-process.
-- `static mut` state should move to proper sync types; hot-path allocations
-  (font bytes per draw) should be cached per face.
+- `static mut` state (set once at init) should move to proper sync types.
 
 ## Build & try (single process)
 

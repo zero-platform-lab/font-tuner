@@ -6,9 +6,10 @@
 //!   * DirectWrite: IDWriteBitmapRenderTarget::DrawGlyphRun, via a shared-vtable
 //!     patch so every render target in the process routes through us — Stage 5c.
 //!
-//! Both resolve the font, render the run, and blit the result over the target
-//! DC's current content. Not yet covered: Direct2D/GPU DirectWrite, opaque-fill
-//! / clip / dx, DPI transforms, and multi-thread hardening.
+//! Both resolve the font (cached, re-extracted only on change), honour the DC's
+//! colour/baseline, and blit over the target's current content; the GDI path
+//! also handles ETO_OPAQUE / ETO_CLIPPED / lpDx. Rendering is serialised by a
+//! mutex. Not yet covered: Direct2D/GPU DirectWrite and DPI transforms.
 
 use core::ffi::c_void;
 use std::io::Write;
@@ -26,7 +27,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN,
 };
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetCurrentObject,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetBkColor, GetCurrentObject,
     GetFontData, GetObjectW, GetTextAlign, GetTextColor, GetTextExtentPoint32W, GetTextExtentPointI,
     GetTextMetricsW, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HDC, LOGFONTW,
     OBJ_FONT, SRCCOPY, TEXTMETRICW,
@@ -50,9 +51,9 @@ static mut TABLES: Option<Tables> = None;
 static mut PROFILE: Option<Profile> = None;
 static IN_DETOUR: AtomicBool = AtomicBool::new(false);
 static CAPTURED: AtomicBool = AtomicBool::new(false);
-/// Serialises all rendering: the single global FreeType face is re-faced per
-/// call, so concurrent draws from the host's threads must not overlap.
-static RENDER_LOCK: Mutex<()> = Mutex::new(());
+/// Serialises all rendering (one shared FreeType face) and remembers the last
+/// font key, so we only re-extract + re-face when the font actually changes.
+static RENDER_LOCK: Mutex<Option<String>> = Mutex::new(None);
 
 type FnDrawGlyphRun = unsafe extern "system" fn(
     *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
@@ -69,14 +70,45 @@ fn log(msg: &str) {
     }
 }
 
+/// Path the tray writes the active profile to: %LOCALAPPDATA%\font-tuner\profile.ini
+fn profile_path() -> Option<String> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|b| PathBuf::from(b).join("font-tuner").join("profile.ini"))
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Reload TABLES/PROFILE when the profile file changes (tray profile switch).
+fn watch_profile(path: String) {
+    let mtime = |p: &str| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+    let mut last = mtime(&path);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let cur = mtime(&path);
+        if cur != last {
+            last = cur;
+            if let Some(p) = Profile::from_ini(&path) {
+                if RENDER_LOCK.lock().is_ok() {
+                    unsafe {
+                        TABLES = Some(tables_for(&p));
+                        PROFILE = Some(p);
+                    }
+                }
+                log("profile reloaded");
+            }
+        }
+    }
+}
+
 /// Resolve the DC's font into render-core (returns the pixel size), or None.
-unsafe fn resolve_font(hdc: HDC, ft: &Ft) -> Option<i32> {
+/// Re-extracts + re-faces only when the font differs from `cache`.
+unsafe fn resolve_font(hdc: HDC, ft: &Ft, cache: &mut Option<String>) -> Option<i32> {
     let hfont = GetCurrentObject(hdc, OBJ_FONT);
     let mut lf = LOGFONTW::default();
     GetObjectW(hfont, core::mem::size_of::<LOGFONTW>() as i32,
                Some(&mut lf as *mut _ as *mut c_void));
     let px = if lf.lfHeight != 0 { lf.lfHeight.unsigned_abs() as i32 } else { 16 };
 
+    // size-only probe is cheap; the full read only happens on a cache miss.
     const TTCF: u32 = 0x6663_7474;
     let mut table = TTCF;
     let mut size = GetFontData(hdc, TTCF, 0, None, 0);
@@ -87,12 +119,16 @@ unsafe fn resolve_font(hdc: HDC, ft: &Ft) -> Option<i32> {
     if size == 0 || size == u32::MAX {
         return None;
     }
-    let mut buf = vec![0u8; size as usize];
-    GetFontData(hdc, table, 0, Some(buf.as_mut_ptr() as *mut c_void), size);
     let face = String::from_utf16_lossy(
         &lf.lfFaceName[..lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(0)],
     );
-    ft.reface_memory(&buf, &face).ok()?;
+    let key = format!("gdi:{face}:{size}");
+    if cache.as_deref() != Some(key.as_str()) {
+        let mut buf = vec![0u8; size as usize];
+        GetFontData(hdc, table, 0, Some(buf.as_mut_ptr() as *mut c_void), size);
+        ft.reface_memory(&buf, &face).ok()?;
+        *cache = Some(key);
+    }
     Some(px)
 }
 
@@ -104,7 +140,7 @@ unsafe extern "system" fn detour(
     if IN_DETOUR.swap(true, Ordering::SeqCst) {
         return (ORIG.unwrap())(hdc_i, x, y, options, rect, str_ptr, count, dx);
     }
-    let r = render_into_dc(hdc_i, x, y, options, str_ptr, count);
+    let r = render_into_dc(hdc_i, x, y, options, rect, str_ptr, count, dx);
     IN_DETOUR.store(false, Ordering::SeqCst);
     match r {
         Some(v) => v,
@@ -114,17 +150,18 @@ unsafe extern "system" fn detour(
 
 /// Returns Some(retval) if we handled the draw, None to fall back to GDI.
 unsafe fn render_into_dc(hdc_i: isize, x: i32, y: i32, options: u32,
-                         str_ptr: *const u16, count: u32) -> Option<i32> {
+                         rect_ptr: *const c_void, str_ptr: *const u16, count: u32,
+                         dx_ptr: *const i32) -> Option<i32> {
     if str_ptr.is_null() || count == 0 {
         return None;
     }
-    let _guard = RENDER_LOCK.lock().ok()?; // serialise access to the shared face
+    let mut cache = RENDER_LOCK.lock().ok()?; // serialise + remember the last font
     let ft = FT.as_ref()?;
     let tables = TABLES.as_ref()?;
     let profile = PROFILE.as_ref()?;
     let hdc = HDC(hdc_i as *mut c_void);
 
-    let px = resolve_font(hdc, ft)?;
+    let px = resolve_font(hdc, ft, &mut cache)?;
 
     // colour, metrics, baseline
     let color = GetTextColor(hdc).0;
@@ -147,10 +184,30 @@ unsafe fn render_into_dc(hdc_i: isize, x: i32, y: i32, options: u32,
     if !ok.as_bool() || sz.cx <= 0 {
         return None;
     }
-    let rw = sz.cx + 6;
-    let rh = tm.tmHeight + 4;
-    let rx = x;
-    let ry = baseline - tm.tmAscent;
+    // ExtTextOutW options + optional rectangle (opaque fill / clip).
+    const ETO_OPAQUE: u32 = 0x0002;
+    const ETO_CLIPPED: u32 = 0x0004;
+    let rect = if rect_ptr.is_null() {
+        None
+    } else {
+        let r = *(rect_ptr as *const RECT);
+        Some((r.left, r.top, r.right, r.bottom))
+    };
+    let dx: Option<&[i32]> = if dx_ptr.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(dx_ptr, count as usize))
+    };
+
+    // Text-extent region, unioned with the rect so opaque fill / clip fit.
+    let (mut rx, mut ry) = (x, baseline - tm.tmAscent);
+    let (mut right, mut bottom) = (x + sz.cx + 6, ry + tm.tmHeight + 4);
+    if let Some((l, t, r, b)) = rect {
+        rx = rx.min(l); ry = ry.min(t);
+        right = right.max(r); bottom = bottom.max(b);
+    }
+    let rw = (right - rx).clamp(1, 8192);
+    let rh = (bottom - ry).clamp(1, 8192);
 
     // offscreen DIB, seeded with the DC's current pixels
     let memdc = CreateCompatibleDC(Some(hdc));
@@ -172,13 +229,23 @@ unsafe fn render_into_dc(hdc_i: isize, x: i32, y: i32, options: u32,
 
     let dib = std::slice::from_raw_parts_mut(bits as *mut u8, (rw * rh * 4) as usize);
     let mut canvas = Canvas::from_bgra_topdown(rw as usize, rh as usize, dib);
+    // ETO_OPAQUE: fill the rect with the DC's background colour first.
+    if let (true, Some((l, t, r, b))) = (options & ETO_OPAQUE != 0, rect) {
+        let bk = GetBkColor(hdc).0;
+        canvas.fill_rect((l - rx, t - ry, r - rx, b - ry),
+                         [(bk & 0xFF) as u8, ((bk >> 8) & 0xFF) as u8, ((bk >> 16) & 0xFF) as u8]);
+    }
+    // ETO_CLIPPED: restrict drawing to the rect.
+    if let (true, Some((l, t, r, b))) = (options & ETO_CLIPPED != 0, rect) {
+        canvas.set_clip(Some((l - rx, t - ry, r - rx, b - ry)));
+    }
     let pen = (x - rx, baseline - ry);
     if glyph_mode {
         let glyphs = std::slice::from_raw_parts(str_ptr, count as usize);
-        draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, pen, None);
+        draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, pen, dx);
     } else {
         let s: String = String::from_utf16_lossy(std::slice::from_raw_parts(str_ptr, count as usize));
-        draw_text_onto(&mut canvas, ft, tables, profile, ink, &s, px, pen, None);
+        draw_text_onto(&mut canvas, ft, tables, profile, ink, &s, px, pen, dx);
     }
     canvas.blit_to_bgra_topdown(dib);
 
@@ -234,7 +301,7 @@ unsafe extern "system" fn dgr_detour(
 }
 
 unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, color: u32) -> Option<()> {
-    let _guard = RENDER_LOCK.lock().ok()?; // serialise access to the shared face
+    let mut cache = RENDER_LOCK.lock().ok()?; // serialise + remember the last font
     let ft = FT.as_ref()?;
     let tables = TABLES.as_ref()?;
     let profile = PROFILE.as_ref()?;
@@ -244,8 +311,14 @@ unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, 
     let (w, h) = (size.cx, size.cy);
     if w <= 0 || h <= 0 { return None; }
 
-    let (bytes, index) = dwrite_font_bytes(r)?;
-    ft.reface_memory_index(&bytes, index as i64).ok()?;
+    // key on the font-face identity; only re-extract on a miss.
+    let face = r.fontFace.deref().as_ref()?;
+    let key = format!("dw:{:x}:{}", face.as_raw() as usize, face.GetIndex());
+    if cache.as_deref() != Some(key.as_str()) {
+        let (bytes, index) = dwrite_font_bytes(r)?;
+        ft.reface_memory_index(&bytes, index as i64).ok()?;
+        *cache = Some(key);
+    }
     let px = r.fontEmSize.round() as i32;
     let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
     let ink = Ink { fg: [(color & 0xFF) as u8, ((color >> 8) & 0xFF) as u8, ((color >> 16) & 0xFF) as u8] };
@@ -318,13 +391,15 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     };
     FT = Some(ft);
     // Use the active font-tuner profile if present, else the default.
-    let p = std::env::var_os("LOCALAPPDATA")
-        .map(|b| PathBuf::from(b).join("font-tuner").join("profile.ini"))
-        .and_then(|path| Profile::from_ini(&path.to_string_lossy()))
-        .unwrap_or_else(Profile::clean_greyscale);
+    let path = profile_path();
+    let p = path.as_deref().and_then(Profile::from_ini).unwrap_or_else(Profile::clean_greyscale);
     log(&format!("profile: {p:?}"));
     TABLES = Some(tables_for(&p));
     PROFILE = Some(p);
+    // Watch the profile file so tray profile switches take effect live.
+    if let Some(path) = path {
+        std::thread::spawn(move || watch_profile(path));
+    }
 
     let Ok(gdi32) = GetModuleHandleW(w!("gdi32.dll")) else { return 1 };
     let Some(target) = GetProcAddress(gdi32, s!("ExtTextOutW")) else { return 1 };
