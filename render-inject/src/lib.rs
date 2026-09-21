@@ -59,9 +59,32 @@ type FnEto = unsafe extern "system" fn(
 ) -> i32;
 
 static mut ORIG: Option<FnEto> = None;
-static mut FT: Option<Ft> = None;
-static mut TABLES: Option<Tables> = None;
-static mut PROFILE: Option<Profile> = None;
+
+/// Everything a draw needs, behind one lock.
+///
+/// FreeType, the blend tables, the profile and the "last font" cache used to be
+/// four separate `static mut`s that every call site promised to touch only while
+/// holding RENDER_LOCK. Nothing enforced that promise, and a reload swapping
+/// tables and profile separately could be observed half-applied. Keeping them in
+/// one struct behind one mutex makes the promise unbypassable: there is no way to
+/// reach the face or the profile without the guard.
+struct RenderState {
+    ft: Ft,
+    tables: Tables,
+    profile: Profile,
+    /// Identity of the face currently loaded into `ft`, so a draw only
+    /// re-extracts and re-faces when the font actually changes.
+    font_key: Option<String>,
+}
+
+// SAFETY: `Ft` owns raw FreeType handles, which are not thread-safe on their
+// own. The only access is through RENDER's mutex, so at most one thread ever
+// touches the library or the face at a time — the condition FreeType requires.
+unsafe impl Send for RenderState {}
+
+/// `None` until `on_attach` initialises FreeType; a draw that arrives first
+/// simply falls back to the OS rasteriser.
+static RENDER: Mutex<Option<RenderState>> = Mutex::new(None);
 thread_local! {
     // Per-thread re-entrancy guard for the GDI detour. Must be thread-local, not
     // a process-global flag: a global one makes every *other* thread's
@@ -83,9 +106,6 @@ static VTABLE_PATCH_LOCK: Mutex<()> = Mutex::new(());
 static RELOAD_MSG: AtomicU32 = AtomicU32::new(0);
 const RELOAD_MSG_NAME: PCWSTR = w!("FontTuner.ReloadProfile");
 static CAPTURED: AtomicBool = AtomicBool::new(false);
-/// Serialises all rendering (one shared FreeType face) and remembers the last
-/// font key, so we only re-extract + re-face when the font actually changes.
-static RENDER_LOCK: Mutex<Option<String>> = Mutex::new(None);
 
 type FnDrawGlyphRun = unsafe extern "system" fn(
     *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
@@ -180,9 +200,11 @@ unsafe fn load_profile() -> (Option<String>, Profile) {
 /// unreadable the built-in default applies, same as at attach.
 unsafe fn reload_profile() {
     let (path, p) = load_profile();
-    if let Ok(_guard) = RENDER_LOCK.lock() {
-        TABLES = Some(tables_for(&p));
-        PROFILE = Some(p);
+    if let Ok(mut guard) = RENDER.lock() {
+        if let Some(st) = guard.as_mut() {
+            st.tables = tables_for(&p);
+            st.profile = p;
+        }
     }
     log(&format!("reloaded profile {}", path.as_deref().unwrap_or("(default)")));
 }
@@ -244,13 +266,11 @@ unsafe fn render_into_dc(hdc_i: isize, x: i32, y: i32, options: u32,
     if str_ptr.is_null() || count == 0 {
         return None;
     }
-    let mut cache = RENDER_LOCK.lock().ok()?; // serialise + remember the last font
-    let ft = FT.as_ref()?;
-    let tables = TABLES.as_ref()?;
-    let profile = PROFILE.as_ref()?;
+    let mut guard = RENDER.lock().ok()?; // serialises every draw
+    let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
     let hdc = HDC(hdc_i as *mut c_void);
 
-    let px = resolve_font(hdc, ft, &mut cache)?;
+    let px = resolve_font(hdc, ft, font_key)?;
 
     // colour, metrics, baseline
     let color = GetTextColor(hdc).0;
@@ -390,10 +410,8 @@ unsafe extern "system" fn dgr_detour(
 }
 
 unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, color: u32) -> Option<()> {
-    let mut cache = RENDER_LOCK.lock().ok()?; // serialise + remember the last font
-    let ft = FT.as_ref()?;
-    let tables = TABLES.as_ref()?;
-    let profile = PROFILE.as_ref()?;
+    let mut guard = RENDER.lock().ok()?; // serialises every draw
+    let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
     let brt = IDWriteBitmapRenderTarget::from_raw_borrowed(&this)?;
     let hdc = brt.GetMemoryDC();
     let size = brt.GetSize().ok()?;
@@ -403,10 +421,10 @@ unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, 
     // key on the font-face identity; only re-extract on a miss.
     let face = r.fontFace.deref().as_ref()?;
     let key = format!("dw:{:x}:{}", face.as_raw() as usize, face.GetIndex());
-    if cache.as_deref() != Some(key.as_str()) {
+    if font_key.as_deref() != Some(key.as_str()) {
         let (bytes, index) = dwrite_font_bytes(r)?;
         ft.reface_memory_index(&bytes, index as i64).ok()?;
-        *cache = Some(key);
+        *font_key = Some(key);
     }
     let px = r.fontEmSize.round() as i32;
     let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
@@ -540,18 +558,17 @@ unsafe extern "system" fn cat_detour(
 unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Option<()> {
     let (w, h) = ((b.right - b.left) as usize, (b.bottom - b.top) as usize);
     if w == 0 || h == 0 || w * h * 3 != size as usize { return None; }
-    let mut cache = RENDER_LOCK.lock().ok()?;
-    let ft = FT.as_ref()?;
-    let profile = PROFILE.as_ref()?;
+    let mut guard = RENDER.lock().ok()?;
+    let RenderState { ft, profile, font_key, .. } = guard.as_mut()?;
     let m = ANALYSES.lock().ok()?;
     let info = m.as_ref()?.get(&(this as usize))?;
     // Key on the font identity (face index + file length), not the analysis
     // object address: addresses are recycled, so keying on `this` would reuse a
     // stale face when a freed analysis's pointer is handed to a different font.
     let key = format!("dwa:{}:{}", info.index, info.bytes.len());
-    if cache.as_deref() != Some(key.as_str()) {
+    if font_key.as_deref() != Some(key.as_str()) {
         ft.reface_memory_index(&info.bytes, info.index as i64).ok()?;
-        *cache = Some(key);
+        *font_key = Some(key);
     }
     // force LCD subpixel for the CLEARTYPE_3x1 texture, keep the profile's hinting
     let lcd = Profile { aa: Aa::LcdRgb, ..*profile };
@@ -658,15 +675,13 @@ unsafe fn d2d_brush_ink(brush: *mut c_void) -> Ink {
 }
 
 unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_RUN, brush: *mut c_void) -> Option<()> {
-    let mut cache = RENDER_LOCK.lock().ok()?;
-    let ft = FT.as_ref()?;
-    let tables = TABLES.as_ref()?;
-    let profile = PROFILE.as_ref()?;
+    let mut guard = RENDER.lock().ok()?;
+    let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
     let (bytes, index) = dwrite_font_bytes(r)?;
     let key = format!("d2d:{index}:{}", bytes.len());
-    if cache.as_deref() != Some(key.as_str()) {
+    if font_key.as_deref() != Some(key.as_str()) {
         ft.reface_memory_index(&bytes, index as i64).ok()?;
-        *cache = Some(key);
+        *font_key = Some(key);
     }
     let px = r.fontEmSize.round() as i32;
     let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
@@ -827,12 +842,12 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
         log("Ft::open failed");
         return 1;
     };
-    FT = Some(ft);
     // Use the active font-tuner profile if present, else the default.
     let (path, p) = load_profile();
     log(&format!("profile {}: {p:?}", path.as_deref().unwrap_or("(default)")));
-    TABLES = Some(tables_for(&p));
-    PROFILE = Some(p);
+    if let Ok(mut guard) = RENDER.lock() {
+        *guard = Some(RenderState { ft, tables: tables_for(&p), profile: p, font_key: None });
+    }
     RELOAD_MSG.store(RegisterWindowMessageW(RELOAD_MSG_NAME), Ordering::Relaxed);
 
     let Ok(gdi32) = GetModuleHandleW(w!("gdi32.dll")) else { return 1 };
