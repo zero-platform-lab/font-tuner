@@ -39,3 +39,28 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[lints]
+workspace = true
+
+# Lints that catch C++ habits Rust can do without: `as` casts that silently
+# truncate or drop the sign, `&x as *const _` and pointer-to-pointer `as`
+# chains, unsafe fns whose whole body is treated as unsafe, unsafe blocks
+# with no SAFETY note. check-lint.ps1 runs clippy and fails when a crate's
+# warning count rises above clippy-baseline.txt; lower the baseline as the
+# count drops.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# pedantic noise that says nothing about C++ habits
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+# beyond pedantic
+undocumented_unsafe_blocks = "warn"
+significant_drop_tightening = "warn"
