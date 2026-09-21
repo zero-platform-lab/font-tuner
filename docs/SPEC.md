@@ -1,8 +1,8 @@
 # Font-tuner specification
 
-A small, self-contained tray loader for [MacType](https://github.com/snowie2000/mactype).
-It reproduces what the closed-source *MacTray* does in "tray mode", ships the
-MacType core DLL built from source, bundles a set of rendering profiles, and
+A small, self-contained font-rendering tuner for Windows (tray + injected render core; upstream: https://github.com/snowie2000/mactype).
+It reproduces what the upstream closed-source tray does in "tray mode", ships the
+render core DLL built from source, bundles a set of rendering profiles, and
 adds a tray-menu system-font switcher. Windows 11, 64-bit only.
 
 ---
@@ -13,22 +13,28 @@ adds a tray-menu system-font switcher. Windows 11, 64-bit only.
 
 ```
 font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64-bit GUI process
-                                                          maps MacType64.Core.dll
+                                                          maps RenderCore64.dll
                                                           (hook proc lives there)
                           core DllMain hooks the font APIs (GDI / DirectWrite)
                           │
-                          └─ on child-process spawn, core injects MTBootStrap64.dll
+                          └─ on child-process spawn, core injects RenderBootstrap64.dll
                              (GdippInjectDLL), which LoadLibraryW's the core in the child
 ```
 
 * **font-tuner.exe** — the tray process. Installs one global `WH_GETMESSAGE` hook
-  whose procedure is exported by `MacType64.Core.dll`. When any 64-bit GUI
+  whose procedure is exported by `RenderCore64.dll`. When any 64-bit GUI
   process pulls a message, Windows maps the core DLL into it and the hook fires,
   so the core's `DllMain` runs and patches the font-rendering APIs.
-* **MacType64.Core.dll** — the MacType engine (built from `vendor/`). Does the
-  actual glyph rendering via the bundled FreeType fork.
-* **MTBootStrap64.dll** — a tiny Rust replacement (`bootstrap/`, crate
-  `mtbootstrap`, output name `MTBootStrap64`) for the closed-source bootstrap.
+* **RenderCore64.dll** — the render engine (Rust port of the upstream core). Does the
+  actual glyph rendering via the bundled FreeType fork. On attach it marks
+  itself non-unloadable for the life of the process
+  (`GetModuleHandleEx` + `GET_MODULE_HANDLE_EX_FLAG_PIN`): removing the hook
+  (tray off / exit / upgrade / uninstall) stops injection into *new* processes
+  but never unmaps the DLL from running ones, so there is no "code executes
+  after unmap" crash path. Profile switch, on/off and upgrade all take effect
+  for processes started afterwards.
+* **RenderBootstrap64.dll** — a tiny Rust replacement (`bootstrap/`, crate
+  `render-bootstrap`, output name `RenderBootstrap64`) for the closed-source bootstrap.
   The core injects it into freshly spawned child processes; its only job is to
   `LoadLibraryW` the core from a background thread. It uses `CreateThread` from
   `DllMain` (never `LoadLibrary` under loader lock) to stay deadlock-free.
@@ -54,7 +60,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64
 ## 2. Rendering profiles
 
 Profiles live in `profiles/ini/*.ini`. The active one is chosen by
-`MacType.ini` `[General] AlternativeFile=ini\<name>.ini`; it applies to
+`font-tuner.ini` `[General] AlternativeFile=ini\<name>.ini`; it applies to
 newly created processes. The tray "profile" submenu writes this key when you
 pick an entry (via `WritePrivateProfileString`).
 
@@ -131,10 +137,10 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
 * **Toolflags** — `.cargo/config.toml` sets `+crt-static` for the MSVC target,
   removing the `VCRUNTIME140.dll` dependency (and its DLL-search-order hijack
   surface). Release profile: `opt-level="s"`, LTO, `panic="abort"`, stripped.
-* **`build-core.ps1`** — builds `MacType64.Core.dll` from `vendor/` (IniParser,
+* **`build-core.ps1`** — builds `RenderCore64.dll` from `vendor/` (IniParser,
   the snowie2000 FreeType fork, Detours) via MSBuild/vswhere.
 * **`build-msi.ps1`** — builds the core, `cargo build --release --workspace`,
-  stages exe + DLLs + `MacType.ini` + `ini\*.ini` into `build\pkg`, then
+  stages exe + DLLs + `font-tuner.ini` + `ini\*.ini` into `build\pkg`, then
   `wix build` → `dist\font-tuner-<ver>-x64.msi`.
 
 ---
@@ -143,9 +149,9 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
 
 * **Scope** perMachine, installs to `C:\Program Files\Font-tuner`.
 * **Run at logon** — writes `HKLM\...\CurrentVersion\Run\Font-tuner`.
-* **On install** — stops a running `MacTray.exe` and `font-tuner.exe`, then launches
+* **On install** — stops a running `font-tuner.exe`, then launches
   Font-tuner.
-* **`MacType.ini`** is marked `NeverOverwrite` — a user's selected profile
+* **`font-tuner.ini`** is marked `NeverOverwrite` — a user's selected profile
   (the `AlternativeFile` value) survives upgrades.
 * **Uninstall** — standard Add/Remove Programs entry, or
   `msiexec /x {ProductCode}`. Removes files, the Run registry value, and stops
@@ -159,5 +165,5 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
 
 ## 7. Licensing
 
-GPL-3.0-or-later. Bundles the MacType core and a FreeType fork from `vendor/`
+GPL-3.0-only. Bundles a FreeType fork from `vendor/`
 under their respective licenses. Tray icon art is CC0.

@@ -1,7 +1,7 @@
-//! font-tuner: a small tray loader for MacType.
+//! font-tuner: a small tray loader for the RenderCore64 text-rendering DLL.
 //!
-//! It does what the closed-source MacTray does in "tray mode": install a
-//! global WH_GETMESSAGE hook whose procedure lives in MacType64.dll, so that
+//! It does what the upstream closed-source tray does in "tray mode": install a
+//! global WH_GETMESSAGE hook whose procedure lives in RenderCore64.dll, so that
 //! every 64-bit GUI process maps the DLL and its DllMain hooks the font APIs.
 //! 32-bit processes are out of scope.
 
@@ -20,15 +20,17 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::System::WindowsProgramming::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCSTR, PCWSTR};
+use windows::core::{w, PCSTR, PCWSTR};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_ENABLED: usize = 1;
 const ID_EXIT: usize = 2;
+const ID_RELOAD: usize = 3;
+const ID_VERSION: usize = 4;
 const ID_PROFILE_BASE: usize = 100;
 const ID_SYSFONT_DEFAULT: usize = 200;
 const ID_SYSFONT_BASE: usize = 201;
-const DLL_NAME: &str = "MacType64.Core.dll";
+const DLL_NAME: &str = "RenderCore64.dll";
 /// Icon resources embedded via app.rc. Black-metallic reads on a light
 /// taskbar, silver on a dark one.
 const IDI_TRAY_LIGHT: usize = 1; // black metallic, for light taskbar
@@ -88,19 +90,28 @@ fn msgbox(text: &str) {
     }
 }
 
-/// The MacType install folder: next to this exe, else the default location.
-fn mactype_dir() -> Option<PathBuf> {
+/// Informational popup (not an error), used for the version item.
+fn infobox(text: &str) {
+    let t = wide(text);
+    let c = wide("Font-tuner");
+    unsafe {
+        MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+/// The Font-tuner install folder: next to this exe, else the default location.
+fn install_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let here = exe.parent()?.to_path_buf();
     if here.join(DLL_NAME).exists() {
         return Some(here);
     }
     let pf = std::env::var_os("ProgramFiles")?;
-    let d = Path::new(&pf).join("MacType");
+    let d = Path::new(&pf).join("Font-tuner");
     d.join(DLL_NAME).exists().then_some(d)
 }
 
-/// A global WH_GETMESSAGE hook backed by MacType's exported `GetMsgProc`.
+/// A global WH_GETMESSAGE hook backed by RenderCore64's exported `GetMsgProc`.
 struct Hook {
     hhook: HHOOK,
 }
@@ -156,7 +167,7 @@ impl Profiles {
             let rank = ORDER.iter().position(|o| *o == lower).unwrap_or(ORDER.len());
             (rank, lower)
         });
-        Profiles { ini: dir.join("MacType.ini"), names }
+        Profiles { ini: dir.join("font-tuner.ini"), names }
     }
 
     fn ini_path(&self) -> Vec<u16> {
@@ -294,8 +305,12 @@ impl App {
             );
             let _ = AppendMenuW(menu, MF_STRING | en, ID_ENABLED, PCWSTR(t1.as_ptr()));
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(t2.as_ptr()));
+            let tr = wide(self.s.reload);
+            let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, PCWSTR(tr.as_ptr()));
             let _ = AppendMenuW(menu, MF_POPUP, fsub.0 as usize, PCWSTR(tf.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let tv = wide(&format!("{} {}", self.s.version, env!("CARGO_PKG_VERSION")));
+            let _ = AppendMenuW(menu, MF_STRING, ID_VERSION, PCWSTR(tv.as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, PCWSTR(t3.as_ptr()));
             menu
         }
@@ -374,6 +389,23 @@ fn handle_command(hwnd: HWND, cmd: usize) {
         ID_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
         },
+        // Ask every injected process to re-read font-tuner.ini. The core's
+        // GetMsgProc handles this message on each process's own UI thread.
+        ID_RELOAD => unsafe {
+            let id = RegisterWindowMessageW(w!("FontTuner.ReloadProfile"));
+            let _ = PostMessageW(Some(HWND_BROADCAST), id, WPARAM(0), LPARAM(0));
+        },
+        ID_VERSION => infobox(&format!(
+            "Font-tuner {}\n\
+             License: GPL-3.0-only\n\
+             Source: {}\n\n\
+             Rendering core: RenderCore64 (Rust port), statically linked with\n\
+             the FreeType library.\n\
+             Portions of this software are copyright \u{00A9} The FreeType\n\
+             Project (www.freetype.org). All rights reserved.",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_REPOSITORY"),
+        )),
         ID_SYSFONT_DEFAULT => sysfont::restore(),
         c if (ID_SYSFONT_BASE..ID_SYSFONT_BASE + sysfont::FONTS.len()).contains(&c) => {
             sysfont::apply(sysfont::FONTS[c - ID_SYSFONT_BASE]);
@@ -391,7 +423,7 @@ fn handle_command(hwnd: HWND, cmd: usize) {
 
 fn main() {
     let s = lang::current();
-    let Some(dir) = mactype_dir() else {
+    let Some(dir) = install_dir() else {
         msgbox(s.err_no_dll);
         return;
     };

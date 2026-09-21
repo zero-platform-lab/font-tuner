@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Font-tuner installer. Self-contained: ships font-tuner.exe, the MacType core
+  Font-tuner installer. Self-contained: ships font-tuner.exe, the RenderCore64 core
   DLL built from source, and the rendering profiles. Registers Font-tuner to run
-  at logon, stops the closed-source MacTray if it is running, and starts it.
+  at logon, and starts it.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
@@ -16,7 +16,17 @@
            Scope="perMachine"
            InstallerVersion="500">
 
-    <MajorUpgrade DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallExecute" DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
+
+    <!-- RenderCore64.dll (and RenderBootstrap64.dll) is injected into every process on the machine, so it
+         is always "in use" by the user's terminal, shell, editor, etc.  With the
+         Restart Manager enabled, msiexec would close ALL of those to replace the
+         DLL - it has killed the user's PowerShell / Claude Code session more
+         than once.  Disable it: only the tray itself is closed
+         (util:CloseApplication below); the in-use core is renamed out of the
+         way by RenameOldCore so the new one can be placed immediately. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <Property Id="REBOOT" Value="ReallySuppress" />
     <MediaTemplate EmbedCab="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -24,10 +34,16 @@
         <Directory Id="ProfilesFolder" Name="ini" />
       </Directory>
     </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
 
     <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
       <Component Id="AppExe">
-        <File Id="AppExeFile" Source="$(var.StageDir)\font-tuner.exe" KeyPath="yes" />
+        <File Id="AppExeFile" Source="$(var.StageDir)\font-tuner.exe" KeyPath="yes">
+          <!-- Start menu entry, so the tray can be launched by hand after
+               "Exit" without digging into Program Files. -->
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Font-tuner"
+                    WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+        </File>
         <RegistryValue Root="HKLM"
                        Key="Software\Microsoft\Windows\CurrentVersion\Run"
                        Name="Font-tuner"
@@ -35,20 +51,20 @@
                        Type="string" />
       </Component>
       <Component Id="CoreDll">
-        <File Id="MacType64.Core.dll" Source="$(var.StageDir)\MacType64.Core.dll" />
+        <File Id="RenderCore64.dll" Source="$(var.StageDir)\RenderCore64.dll" />
       </Component>
       <Component Id="BootstrapDll">
         <!-- Child-process loader stub the core injects into every process it
              spawns (expfunc.cpp GdippInjectDLL). Rust replacement for the
-             closed-source MTBootStrap64.dll. Reaches ordinary child processes
+             closed-source upstream bootstrap. Reaches ordinary child processes
              (e.g. Chrome's crashpad-handler / utility processes); it does NOT
              reach Chrome/Edge renderer & GPU processes, which block unsigned
              DLLs via MITIGATION_FORCE_MS_SIGNED_BINS. -->
-        <File Id="MTBootStrap64.dll" Source="$(var.StageDir)\MTBootStrap64.dll" />
+        <File Id="RenderBootstrap64.dll" Source="$(var.StageDir)\RenderBootstrap64.dll" />
       </Component>
       <Component Id="MainIni" NeverOverwrite="yes" Permanent="no">
         <!-- User-edited; never clobbered on upgrade. -->
-        <File Id="MacType.ini" Source="$(var.StageDir)\MacType.ini" />
+        <File Id="FontTunerIni" Source="$(var.StageDir)\font-tuner.ini" />
       </Component>
     </ComponentGroup>
 
@@ -62,9 +78,36 @@
       <ComponentGroupRef Id="Profiles" />
     </Feature>
 
-    <!-- Stop both trays before files are touched. -->
-    <util:CloseApplication Id="CloseMacTray" Target="MacTray.exe"     CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
-    <util:CloseApplication Id="CloseApp"     Target="font-tuner.exe"  CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
+    <!-- Stop the tray before files are touched. -->
+    <util:CloseApplication Id="CloseApp" Target="font-tuner.exe" CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
+
+    <!-- RenderCore64.dll is mapped into every running GUI process and keeps
+         itself loaded until each of them exits, so the file is never free to
+         overwrite. Instead of MSI's fallback (leave the old file, swap on
+         reboot - new processes keep getting the OLD core until then), rename
+         the in-use file out of the way first: Windows allows renaming a mapped
+         image. InstallFiles then finds the name free and the freshly started
+         tray hooks with the new core immediately. RemoveExistingProducts is
+         scheduled afterInstallExecute (MSI forbids anything between
+         InstallInitialize and an afterInstallInitialize REP), so the old
+         product is removed after the new files are in place; shared
+         components (same GUID) are refcounted and left alone. -->
+    <!-- PowerShell rather than cmd: the renamed-away copy must be queued for
+         deletion at the next reboot (MoveFileEx DELAY_UNTIL_REBOOT), which cmd
+         cannot do. MSI's RemoveFile cannot either: it enumerates before the
+         script runs, so it never sees a file this action creates. Leftovers
+         from earlier upgrades are deleted here if freed, else queued too.
+         "[\[]", "[\{]", "[\}]" are MSI's escapes for literal [ { } (Formatted
+         syntax strips bare braces). -->
+    <SetProperty Id="RenameOldCore"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command &quot;$d='[INSTALLFOLDER]'; Add-Type -Namespace W -Name K -MemberDefinition '[\[]DllImport(\&quot;kernel32.dll\&quot;, CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool MoveFileExW(string a, IntPtr b, uint f);'; $f=Join-Path $d 'RenderCore64.dll'; if (Test-Path $f) [\{] $n=Join-Path $d ('RenderCore64.dll.old.' + (Get-Random)); Rename-Item $f $n; [\[]W.K]::MoveFileExW($n, [\[]IntPtr]::Zero, 4) | Out-Null [\}]; Get-ChildItem $d -Filter 'RenderCore64.dll.old.*' | ForEach-Object [\{] $q=$_.FullName; if ($q -ne $n) [\{] try [\{] Remove-Item $q -Force -ErrorAction Stop [\}] catch [\{] [\[]W.K]::MoveFileExW($q, [\[]IntPtr]::Zero, 4) | Out-Null [\}] [\}] [\}]&quot;"
+                 Before="RenameOldCore" Sequence="execute" />
+    <CustomAction Id="RenameOldCore"
+                  DllEntry="WixQuietExec64"
+                  BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
 
     <!-- Start Font-tuner when the install finishes. -->
     <CustomAction Id="LaunchApp"
@@ -74,7 +117,10 @@
                   Return="asyncNoWait"
                   Impersonate="yes" />
     <InstallExecuteSequence>
-      <Custom Action="LaunchApp" After="InstallFinalize" Condition="NOT Installed OR UPGRADINGPRODUCTCODE" />
+      <Custom Action="RenameOldCore" After="InstallInitialize" Condition="NOT REMOVE" />
+      <!-- NOT Installed only: with REP afterInstallExecute the old product's
+           own LaunchApp (UPGRADINGPRODUCTCODE) would start a second tray. -->
+      <Custom Action="LaunchApp" After="InstallFinalize" Condition="NOT Installed" />
     </InstallExecuteSequence>
 
   </Package>

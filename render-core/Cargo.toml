@@ -1,0 +1,18 @@
+[package]
+name = "render-core"
+version = "0.1.0"
+edition = "2021"
+description = "Experimental Rust port of the MacType glyph-rendering core (offline; no hooking)"
+license = "GPL-3.0-only"
+
+[lib]
+name = "render_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "render-core"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+

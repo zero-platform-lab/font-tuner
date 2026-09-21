@@ -1,0 +1,23 @@
+[package]
+name = "dwrite-analysis-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Intercept IDWriteGlyphRunAnalysis::CreateAlphaTexture (the Chromium/Skia glyph coverage path)"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "dwrite-analysis-probe"
+path = "src/main.rs"
+
+[dependencies]
+render-core = { path = "../render-core" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_DirectWrite",
+  "Win32_System_Memory",
+]

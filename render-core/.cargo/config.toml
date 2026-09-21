@@ -1,0 +1,4 @@
+# Match the static CRT of the FreeType fork lib (freetype64.lib, built "Release
+# Static"), so the C shim and the linked lib agree on the runtime.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

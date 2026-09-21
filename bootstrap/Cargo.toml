@@ -1,13 +1,13 @@
 [package]
-name = "mtbootstrap"
+name = "render-bootstrap"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
-description = "Child-process bootstrap for the MacType core DLL (replacement for the closed-source MTBootStrap64)"
+license = "GPL-3.0-only"
+description = "Child-process bootstrap that loads RenderCore64.dll (replacement for the closed-source upstream bootstrap)"
 repository = "https://github.com/zero-platform-Lab/font-tuner"
 
 [lib]
-name = "MTBootStrap64"
+name = "RenderBootstrap64"
 crate-type = ["cdylib"]
 
 [dependencies.windows]

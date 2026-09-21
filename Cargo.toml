@@ -1,12 +1,16 @@
 [workspace]
 members = ["bootstrap"]
+# Experimental Rust port of the C++ glyph-rendering core. Kept out of the main
+# workspace: it links the FreeType fork lib produced by build-core.ps1 and is
+# not part of the shipped product. Build it on its own from render-core/.
+exclude = ["render-core", "render-inject", "hook-probe", "injector", "text-window", "dwrite-probe", "dwrite-window", "loader", "dwrite-analysis-probe", "dwrite-analysis-window", "d2d-probe", "d2d-window"]
 
 [package]
 name = "font-tuner"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
-description = "Tray loader for MacType (replacement for the closed-source MacTray)"
+license = "GPL-3.0-only"
+description = "Font rendering tuner for Windows (tray + RenderCore64 injector)"
 repository = "https://github.com/zero-platform-Lab/font-tuner"
 
 [dependencies.windows]

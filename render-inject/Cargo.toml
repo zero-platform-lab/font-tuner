@@ -1,0 +1,31 @@
+[package]
+name = "render-inject"
+version = "0.1.0"
+edition = "2021"
+description = "Injected DLL that renders text with render-core (SKELETON ONLY — no hooking)"
+license = "GPL-3.0-only"
+
+[lib]
+name = "RenderCore64"
+crate-type = ["cdylib"]
+
+[dependencies]
+render-core = { path = "../render-core" }
+retour = "0.4.0-alpha.4"
+windows-numerics = "0.3"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_UI_WindowsAndMessaging",
+]

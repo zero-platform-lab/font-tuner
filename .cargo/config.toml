@@ -1,4 +1,4 @@
-# Statically link the MSVC CRT. MTBootStrap64.dll is injected into arbitrary
+# Statically link the MSVC CRT. RenderBootstrap64.dll is injected into arbitrary
 # child processes; a dynamic VCRUNTIME140.dll dependency would be resolved via
 # the *target* process's DLL search path, giving an attacker a hijack surface
 # (plant VCRUNTIME140.dll next to a process that runs from a writable dir).
