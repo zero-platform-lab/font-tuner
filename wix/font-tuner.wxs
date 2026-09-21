@@ -16,7 +16,16 @@
            Scope="perMachine"
            InstallerVersion="500">
 
-    <MajorUpgrade DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
+
+    <!-- MTBootStrap64.dll is injected into every process on the machine, so it
+         is always "in use" by the user's terminal, shell, editor, etc.  With the
+         Restart Manager enabled, msiexec would close ALL of those to replace the
+         DLL - it has killed the user's PowerShell / Claude Code session more
+         than once.  Disable it: in-use files are swapped on next reboot instead,
+         and only the tray itself is closed (util:CloseApplication below). -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <Property Id="REBOOT" Value="ReallySuppress" />
     <MediaTemplate EmbedCab="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
