@@ -5,10 +5,10 @@
 //!   * `render-core.png` — our ExtTextOutW hook renders with render-core and
 //!                         blits the result into the DIB, skipping GDI.
 //!
-//! Simplifications (Stage 3a): the font is fixed to Meiryo at a fixed pixel
-//! size instead of being resolved from the DC's LOGFONT; the text colour is
-//! black on white; only the string path is handled. Full font resolution and
-//! the glyph-index path are later stages.
+//! Stage 3b: the font is now resolved from the DC — pixel size from the
+//! selected LOGFONT and the actual font bytes via GetFontData ('ttcf' tag for
+//! TTCs, matching the family for the right sub-face). Text is black on white,
+//! string path only; colour/opacity and the glyph-index path are later stages.
 
 use core::ffi::c_void;
 use std::ptr::null_mut;
@@ -20,11 +20,13 @@ use windows::core::{s, w, PCWSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, ExtTextOutW,
-    GetTextMetricsW, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER,
-    DIB_RGB_COLORS, ETO_OPTIONS, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
-    FONT_QUALITY, HDC, TEXTMETRICW, TRANSPARENT,
+    GetCurrentObject, GetFontData, GetObjectW, GetTextMetricsW, SelectObject, SetBkMode,
+    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, ETO_OPTIONS, FONT_CHARSET,
+    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, LOGFONTW, OBJ_FONT,
+    TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
 
 const W: i32 = 460;
 const H: i32 = 64;
@@ -61,11 +63,41 @@ unsafe extern "system" fn detour(
     let tables = TABLES.as_ref().unwrap();
     let profile = PROFILE.as_ref().unwrap();
 
+    // --- resolve the font from the DC ---
+    let hdc = HDC(_hdc as *mut c_void);
+    // pixel size from the selected LOGFONT
+    let hfont = GetCurrentObject(hdc, OBJ_FONT);
+    let mut lf = LOGFONTW::default();
+    GetObjectW(hfont, core::mem::size_of::<LOGFONTW>() as i32,
+               Some(&mut lf as *mut _ as *mut c_void));
+    let px = if lf.lfHeight != 0 { lf.lfHeight.unsigned_abs() as i32 } else { PX };
+    // The actual font file bytes GDI is using. For a TrueType Collection,
+    // GetFontData with dwTable=0 returns bytes FreeType can't parse; the
+    // 'ttcf' tag (0x66637474 as GDI reads it) returns the whole collection.
+    const TTCF: u32 = 0x6663_7474;
+    let mut table = TTCF;
+    let mut size = GetFontData(hdc, TTCF, 0, None, 0);
+    if size == 0 || size == u32::MAX {
+        table = 0;
+        size = GetFontData(hdc, 0, 0, None, 0);
+    }
+    if size == 0 || size == u32::MAX {
+        return (ORIG.unwrap())(_hdc, x, y, _options, _rect, str_ptr, count, _dx);
+    }
+    let mut buf = vec![0u8; size as usize];
+    GetFontData(hdc, table, 0, Some(buf.as_mut_ptr() as *mut c_void), size);
+    let face = String::from_utf16_lossy(
+        &lf.lfFaceName[..lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(0)],
+    );
+    if ft.reface_memory(&buf, &face).is_err() {
+        return (ORIG.unwrap())(_hdc, x, y, _options, _rect, str_ptr, count, _dx);
+    }
+
     // Render the whole DIB-sized canvas with the text at the draw origin;
     // baseline = y + ascent so the text cell top lands at y.
     let canvas = render_text(
         ft, tables, profile, Ink::default(), [255, 255, 255],
-        &text, PX, (x, y + ASCENT), (W as usize, H as usize),
+        &text, px, (x, y + ASCENT), (W as usize, H as usize),
     );
     // Copy canvas (RGB, top-down) into the DIB (BGRA, top-down).
     let dib = std::slice::from_raw_parts_mut(DIB, (W * H * 4) as usize);
@@ -75,7 +107,7 @@ unsafe extern "system" fn detour(
         dib[i * 4 + 2] = canvas.rgb[i * 3]; // R
         dib[i * 4 + 3] = 255; // A
     }
-    println!("[writeback] rendered {text:?} at ({x},{y}) via render-core");
+    println!("[writeback] rendered {text:?} font={face:?} px={px} at ({x},{y}) via render-core");
     1 // skip GDI
 }
 
@@ -122,8 +154,9 @@ fn main() {
         DIB = bits as *mut u8;
         fill_white();
 
-        // A Meiryo font at PX (negative height = character height), grayscale AA.
-        let face = w!("Meiryo");
+        // Use a font OTHER than the old hardcoded Meiryo so that correct
+        // resolution from the DC is visible. Yu Gothic UI at PX, grayscale AA.
+        let face = w!("Yu Gothic UI");
         let font = CreateFontW(
             -PX, 0, 0, 0, 400, 0, 0, 0,
             FONT_CHARSET(1),               // DEFAULT_CHARSET
