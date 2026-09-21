@@ -25,7 +25,7 @@ use render_core::render::{draw_glyphs_onto, draw_text_onto, glyph_run_coverage_l
 use render_core::{tables_for, Aa, Ft, Profile, Tables};
 use windows::core::{PCWSTR, s, w, Interface, BOOL, GUID, HRESULT};
 use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
-use windows::Win32::Foundation::{HINSTANCE, HMODULE, RECT};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HMODULE, RECT};
 use windows::Win32::Graphics::Direct2D::{ID2D1Brush, ID2D1GdiInteropRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_DC_INITIALIZE_MODE_COPY};
 use windows_numerics::Vector2;
 use windows::Win32::Graphics::DirectWrite::{
@@ -43,8 +43,13 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS};
 use windows::Win32::System::Threading::{
-    CreateThread, GetCurrentProcessId, THREAD_CREATION_FLAGS,
+    CreateMutexW, CreateThread, GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread,
+    SuspendThread, THREAD_CREATION_FLAGS, THREAD_SUSPEND_RESUME,
 };
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+};
+use retour::RawDetour;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
@@ -96,8 +101,10 @@ struct RunInfo {
     baseline: (i32, i32),
 }
 
+static LOG_LOCK: Mutex<()> = Mutex::new(());
 fn log(msg: &str) {
     if let Some(tmp) = std::env::var_os("TEMP") {
+        let _g = LOG_LOCK.lock();
         let path = PathBuf::from(tmp).join("render-inject.log");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{msg}");
@@ -658,6 +665,74 @@ unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_
     Some(())
 }
 
+/// Installed inline detours, kept alive for the life of the process (the DLL
+/// pins itself, so they are never disabled). retour patches the target's first
+/// bytes non-atomically and does NOT stop other threads while doing so, so a
+/// thread executing inside those bytes at that instant would fault. We suspend
+/// every other thread in this process around the patch — the same window
+/// MinHook closes internally — then leak the detour so it stays enabled.
+static DETOURS: Mutex<Vec<RawDetour>> = Mutex::new(Vec::new());
+
+/// Suspend all threads in this process except the caller, for the duration of
+/// the returned guard. Resumed (in reverse) on drop. Best-effort: threads that
+/// cannot be opened/suspended are skipped.
+struct FrozenThreads(Vec<isize>);
+impl FrozenThreads {
+    unsafe fn all_but_current() -> FrozenThreads {
+        let pid = GetCurrentProcessId();
+        let me = GetCurrentThreadId();
+        let mut handles = Vec::new();
+        if let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
+            let mut e = THREADENTRY32 { dwSize: core::mem::size_of::<THREADENTRY32>() as u32, ..Default::default() };
+            if Thread32First(snap, &mut e).is_ok() {
+                loop {
+                    if e.th32OwnerProcessID == pid && e.th32ThreadID != me {
+                        if let Ok(h) = OpenThread(THREAD_SUSPEND_RESUME, false, e.th32ThreadID) {
+                            // SuspendThread returns (DWORD)-1 on failure.
+                            if SuspendThread(h) != u32::MAX {
+                                handles.push(h.0 as isize);
+                            } else {
+                                let _ = CloseHandle(h);
+                            }
+                        }
+                    }
+                    if Thread32Next(snap, &mut e).is_err() { break; }
+                }
+            }
+            let _ = CloseHandle(snap);
+        }
+        FrozenThreads(handles)
+    }
+}
+impl Drop for FrozenThreads {
+    fn drop(&mut self) {
+        for &h in self.0.iter().rev() {
+            unsafe {
+                let hh = HANDLE(h as *mut c_void);
+                ResumeThread(hh);
+                let _ = CloseHandle(hh);
+            }
+        }
+    }
+}
+
+/// Create + enable an inline detour on `target`, with other threads frozen
+/// around the byte patch. Returns the trampoline (original) on success.
+unsafe fn install_hook(target: *const (), detour: *const ()) -> Option<*const ()> {
+    let d = match RawDetour::new(target, detour) {
+        Ok(d) => d,
+        Err(e) => { log(&format!("detour new failed: {e:?}")); return None; }
+    };
+    let tramp = d.trampoline() as *const () as *const ();
+    let ok = {
+        let _frozen = FrozenThreads::all_but_current();
+        d.enable().is_ok()
+    };
+    if !ok { log("detour enable failed"); return None; }
+    if let Ok(mut v) = DETOURS.lock() { v.push(d); }
+    Some(tramp)
+}
+
 /// Hook d2d1!D2D1CreateFactory so we can patch render-target DrawGlyphRun.
 unsafe fn setup_d2d_hook() {
     let d2d1 = match GetModuleHandleW(w!("d2d1.dll")) {
@@ -668,18 +743,32 @@ unsafe fn setup_d2d_hook() {
         },
     };
     let Some(target) = GetProcAddress(d2d1, s!("D2D1CreateFactory")) else { return };
-    match minhook::MinHook::create_hook(target as *mut c_void, d2dcf_detour as *mut c_void) {
-        Ok(tramp) => {
-            ORIG_D2DCF = Some(std::mem::transmute::<*mut c_void, FnD2DCreateFactory>(tramp));
-            if minhook::MinHook::enable_all_hooks().is_ok() { log("hook installed on D2D1CreateFactory"); }
-        }
-        Err(e) => log(&format!("D2D1CreateFactory hook failed: {e:?}")),
+    if let Some(tramp) = install_hook(target as *const (), d2dcf_detour as *const ()) {
+        ORIG_D2DCF = Some(std::mem::transmute::<*const (), FnD2DCreateFactory>(tramp));
+        log("hook installed on D2D1CreateFactory");
+    } else {
+        log("D2D1CreateFactory hook failed");
     }
 }
 
 /// Runs off the loader lock: init render-core and install the hook.
 unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     let pid = GetCurrentProcessId();
+    // Attach once per *process*, across DLL instances. This image can be mapped
+    // into one process more than once (Windows keys module identity by the path
+    // it was loaded with, so the WH_GETMESSAGE map and another load can become
+    // two instances with separate statics). A second attach would detour
+    // ExtTextOutW over our own jump, and retour would build a trampoline from
+    // that jump — corrupting the call chain and crashing the host. A named
+    // kernel mutex is shared across instances, so the first attach owns it and
+    // the rest bail. The handle is leaked on purpose: released only at process
+    // exit, keeping the claim for the process's life.
+    let guard_name: Vec<u16> = format!("Local\\FontTuner.Attached.{pid}\0").encode_utf16().collect();
+    let h = CreateMutexW(None, true, PCWSTR(guard_name.as_ptr()));
+    if h.is_err() || GetLastError() == ERROR_ALREADY_EXISTS {
+        if let Ok(hh) = h { let _ = CloseHandle(hh); }
+        return 0;
+    }
     let mut buf = [0u16; 260];
     let n = GetModuleFileNameW(None, &mut buf);
     let exe = String::from_utf16_lossy(&buf[..n as usize]);
@@ -699,16 +788,11 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
 
     let Ok(gdi32) = GetModuleHandleW(w!("gdi32.dll")) else { return 1 };
     let Some(target) = GetProcAddress(gdi32, s!("ExtTextOutW")) else { return 1 };
-    match minhook::MinHook::create_hook(target as *mut c_void, detour as *mut c_void) {
-        Ok(tramp) => {
-            ORIG = Some(std::mem::transmute::<*mut c_void, FnEto>(tramp));
-            if minhook::MinHook::enable_all_hooks().is_ok() {
-                log("hook installed on ExtTextOutW");
-            } else {
-                log("enable_all_hooks failed");
-            }
-        }
-        Err(e) => log(&format!("create_hook failed: {e:?}")),
+    if let Some(tramp) = install_hook(target as *const (), detour as *const ()) {
+        ORIG = Some(std::mem::transmute::<*const (), FnEto>(tramp));
+        log("hook installed on ExtTextOutW");
+    } else {
+        log("ExtTextOutW hook failed");
     }
     setup_dwrite_hook();
     setup_d2d_hook();
@@ -716,7 +800,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
 }
 
 #[no_mangle]
-pub extern "system" fn DllMain(hinst: HINSTANCE, reason: u32, reserved: *mut c_void) -> BOOL {
+pub extern "system" fn DllMain(hinst: HINSTANCE, reason: u32, _reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
             SELF_HINST = hinst;
@@ -743,7 +827,7 @@ pub extern "system" fn DllMain(hinst: HINSTANCE, reason: u32, reserved: *mut c_v
     } else if reason == DLL_PROCESS_DETACH {
         // Pinned above, so this only ever runs at process termination. The
         // process is being torn down and will not draw again; touching
-        // vtables or MinHook (thread suspension) here is pointless and can
+        // vtables or the detours (thread suspension) here is pointless and can
         // itself fault. Do nothing, as the C++ core does on termination.
     }
     BOOL(1)

@@ -9,7 +9,7 @@ Font-tuner は GPL-3.0-or-later で配布する。MSI に同梱するものと�
 | `font-tuner.exe` (トレイ) | このリポジトリ (`src/`) | GPL-3.0-or-later | ソース公開 (このリポジトリ) |
 | `RenderCore64.dll` (描画コア + フック) | このリポジトリ (`render-inject/`, `render-core/`)。描画アルゴリズム (`render-core`) は [snowie2000/mactype](https://github.com/snowie2000/mactype) の `ft.cpp` ほかを Rust に移植したもの (翻訳 = 改変物) | GPL-3.0-or-later (派生元が GPL-3.0) | ソース公開。派生元の表記を消さない |
 | ↳ 内部に静的リンク: FreeType | [snowie2000/freetype](https://github.com/snowie2000/freetype) (`vendor/freetype`)。本家 FreeType に `FT_Glyph_To_BitmapEx` を足したフォーク | FTL または GPLv2+ の二択 | **表示義務**: 「Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.」を README か About に載せる |
-| ↳ 内部に静的リンク: MinHook | [TsudaKageyu/minhook](https://github.com/TsudaKageyu/minhook) (Rust crate `minhook` 0.5 経由) | BSD-2-Clause (C ライブラリ) / MIT (Rust crate) | 著作権表示とライセンス本文を同梱 |
+| ↳ フック機構: retour + iced-x86 | [Hpmason/retour-rs](https://github.com/Hpmason/retour-rs) (inline detour) / [icedland/iced](https://github.com/icedland/iced) (逆アセンブラ) | retour: BSD-3-Clause / iced-x86: MIT | 著作権表示 (crate に同梱) |
 | `RenderBootstrap64.dll` (子プロセス用ローダ) | このリポジトリ (`bootstrap/`) | GPL-3.0-or-later | ソース公開 |
 | `font-tuner.ini` | このリポジトリ (`profiles/`)。`[UnloadDll]` の除外リストは純正 MacType 同梱のものを元にした | GPL-3.0 | — |
 | `ini\*.ini` (プロファイル 5 本) | 純正 MacType 同梱のプロファイルを元にした。各ファイル冒頭に作者名あり (Samantha Glocker, mufunyo) | MacType 配布物の一部として GPL-3.0 で配布されている | 作者コメント行を削らない |
@@ -21,7 +21,7 @@ Font-tuner は GPL-3.0-or-later で配布する。MSI に同梱するものと�
 | もの | 理由 |
 |---|---|
 | 純正 MacType のバイナリ一式 (コア DLL、トレイ、ウィザード、ブートストラップ、更新ツール) | Font-tuner が置き換える対象。コアは Rust 移植 (`RenderCore64.dll`) に置き換え済み |
-| Microsoft Detours / IniParser | C++ コアを同梱しなくなったので不要。フックは MinHook |
+| Microsoft Detours / IniParser / MinHook | C++ コアを同梱しなくなったので不要。フックは純 Rust の retour + iced-x86 |
 | `easyhk64.dll` (EasyHook) / `wow64ext` | 使わない (32bit 非対応) |
 
 ## 系譜
@@ -38,6 +38,5 @@ Font-tuner は GPL-3.0-or-later で配布する。MSI に同梱するものと�
 
 - `LICENSE` — GPL-3.0 (Font-tuner、RenderCore64 の派生元)
 - `vendor/freetype/docs/FTL.TXT`, `vendor/freetype/docs/GPLv2.TXT`
-- MinHook: BSD-2-Clause (https://github.com/TsudaKageyu/minhook/blob/master/LICENSE.txt)
 
 Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.
