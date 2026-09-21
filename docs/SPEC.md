@@ -153,6 +153,13 @@ The `[DirectWrite]` section (`GammaValue`, `Contrast`, `ClearTypeLevel`,
 ourselves (1.2). Defaults follow upstream: gamma derived from the general one
 (`g² > 1.3 ? g²/2 : 0.7`), contrast 1.0, ClearType level 1.0, mode 5.
 
+`[Experimental] ClipBoxFix` (default 1) pads the metrics `GetGlyphOutline`
+reports for a metrics-only query — origin up by `floor(1.5·DPI/96)` px, black
+box grown the same, both capped to the font's ascent/height — so apps that
+clip glyphs to those metrics (Java2D) do not cut off the heavier rendered
+glyphs. Per-process sections such as `[Experimental@idea64.exe]` are read
+by upstream only; the core has no per-process settings.
+
 ### 2.2 Menu order
 
 The tray lists profiles in a fixed preferred order (`ORDER` in `src/main.rs`),

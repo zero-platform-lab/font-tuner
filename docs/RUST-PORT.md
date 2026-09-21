@@ -24,7 +24,9 @@ the tray's global (or loader's single-process) WH_GETMESSAGE hook maps RenderCor
   → DllMain self-pins (GetModuleHandleEx FLAG_PIN) and spawns a thread
     (off the loader lock) that, once per process (named-mutex guard):
       loads the active profile (install-dir font-tuner.ini AlternativeFile, else default)
-      hooks gdi32!ExtTextOutW               (retour inline detour, other threads frozen)
+      hooks gdi32!ExtTextOutW               (retour inline detour, other threads frozen;
+                                             TextOutW/TextOutA/ExtTextOutA arrive here too)
+      hooks gdi32!GetGlyphOutlineW/A        (ClipBoxFix: pad metrics-only queries)
       patches IDWriteBitmapRenderTarget::DrawGlyphRun in the shared vtable
       patches IDWriteFactory{,2,3}::CreateGlyphRunAnalysis (→ CreateAlphaTexture)
       hooks d2d1!D2D1CreateFactory / D2D1CreateDevice / D2D1CreateDeviceContext, then
@@ -83,7 +85,8 @@ paths MacType hooks, and where we stand:
 | path | MacType hooks | ours |
 |---|---|---|
 | GDI `ExtTextOutW` | yes | **done** |
-| GDI `ExtTextOutA` / `TextOutW/A` / `GetGlyphOutline*` | yes | todo (most apps hit ExtTextOutW) |
+| GDI `ExtTextOutA` / `TextOutW` / `TextOutA` | yes | **covered without own hooks**: on Windows 11 (26200) all three end in the `ExtTextOutW` entry our inline detour patches (verified with the probe harness) |
+| GDI `GetGlyphOutlineW` / `GetGlyphOutlineA` (upstream "ClipBoxFix") | yes | **done** (`gdi_metrics.rs`; `[Experimental] ClipBoxFix`, default on; per-process `[Experimental@exe]` sections not applied) |
 | DirectWrite `IDWriteBitmapRenderTarget::DrawGlyphRun` (vtbl 3) | yes | **done** |
 | DirectWrite `CreateGlyphRunAnalysis` → `CreateAlphaTexture` (Chromium/Skia, VS Code), incl. the `IDWriteFactory2`/`3` overloads | yes | **done** |
 | Direct2D `ID2D1RenderTarget::DrawGlyphRun` (vtbl 29) | yes | **done** (via `D2D1CreateFactory` → RT creation → per-vtable patch) |

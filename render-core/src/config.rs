@@ -72,34 +72,38 @@ pub struct Profile {
     pub embolden: i32,
     /// `[DirectWrite]` overrides for the paths DirectWrite/Direct2D render.
     pub dw: DwParams,
+    /// `[Experimental] ClipBoxFix` (default on, as upstream): pad the glyph
+    /// metrics `GetGlyphOutline` reports so apps that clip to them (Java2D)
+    /// do not cut off the heavier rendered glyphs.
+    pub clipbox_fix: bool,
 }
 
 impl Profile {
     /// Clean Greyscale (shipped default): greyscale, no hinting bias, gamma 1.25.
     pub fn clean_greyscale() -> Profile {
         Profile { gamma: 1.25, weight: 1.0, contrast: 1.0, gamma_mode: 0,
-                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.25) }
+                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.25), clipbox_fix: true }
     }
     /// Clean Sharp: LCD subpixel, no hinting, gamma 1.2, no LCD filter.
     pub fn clean_sharp() -> Profile {
         Profile { gamma: 1.20, weight: 1.0, contrast: 1.0, gamma_mode: 0,
-                  aa: Aa::LcdRgb, hinting: 1, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.20) }
+                  aa: Aa::LcdRgb, hinting: 1, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.20), clipbox_fix: true }
     }
     /// Accurate: LightLCD, autohint, gamma 1.3, LIGHT filter.
     pub fn accurate() -> Profile {
         Profile { gamma: 1.30, weight: 1.0, contrast: 1.0, gamma_mode: 0,
-                  aa: Aa::LightLcdRgb, hinting: 2, lcd_filter: 2, embolden: 0, dw: DwParams::derived_from(1.30) }
+                  aa: Aa::LightLcdRgb, hinting: 2, lcd_filter: 2, embolden: 0, dw: DwParams::derived_from(1.30), clipbox_fix: true }
     }
     /// Clean Dark Greyscale: greyscale tuned for dark backgrounds
     /// (gamma 1.1, contrast 0.9, slightly heavier weight).
     pub fn clean_dark_greyscale() -> Profile {
         Profile { gamma: 1.10, weight: 1.05, contrast: 0.9, gamma_mode: 0,
-                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.10) }
+                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.10), clipbox_fix: true }
     }
     /// Clean Sharp Dark: LCD subpixel tuned for dark backgrounds.
     pub fn clean_sharp_dark() -> Profile {
         Profile { gamma: 1.10, weight: 1.05, contrast: 0.9, gamma_mode: 0,
-                  aa: Aa::LcdRgb, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.10) }
+                  aa: Aa::LcdRgb, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.10), clipbox_fix: true }
     }
 
     /// Parse a MacType profile `.ini` into a `Profile`. Keys outside
@@ -115,25 +119,45 @@ impl Profile {
     pub fn from_ini_str(text: &str) -> Profile {
         let mut p = Profile::clean_greyscale();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut in_dw = false;
+        #[derive(PartialEq)]
+        enum Section { General, DirectWrite, Experimental, Other }
+        let mut section = Section::General;
         // Explicit [DirectWrite] values; the rest is derived once the general
         // gamma is known (upstream reads the section after [General]).
         let mut dw: [Option<f32>; 4] = [None; 4];
+        let mut clipbox_fix: Option<bool> = None;
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with(';') {
                 continue;
             }
             if line.starts_with('[') {
-                in_dw = line.trim_end_matches(']').trim_start_matches('[').trim().eq_ignore_ascii_case("DirectWrite");
+                let name = line.trim_end_matches(']').trim_start_matches('[').trim();
+                // Per-process sections (`[Experimental@idea64.exe]`) are not
+                // applied: the core has no per-exe settings yet.
+                section = if name.eq_ignore_ascii_case("DirectWrite") { Section::DirectWrite }
+                    else if name.eq_ignore_ascii_case("Experimental") { Section::Experimental }
+                    else if name.eq_ignore_ascii_case("General") || name.eq_ignore_ascii_case("FreeType") { Section::General }
+                    else { Section::Other };
                 continue;
             }
             let Some((k, v)) = line.split_once('=') else { continue };
             let (k, v) = (k.trim(), v.trim());
-            if in_dw {
-                let i = match k { "GammaValue" => 0, "Contrast" => 1, "ClearTypeLevel" => 2, "RenderingMode" => 3, _ => continue };
-                if dw[i].is_none() { dw[i] = v.parse().ok(); }
-                continue;
+            match section {
+                Section::DirectWrite => {
+                    let i = match k { "GammaValue" => 0, "Contrast" => 1, "ClearTypeLevel" => 2, "RenderingMode" => 3, _ => continue };
+                    if dw[i].is_none() { dw[i] = v.parse().ok(); }
+                    continue;
+                }
+                Section::Experimental => {
+                    // Profiles spell it ClipBoxFix / Clipboxfix / clipboxfix.
+                    if k.eq_ignore_ascii_case("ClipBoxFix") && clipbox_fix.is_none() {
+                        clipbox_fix = v.parse::<i32>().ok().map(|n| n != 0);
+                    }
+                    continue;
+                }
+                Section::Other => continue,
+                Section::General => {}
             }
             if !seen.insert(k) { continue; } // first occurrence wins
             match k {
@@ -157,6 +181,7 @@ impl Profile {
             cleartype_level: dw[2].unwrap_or(d.cleartype_level).clamp(0.0, 1.0),
             rendering_mode: (dw[3].unwrap_or(d.rendering_mode as f32) as i32).clamp(0, 6),
         };
+        p.clipbox_fix = clipbox_fix.unwrap_or(true);
         p
     }
 }
@@ -187,9 +212,30 @@ Contrast=0.0
         assert!((p.gamma - 1.3).abs() < 1e-6, "first (General) GammaValue wins over DirectWrite");
         assert!((p.contrast - 1.0).abs() < 1e-6);
         assert!((p.dw.gamma - 1.4).abs() < 1e-6, "[DirectWrite] GammaValue lands in dw");
-        assert!((p.dw.contrast - 0.0).abs() < 1e-6);
+        // Contrast=0.0 is clamped to upstream's CONTRAST_MIN (settings.cpp).
+        assert!((p.dw.contrast - 0.0625).abs() < 1e-6);
         assert!((p.dw.cleartype_level - 1.0).abs() < 1e-6, "absent key keeps the upstream default");
         assert_eq!(p.dw.rendering_mode, 5);
+    }
+
+    #[test]
+    fn clipbox_fix_from_experimental_section_any_case() {
+        assert!(Profile::from_ini_str("").clipbox_fix, "upstream default is on");
+        assert!(!Profile::from_ini_str("[Experimental]
+clipboxfix=0
+").clipbox_fix);
+        assert!(Profile::from_ini_str("[Experimental]
+ClipBoxFix=1
+").clipbox_fix);
+        // a per-process section must not override the plain one
+        assert!(!Profile::from_ini_str("[Experimental]
+Clipboxfix=0
+[Experimental@idea64.exe]
+clipboxfix=1
+").clipbox_fix);
+        // and a key outside [Experimental] is ignored
+        assert!(Profile::from_ini_str("ClipBoxFix=0
+").clipbox_fix);
     }
 
     #[test]

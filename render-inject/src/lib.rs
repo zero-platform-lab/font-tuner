@@ -40,6 +40,7 @@ use windows::Win32::System::Threading::{
 
 mod dwrite;
 mod d2d;
+mod gdi_metrics;
 mod hook;
 mod state;
 mod profile;
@@ -303,6 +304,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     } else {
         log("ExtTextOutW hook failed");
     }
+    gdi_metrics::setup_gdi_metrics_hooks();
     setup_dwrite_hook();
     setup_d2d_hook();
     0
