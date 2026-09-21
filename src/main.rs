@@ -1,6 +1,6 @@
 //! font-tuner: a small tray loader for the RenderCore64 text-rendering DLL.
 //!
-//! It does what the closed-source MacTray does in "tray mode": install a
+//! It does what the upstream closed-source tray does in "tray mode": install a
 //! global WH_GETMESSAGE hook whose procedure lives in RenderCore64.dll, so that
 //! every 64-bit GUI process maps the DLL and its DllMain hooks the font APIs.
 //! 32-bit processes are out of scope.

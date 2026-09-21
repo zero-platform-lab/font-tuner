@@ -2,7 +2,7 @@
 <!--
   Font-tuner installer. Self-contained: ships font-tuner.exe, the RenderCore64 core
   DLL built from source, and the rendering profiles. Registers Font-tuner to run
-  at logon, stops the closed-source MacTray if it is running, and starts it.
+  at logon, and starts it.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
@@ -78,9 +78,8 @@
       <ComponentGroupRef Id="Profiles" />
     </Feature>
 
-    <!-- Stop both trays before files are touched. -->
-    <util:CloseApplication Id="CloseMacTray" Target="MacTray.exe"     CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
-    <util:CloseApplication Id="CloseApp"     Target="font-tuner.exe"  CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
+    <!-- Stop the tray before files are touched. -->
+    <util:CloseApplication Id="CloseApp" Target="font-tuner.exe" CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
 
     <!-- RenderCore64.dll is mapped into every running GUI process and keeps
          itself loaded until each of them exits, so the file is never free to

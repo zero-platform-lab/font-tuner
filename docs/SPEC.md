@@ -1,7 +1,7 @@
 # Font-tuner specification
 
 A small, self-contained font-rendering tuner for Windows (tray + injected render core; upstream: https://github.com/snowie2000/mactype).
-It reproduces what the closed-source *MacTray* does in "tray mode", ships the
+It reproduces what the upstream closed-source tray does in "tray mode", ships the
 render core DLL built from source, bundles a set of rendering profiles, and
 adds a tray-menu system-font switcher. Windows 11, 64-bit only.
 
@@ -149,7 +149,7 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
 
 * **Scope** perMachine, installs to `C:\Program Files\Font-tuner`.
 * **Run at logon** — writes `HKLM\...\CurrentVersion\Run\Font-tuner`.
-* **On install** — stops a running `MacTray.exe` and `font-tuner.exe`, then launches
+* **On install** — stops a running `font-tuner.exe`, then launches
   Font-tuner.
 * **`font-tuner.ini`** is marked `NeverOverwrite` — a user's selected profile
   (the `AlternativeFile` value) survives upgrades.
