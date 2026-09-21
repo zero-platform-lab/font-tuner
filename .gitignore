@@ -1,0 +1,6 @@
+/target
+/build/lib/
+/build/stage/
+/build/pkg/
+/dist/
+/vendor/mactype/x64/

@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Font-tuner installer. Self-contained: ships font-tuner.exe, the MacType core
+  DLL built from source, and the rendering profiles. Registers Font-tuner to run
+  at logon, stops the closed-source MacTray if it is running, and starts it.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Name="Font-tuner"
+           Manufacturer="zero-platform-Lab"
+           Version="$(var.Version)"
+           UpgradeCode="7d0f6c3e-2f0c-4c1b-9b0e-5a1d2c3b4e5f"
+           Language="1041"
+           Codepage="65001"
+           Scope="perMachine"
+           InstallerVersion="500">
+
+    <MajorUpgrade DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Font-tuner">
+        <Directory Id="ProfilesFolder" Name="ini" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
+      <Component Id="AppExe">
+        <File Id="AppExeFile" Source="$(var.StageDir)\font-tuner.exe" KeyPath="yes" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="Font-tuner"
+                       Value="&quot;[INSTALLFOLDER]font-tuner.exe&quot;"
+                       Type="string" />
+      </Component>
+      <Component Id="CoreDll">
+        <File Id="MacType64.Core.dll" Source="$(var.StageDir)\MacType64.Core.dll" />
+      </Component>
+      <Component Id="BootstrapDll">
+        <!-- Child-process loader stub the core injects into every process it
+             spawns (expfunc.cpp GdippInjectDLL). Rust replacement for the
+             closed-source MTBootStrap64.dll. Reaches ordinary child processes
+             (e.g. Chrome's crashpad-handler / utility processes); it does NOT
+             reach Chrome/Edge renderer & GPU processes, which block unsigned
+             DLLs via MITIGATION_FORCE_MS_SIGNED_BINS. -->
+        <File Id="MTBootStrap64.dll" Source="$(var.StageDir)\MTBootStrap64.dll" />
+      </Component>
+      <Component Id="MainIni" NeverOverwrite="yes" Permanent="no">
+        <!-- User-edited; never clobbered on upgrade. -->
+        <File Id="MacType.ini" Source="$(var.StageDir)\MacType.ini" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ini\*.ini harvested at build time by build-msi.ps1. -->
+    <ComponentGroup Id="Profiles" Directory="ProfilesFolder">
+      <Files Include="$(var.StageDir)\ini\*.ini" />
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Font-tuner" Level="1">
+      <ComponentGroupRef Id="Main" />
+      <ComponentGroupRef Id="Profiles" />
+    </Feature>
+
+    <!-- Stop both trays before files are touched. -->
+    <util:CloseApplication Id="CloseMacTray" Target="MacTray.exe"     CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
+    <util:CloseApplication Id="CloseApp"     Target="font-tuner.exe"  CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
+
+    <!-- Start Font-tuner when the install finishes. -->
+    <CustomAction Id="LaunchApp"
+                  FileRef="AppExeFile"
+                  ExeCommand=""
+                  Execute="immediate"
+                  Return="asyncNoWait"
+                  Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="LaunchApp" After="InstallFinalize" Condition="NOT Installed OR UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

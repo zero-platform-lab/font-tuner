@@ -1,0 +1,58 @@
+# Font-tuner
+
+MacType のトレイローダ。非公開 (Delphi 製) の MacTray / MacWiz / ブートストラップを使わず、
+公開ソースの描画 DLL (`MacType64.Core.dll`) を自前でビルドして同梱する。
+
+- 64bit プロセスのみ (32bit は対象外)
+- Windows 11 前提
+- UI は日本語 / 英語 (OS の UI 言語で切替)
+- ライセンス: GPL-3.0-or-later。権利関係の詳細は [NOTICE.md](NOTICE.md)
+
+## 使い方
+
+`dist\font-tuner-<ver>-x64.msi` を入れると `C:\Program Files\Font-tuner\` に配置され、ログオン時に起動する。
+タスクトレイのアイコンを右クリック:
+
+| 項目 | 動作 |
+|---|---|
+| 有効 | フックの ON/OFF。OFF にしても既に DLL を読み込み済みのプロセスからは DLL をアンロードしない。以降に起動するプロセスへ注入しなくなるだけ |
+| プロファイル | `ini\*.ini` の一覧。選ぶと `MacType.ini` の `AlternativeFile=` を書き換える。新規プロセスから反映 |
+| システムフォント | シェルの UI フォントを切替 (BIZ UDPゴシック / BIZ UDゴシック / Noto Sans JP / メイリオ)。初回に元設定を退避し「既定に戻す」で復元 |
+| 終了 | フックを外して終了 |
+
+トレイアイコンはタスクバーのテーマ (明/暗) に合わせてシルバー / ブラックを自動で切り替える。
+
+## 制限事項
+
+- **Chrome / Edge のレンダラー / GPU プロセスには描画差し替えを適用できない。**
+  これらのプロセスは `MITIGATION_FORCE_MS_SIGNED_BINS` (Microsoft 署名必須) により
+  未署名 DLL の読み込みを拒否するため、`MacType64.Core.dll` を注入できない。
+  crashpad-handler や utility など、この緩和が無い子プロセスには注入される。
+  レンダラーに適用するにはブラウザ側で `RendererCodeIntegrityEnabled=0` ポリシーの
+  設定が必要 (サンドボックスの保護を下げるため本ソフトでは設定しない)。
+- **メッセージポンプを持たないプロセス** (コンソールアプリ / サービス) にはフックが
+  発火しないため注入されない。
+- **32bit プロセス**には注入されない (64bit 専用ビルド)。
+- **自分より高い整合性レベルのプロセス**へは UIPI によりフックメッセージが届かず注入されない。
+- **MSI は未署名**のため、インストール時に UAC が「発行元不明」と表示する
+  (インストールは中断されない)。
+
+## ビルド
+
+必要なもの: Visual Studio 2022 (C++ デスクトップ ワークロード), Rust (msvc), WiX v6 (`dotnet tool install -g wix`, `wix extension add -g WixToolset.Util.wixext/6.0.2`)
+
+```powershell
+git clone --recurse-submodules https://github.com/zero-platform-Lab/font-tuner
+cd font-tuner
+.\build-msi.ps1     # build-core.ps1 (Detours, IniParser, FreeType, Core DLL) → cargo → wix
+```
+
+`build-core.ps1` は上流のプロジェクトファイルを書き換えず、`build/mactype.props` で include / lib パスを注入する。
+
+## 仕組み
+
+`SetWindowsHookEx(WH_GETMESSAGE)` のフックプロシージャに `MacType64.Core.dll` が export する `GetMsgProc` を指定するだけ。
+これで GUI を持つ全 64bit プロセスに DLL がマップされ、DLL 側の `DllMain` が自分の隣の `MacType.ini` を読んで GDI / DirectWrite をフックする。
+Font-tuner 自身は `[UnloadDll]` に載せてあり、描画差し替えの対象外。
+
+Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.

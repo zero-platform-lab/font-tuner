@@ -1,0 +1,21 @@
+[package]
+name = "mtbootstrap"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Child-process bootstrap for the MacType core DLL (replacement for the closed-source MTBootStrap64)"
+repository = "https://github.com/zero-platform-Lab/font-tuner"
+
+[lib]
+name = "MTBootStrap64"
+crate-type = ["cdylib"]
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_LibraryLoader",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+]

@@ -1,0 +1,12 @@
+[submodule "vendor/mactype"]
+	path = vendor/mactype
+	url = https://github.com/snowie2000/mactype.git
+[submodule "vendor/freetype"]
+	path = vendor/freetype
+	url = https://github.com/snowie2000/freetype.git
+[submodule "vendor/iniparser"]
+	path = vendor/iniparser
+	url = https://github.com/snowie2000/IniParser.git
+[submodule "vendor/detours"]
+	path = vendor/detours
+	url = https://github.com/microsoft/Detours.git

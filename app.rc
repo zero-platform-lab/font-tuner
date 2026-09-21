@@ -1,0 +1,5 @@
+// Tray icons embedded into font-tuner.exe. Lowest-numbered icon (1) is also the
+// icon Explorer/MSI show for the exe. 1 = black metallic (light taskbar),
+// 2 = silver (dark taskbar). Both are CC0 gear art with an "A" (font tool).
+1 ICON "assets/tray-light.ico"
+2 ICON "assets/tray-dark.ico"
