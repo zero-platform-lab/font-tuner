@@ -35,7 +35,7 @@
                        Type="string" />
       </Component>
       <Component Id="CoreDll">
-        <File Id="MacType64.Core.dll" Source="$(var.StageDir)\MacType64.Core.dll" />
+        <File Id="RenderCore64.dll" Source="$(var.StageDir)\RenderCore64.dll" />
       </Component>
       <Component Id="BootstrapDll">
         <!-- Child-process loader stub the core injects into every process it
