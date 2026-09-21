@@ -8,6 +8,7 @@
 #include FT_OUTLINE_H
 #include FT_LCD_FILTER_H
 #include <string.h>
+#include <stdlib.h>
 
 typedef struct {
     int width, rows, pitch, pixel_mode;
@@ -16,14 +17,51 @@ typedef struct {
     const unsigned char* buffer; /* valid until the next shim_render / shim_done */
 } ShimGlyph;
 
-static FT_Library g_lib = 0;
-static FT_Face    g_face = 0;
+static FT_Library    g_lib = 0;
+static FT_Face       g_face = 0;
+static unsigned char* g_membuf = 0; /* kept alive for FT_New_Memory_Face */
 
-int shim_init(void) { return FT_Init_FreeType(&g_lib); }
+int shim_init(void) {
+    if (g_lib) return 0; /* idempotent */
+    return FT_Init_FreeType(&g_lib);
+}
 
 int shim_open(const char* path, long face_index) {
     if (g_face) { FT_Done_Face(g_face); g_face = 0; }
-    return FT_New_Face(g_lib, path, face_index, &g_face);
+    int err = FT_New_Face(g_lib, path, face_index, &g_face);
+    if (!err && g_face) FT_Select_Charmap(g_face, FT_ENCODING_UNICODE);
+    return err;
+}
+
+/* Load a face from an in-memory font file (e.g. GDI GetFontData bytes). For a
+   TrueType Collection, pick the face whose family name matches want_family
+   (case-insensitive); falls back to face 0. The buffer is copied and kept until
+   the next reface / shim_done, since FreeType references it for the face's life. */
+int shim_reface_memory(const unsigned char* data, long len, const char* want_family) {
+    if (g_face) { FT_Done_Face(g_face); g_face = 0; }
+    if (g_membuf) { free(g_membuf); g_membuf = 0; }
+    g_membuf = (unsigned char*)malloc(len);
+    if (!g_membuf) return -1;
+    memcpy(g_membuf, data, len);
+
+    long chosen = 0;
+    if (want_family && *want_family) {
+        FT_Face probe;
+        int perr = FT_New_Memory_Face(g_lib, g_membuf, len, -1, &probe);
+        long n = perr ? 1 : probe->num_faces;
+        if (!perr) FT_Done_Face(probe);
+        for (long i = 0; i < n; ++i) {
+            FT_Face f;
+            if (FT_New_Memory_Face(g_lib, g_membuf, len, i, &f) == 0) {
+                int match = f->family_name && _stricmp(f->family_name, want_family) == 0;
+                FT_Done_Face(f);
+                if (match) { chosen = i; break; }
+            }
+        }
+    }
+    int err = FT_New_Memory_Face(g_lib, g_membuf, len, chosen, &g_face);
+    if (!err && g_face) FT_Select_Charmap(g_face, FT_ENCODING_UNICODE);
+    return err;
 }
 
 /* filter: FT_LCD_FILTER_* (0 NONE, 1 DEFAULT, 2 LIGHT, 3 LEGACY1, 16 LEGACY) */
@@ -63,4 +101,5 @@ int shim_render(unsigned int charcode, int pixel_height,
 void shim_done(void) {
     if (g_face) { FT_Done_Face(g_face); g_face = 0; }
     if (g_lib)  { FT_Done_FreeType(g_lib); g_lib = 0; }
+    if (g_membuf) { free(g_membuf); g_membuf = 0; }
 }
