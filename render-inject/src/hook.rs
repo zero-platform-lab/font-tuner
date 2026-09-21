@@ -81,27 +81,31 @@ impl Drop for FrozenThreads {
 }
 
 /// Create + enable an inline detour on `target`, with other threads frozen
-/// around the byte patch. Returns the trampoline (original) on success.
-pub(crate) unsafe fn install_hook(target: *const (), detour: *const ()) -> Option<*const ()> {
+/// around the byte patch. `publish` receives the trampoline (the way back to
+/// the original) *before* the detour goes live, so a thread that hits the
+/// detour the instant it is enabled already finds its `ORIG_*` set.
+pub(crate) unsafe fn install_hook(target: *const (), detour: *const (), publish: impl FnOnce(*const ())) -> bool {
     let d = match RawDetour::new(target, detour) {
         Ok(d) => d,
-        Err(e) => { log(&format!("detour new failed: {e:?}")); return None; }
+        Err(e) => { log(&format!("detour new failed: {e:?}")); return false; }
     };
-    let tramp = d.trampoline() as *const () as *const ();
+    publish(d.trampoline() as *const () as *const ());
     let ok = {
         let _frozen = FrozenThreads::all_but_current();
         d.enable().is_ok()
     };
-    if !ok { log("detour enable failed"); return None; }
+    if !ok { log("detour enable failed"); return false; }
     if let Ok(mut v) = DETOURS.lock() { v.push(d); }
-    Some(tramp)
+    true
 }
 
-pub(crate) unsafe fn patch_slot(slot: *mut usize, newv: usize) -> Option<usize> {
+/// Overwrite one vtable slot with `newv`. `publish` receives the previous
+/// value before the write, for the same reason as in `install_hook`.
+pub(crate) unsafe fn patch_slot(slot: *mut usize, newv: usize, publish: impl FnOnce(usize)) -> bool {
     let mut oldp = PAGE_PROTECTION_FLAGS(0);
-    if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() { return None; }
-    let old = *slot;
+    if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() { return false; }
+    publish(*slot);
     *slot = newv;
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
-    Some(old)
+    true
 }

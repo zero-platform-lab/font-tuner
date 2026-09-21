@@ -33,6 +33,16 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64
   but never unmaps the DLL from running ones, so there is no "code executes
   after unmap" crash path. Profile switch, on/off and upgrade all take effect
   for processes started afterwards.
+* **Fixed hook-procedure RVA** — `SetWindowsHookEx` stores only
+  `GetMsgProc - hmod`; in a target process Windows resolves the DLL by path,
+  finds the (self-pinned) image that process already holds, and calls
+  `that_base + RVA`. After an upgrade the running processes still hold the
+  *previous* build, so the RVA must be identical across builds or every one
+  of them executes random bytes on its next message and dies at once (this
+  happened once: a refactor moved `GetMsgProc` from `0x1100` to `0x8300`).
+  The core's `build.rs` pins `GetMsgProc` to RVA `0x1000` (first byte of
+  `.text`) with the linker's `/ORDER`; `build-msi.ps1` refuses to package a
+  core where it moved, and the tray refuses to hook one (see 1.2).
 * **RenderBootstrap64.dll** — a tiny Rust replacement (`bootstrap/`, crate
   `render-bootstrap`, output name `RenderBootstrap64`) for the closed-source bootstrap.
   The core injects it into freshly spawned child processes; its only job is to
@@ -58,6 +68,20 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64
   itself → infinite recursion.
 * **Re-entrancy** is guarded per-thread (`thread_local`), so one thread
   rendering never forces another thread's draw down the untuned GDI path.
+* **Hook-install guards in the tray** (`Hook::install`, `src/stale.rs`) —
+  before `SetWindowsHookExW` the tray checks (a) that the core it loaded has
+  `GetMsgProc` at RVA `0x1000`, and (b) that no running process holds the
+  core *from the same path* with `GetMsgProc` anywhere else (Toolhelp module
+  walk + `ReadProcessMemory` of that image's export table; a process that has
+  the module but whose image cannot be read counts as stale). A copy loaded
+  from another directory (the `loader` harness) is not a problem: Windows
+  resolves the hook DLL by path and maps the installed one as a separate
+  image, and the attach-once mutex keeps the second one inert. Either failure
+  shows an error and leaves the hook off; for (b) the message lists the
+  programs and tells the user to sign out and back in (or reboot) — that is
+  the only way the stale images go away, because the core is self-pinned.
+  Processes the tray cannot open (other users, higher integrity) are not
+  reached by its hook either, so skipping them is safe.
 
 ### 1.3 What it cannot reach
 
@@ -171,8 +195,10 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
   The C++ MacType core, Detours and IniParser are no longer built — the render
   core is Rust (`RenderCore64.dll`) and hooking uses `retour`.
 * **`build-msi.ps1`** — runs `build-core.ps1`, `cargo build --release`
-  (workspace + `render-inject`), stages exe + DLLs + `font-tuner.ini` +
-  `ini\*.ini` into `build\pkg`, then `wix build` →
+  (workspace + `render-inject`), checks with `check-export-rva.ps1` that the
+  core exports `GetMsgProc` at RVA `0x1000` (aborts otherwise — see 1.1),
+  stages exe + DLLs + `font-tuner.ini` + `ini\*.ini` into `build\pkg`, then
+  `wix build` →
   `dist\font-tuner-<ver>-x64.msi`.
 
 ---
@@ -196,6 +222,10 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
   then hooks with the new core. Renamed-aside copies are queued for deletion at
   next reboot (`MoveFileEx DELAY_UNTIL_REBOOT`). No reboot is needed for the
   upgrade to take effect on newly started processes.
+  The renamed-aside image stays mapped in every running process under its
+  original path, which is why `GetMsgProc` must keep the same RVA in the new
+  core (1.1); if the tray finds a running process whose core disagrees, it
+  does not hook and asks for a sign-out (1.2).
 * **`font-tuner.ini`** is marked `NeverOverwrite` — a user's selected profile
   (the `AlternativeFile` value) survives upgrades.
 * **Uninstall** — standard Add/Remove Programs entry, or

@@ -295,8 +295,9 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
 
     let Ok(gdi32) = GetModuleHandleW(w!("gdi32.dll")) else { return 1 };
     let Some(target) = GetProcAddress(gdi32, s!("ExtTextOutW")) else { return 1 };
-    if let Some(tramp) = install_hook(target as *const (), detour as *const ()) {
+    if install_hook(target as *const (), detour as *const (), |tramp| {
         let _ = ORIG.set(std::mem::transmute::<*const (), FnEto>(tramp));
+    }) {
         log("hook installed on ExtTextOutW");
     } else {
         log("ExtTextOutW hook failed");
@@ -343,6 +344,15 @@ pub extern "system" fn DllMain(hinst: HINSTANCE, reason: u32, _reserved: *mut c_
 /// WH_GETMESSAGE hook procedure. Its only purpose is to make Windows map this
 /// DLL into every GUI process that pumps messages (which runs DllMain, which
 /// installs our text hooks) — the same auto-injection mechanism the C++ core uses.
+///
+/// Its RVA is fixed at 0x1000, the first byte of `.text` (linker `/ORDER`, see
+/// `build.rs`; the tray and `build-msi.ps1` both verify it). The
+/// tray passes `hmod + rva` to SetWindowsHookEx; in a process that still holds
+/// an *older* build of this DLL (self-pinned, same path) Windows reuses that
+/// image and calls old_base + rva. If the RVA had moved, that lands on random
+/// bytes and every such process crashes at once — which is what happened
+/// when the 980-line lib.rs was split into modules and `GetMsgProc` drifted
+/// from 0x1100 to 0x8300.
 #[no_mangle]
 pub extern "system" fn GetMsgProc(
     code: i32,

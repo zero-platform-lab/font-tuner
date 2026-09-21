@@ -8,6 +8,7 @@
 #![windows_subsystem = "windows"]
 
 mod lang;
+mod stale;
 mod sysfont;
 
 use std::cell::RefCell;
@@ -111,20 +112,50 @@ fn install_dir() -> Option<PathBuf> {
     d.join(DLL_NAME).exists().then_some(d)
 }
 
+/// Where `GetMsgProc` must sit inside `RenderCore64.dll`: the first byte of
+/// `.text`. The core's `build.rs` pins it there with the linker's `/ORDER`.
+///
+/// Windows applies `proc - hmod` to whatever image of the DLL a target process
+/// already holds. The core self-pins, so after an upgrade the running
+/// processes still hold the *previous* build; if the RVA differed, the hook
+/// would land on random bytes in them and they would all crash on their next
+/// message. So the tray refuses to hook a core whose export has moved.
+const HOOK_PROC_RVA: usize = 0x1000;
+
 /// A global WH_GETMESSAGE hook backed by RenderCore64's exported `GetMsgProc`.
 struct Hook {
     hhook: HHOOK,
 }
 
+enum HookError {
+    /// Load, export lookup or `SetWindowsHookExW` failed.
+    Install,
+    /// `GetMsgProc` is not at `HOOK_PROC_RVA`; hooking would crash every
+    /// process that still holds an older core.
+    Layout,
+    /// These running processes hold a core whose `GetMsgProc` is elsewhere;
+    /// hooking would crash them on their next message.
+    Stale(Vec<String>),
+}
+
 impl Hook {
-    fn install(dir: &Path) -> Option<Hook> {
-        let path = wide(dir.join(DLL_NAME).to_str()?);
+    fn install(dir: &Path) -> Result<Hook, HookError> {
+        let dll = dir.join(DLL_NAME);
+        let path = wide(dll.to_str().ok_or(HookError::Install)?);
         unsafe {
-            let hmod = LoadLibraryW(PCWSTR(path.as_ptr())).ok()?;
-            let proc_ = GetProcAddress(hmod, PCSTR(b"GetMsgProc\0".as_ptr()))?;
+            let hmod = LoadLibraryW(PCWSTR(path.as_ptr())).map_err(|_| HookError::Install)?;
+            let proc_ = GetProcAddress(hmod, PCSTR(b"GetMsgProc\0".as_ptr())).ok_or(HookError::Install)?;
+            if proc_ as usize - hmod.0 as usize != HOOK_PROC_RVA {
+                return Err(HookError::Layout);
+            }
+            let stale = stale::holders_of_stale_core(&dll, HOOK_PROC_RVA);
+            if !stale.is_empty() {
+                return Err(HookError::Stale(stale));
+            }
             let hookproc: HOOKPROC = Some(std::mem::transmute(proc_));
-            let hhook = SetWindowsHookExW(WH_GETMESSAGE, hookproc, Some(HINSTANCE(hmod.0)), 0).ok()?;
-            Some(Hook { hhook })
+            let hhook = SetWindowsHookExW(WH_GETMESSAGE, hookproc, Some(HINSTANCE(hmod.0)), 0)
+                .map_err(|_| HookError::Install)?;
+            Ok(Hook { hhook })
         }
     }
 }
@@ -224,10 +255,19 @@ impl App {
 
     fn set_enabled(&mut self, on: bool) {
         if on {
-            self.hook = Hook::install(&self.dir);
-            if self.hook.is_none() {
-                msgbox(self.s.err_hook);
-            }
+            self.hook = match Hook::install(&self.dir) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    match e {
+                        HookError::Install => msgbox(self.s.err_hook),
+                        HookError::Layout => msgbox(self.s.err_rva),
+                        HookError::Stale(names) => msgbox(&format!("{}
+
+{}", self.s.err_stale, names.join(", "))),
+                    }
+                    None
+                }
+            };
         } else {
             self.hook = None;
         }

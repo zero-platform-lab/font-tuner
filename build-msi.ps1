@@ -27,7 +27,14 @@ Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage, "$stage\ini", dist | Out-Null
 Copy-Item target\release\font-tuner.exe $stage -Force
 Copy-Item target\release\RenderBootstrap64.dll $stage -Force
-Copy-Item render-inject\target\release\RenderCore64.dll $stage -Force
+# GetMsgProc must stay at RVA 0x1000 (render-inject\build.rs pins it with
+# /ORDER). Running processes keep the previous core mapped, and the new tray's
+# hook is resolved as old_base + this RVA inside them — if it moved, every one
+# of them would crash on its next message. Refuse to ship such a build.
+$core = 'render-inject\target\release\RenderCore64.dll'
+$rva = & .\check-export-rva.ps1 $core GetMsgProc
+if ($rva -ne 0x1000) { throw "GetMsgProc is at RVA 0x$('{0:X}' -f $rva), expected 0x1000 - see render-inject\build.rs" }
+Copy-Item $core $stage -Force
 Copy-Item profiles\font-tuner.ini $stage -Force
 Copy-Item profiles\ini\*.ini "$stage\ini" -Force
 

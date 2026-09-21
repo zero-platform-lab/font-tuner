@@ -48,6 +48,11 @@ itself, not the injection mechanism.
   `RenderBootstrap64` already does).
 - Self-pin on attach (GetModuleHandleEx FLAG_PIN): never unmapped from a
   running process, so no code can run after unmap. DllMain DETACH is a no-op.
+- `GetMsgProc` stays at RVA 0x1000 (`build.rs`, linker `/ORDER`). Because of
+  the pin, running processes keep the previous build after an upgrade, and
+  the tray's hook resolves to `old_base + RVA` inside them — a moved RVA
+  crashed every GUI process at once (2026-09-22, the lib.rs split). Do not
+  drop `build.rs`/`order.txt`; `build-msi.ps1` and the tray both verify it.
 - retour does not stop threads while patching, so freeze the other threads
   around each byte patch; serialise one-time vtable patches with a mutex.
 - Every stage stays opt-in and process-scoped until proven; no system-wide

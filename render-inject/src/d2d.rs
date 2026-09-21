@@ -51,10 +51,10 @@ unsafe extern "system" fn d2dcf_detour(ftype: i32, riid: *const GUID, opts: *con
         // must not both capture the "original" (see VTABLE_PATCH_LOCK).
         let _guard = VTABLE_PATCH_LOCK.lock();
         if ORIG_HWNDRT.get().is_none() {
-            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as *const () as usize) { let _ = ORIG_HWNDRT.set(std::mem::transmute(o)); }
+            patch_slot(vtbl.add(14), create_hwnd_detour as *const () as usize, |o| { let _ = ORIG_HWNDRT.set(std::mem::transmute(o)); });
         }
         if ORIG_DCRT.get().is_none() {
-            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as *const () as usize) { let _ = ORIG_DCRT.set(std::mem::transmute(o)); }
+            patch_slot(vtbl.add(16), create_dc_detour as *const () as usize, |o| { let _ = ORIG_DCRT.set(std::mem::transmute(o)); });
         }
         log("hook installed on D2D1Factory render-target creation");
     }
@@ -78,8 +78,7 @@ unsafe fn patch_rt_dgr(rt: *mut c_void) {
     let Ok(mut m) = D2D_DGR_ORIG.lock() else { return };
     let map = m.get_or_insert_with(HashMap::new);
     if map.contains_key(&vptr) { return; }
-    if let Some(old) = patch_slot(vtbl.add(29), d2d_dgr_detour as *const () as usize) {
-        map.insert(vptr, old);
+    if patch_slot(vtbl.add(29), d2d_dgr_detour as *const () as usize, |old| { map.insert(vptr, old); }) {
         log("hook installed on D2D DrawGlyphRun");
     }
 }
@@ -178,8 +177,9 @@ pub(crate) unsafe fn setup_d2d_hook() {
         },
     };
     let Some(target) = GetProcAddress(d2d1, s!("D2D1CreateFactory")) else { return };
-    if let Some(tramp) = install_hook(target as *const (), d2dcf_detour as *const ()) {
+    if install_hook(target as *const (), d2dcf_detour as *const (), |tramp| {
         let _ = ORIG_D2DCF.set(std::mem::transmute::<*const (), FnD2DCreateFactory>(tramp));
+    }) {
         log("hook installed on D2D1CreateFactory");
     } else {
         log("D2D1CreateFactory hook failed");
