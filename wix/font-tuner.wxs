@@ -16,14 +16,15 @@
            Scope="perMachine"
            InstallerVersion="500">
 
-    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallInitialize" DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallExecute" DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
 
     <!-- RenderCore64.dll (and RenderBootstrap64.dll) is injected into every process on the machine, so it
          is always "in use" by the user's terminal, shell, editor, etc.  With the
          Restart Manager enabled, msiexec would close ALL of those to replace the
          DLL - it has killed the user's PowerShell / Claude Code session more
-         than once.  Disable it: in-use files are swapped on next reboot instead,
-         and only the tray itself is closed (util:CloseApplication below). -->
+         than once.  Disable it: only the tray itself is closed
+         (util:CloseApplication below); the in-use core is renamed out of the
+         way by RenameOldCore so the new one can be placed immediately. -->
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
     <Property Id="REBOOT" Value="ReallySuppress" />
     <MediaTemplate EmbedCab="yes" />
@@ -51,10 +52,6 @@
       </Component>
       <Component Id="CoreDll">
         <File Id="RenderCore64.dll" Source="$(var.StageDir)\RenderCore64.dll" />
-        <!-- Renamed-away cores from RenameOldCore (below). Freed ones go now;
-             ones still mapped by running processes are scheduled by MSI for
-             deletion at the next reboot. -->
-        <RemoveFile Id="OldCores" Name="RenderCore64.dll.old.*" On="install" />
       </Component>
       <Component Id="BootstrapDll">
         <!-- Child-process loader stub the core injects into every process it
@@ -91,11 +88,20 @@
          reboot - new processes keep getting the OLD core until then), rename
          the in-use file out of the way first: Windows allows renaming a mapped
          image. InstallFiles then finds the name free and the freshly started
-         tray hooks with the new core immediately. Must run before the old
-         product's RemoveFiles (RemoveExistingProducts), or that would queue a
-         reboot-time delete against the name the new file is about to take. -->
+         tray hooks with the new core immediately. RemoveExistingProducts is
+         scheduled afterInstallExecute (MSI forbids anything between
+         InstallInitialize and an afterInstallInitialize REP), so the old
+         product is removed after the new files are in place; shared
+         components (same GUID) are refcounted and left alone. -->
+    <!-- PowerShell rather than cmd: the renamed-away copy must be queued for
+         deletion at the next reboot (MoveFileEx DELAY_UNTIL_REBOOT), which cmd
+         cannot do. MSI's RemoveFile cannot either: it enumerates before the
+         script runs, so it never sees a file this action creates. Leftovers
+         from earlier upgrades are deleted here if freed, else queued too.
+         "[\[]", "[\{]", "[\}]" are MSI's escapes for literal [ { } (Formatted
+         syntax strips bare braces). -->
     <SetProperty Id="RenameOldCore"
-                 Value="&quot;[SystemFolder]cmd.exe&quot; /c if exist &quot;[INSTALLFOLDER]RenderCore64.dll&quot; ren &quot;[INSTALLFOLDER]RenderCore64.dll&quot; RenderCore64.dll.old.%RANDOM%%RANDOM%"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command &quot;$d='[INSTALLFOLDER]'; Add-Type -Namespace W -Name K -MemberDefinition '[\[]DllImport(\&quot;kernel32.dll\&quot;, CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool MoveFileExW(string a, IntPtr b, uint f);'; $f=Join-Path $d 'RenderCore64.dll'; if (Test-Path $f) [\{] $n=Join-Path $d ('RenderCore64.dll.old.' + (Get-Random)); Rename-Item $f $n; [\[]W.K]::MoveFileExW($n, [\[]IntPtr]::Zero, 4) | Out-Null [\}]; Get-ChildItem $d -Filter 'RenderCore64.dll.old.*' | ForEach-Object [\{] $q=$_.FullName; if ($q -ne $n) [\{] try [\{] Remove-Item $q -Force -ErrorAction Stop [\}] catch [\{] [\[]W.K]::MoveFileExW($q, [\[]IntPtr]::Zero, 4) | Out-Null [\}] [\}] [\}]&quot;"
                  Before="RenameOldCore" Sequence="execute" />
     <CustomAction Id="RenameOldCore"
                   DllEntry="WixQuietExec64"
@@ -112,8 +118,10 @@
                   Return="asyncNoWait"
                   Impersonate="yes" />
     <InstallExecuteSequence>
-      <Custom Action="RenameOldCore" Before="RemoveExistingProducts" Condition="NOT REMOVE" />
-      <Custom Action="LaunchApp" After="InstallFinalize" Condition="NOT Installed OR UPGRADINGPRODUCTCODE" />
+      <Custom Action="RenameOldCore" After="InstallInitialize" Condition="NOT REMOVE" />
+      <!-- NOT Installed only: with REP afterInstallExecute the old product's
+           own LaunchApp (UPGRADINGPRODUCTCODE) would start a second tray. -->
+      <Custom Action="LaunchApp" After="InstallFinalize" Condition="NOT Installed" />
     </InstallExecuteSequence>
 
   </Package>
