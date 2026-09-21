@@ -91,7 +91,6 @@ type FnDrawGlyphRun = unsafe extern "system" fn(
     *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
 ) -> HRESULT;
 static mut ORIG_DGR: Option<FnDrawGlyphRun> = None;
-static mut DGR_SLOT: *mut usize = std::ptr::null_mut();
 
 // DirectWrite glyph-run *analysis* path (Chromium/Skia / VS Code): capture the
 // run at CreateGlyphRunAnalysis, substitute coverage at CreateAlphaTexture.
@@ -102,7 +101,6 @@ type FnCreateAlphaTexture = unsafe extern "system" fn(
     *mut c_void, i32, *const RECT, *mut u8, u32,
 ) -> HRESULT;
 static mut ORIG_CGRA: Option<FnCreateGlyphRunAnalysis> = None;
-static mut CGRA_SLOT: *mut usize = std::ptr::null_mut();
 static mut ORIG_CAT: Option<FnCreateAlphaTexture> = None;
 static mut CAT_SLOT: *mut usize = std::ptr::null_mut();
 static ANALYSES: Mutex<Option<HashMap<usize, RunInfo>>> = Mutex::new(None);
@@ -136,18 +134,36 @@ unsafe fn self_dir() -> Option<PathBuf> {
     PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])).parent().map(|p| p.to_path_buf())
 }
 
+/// The `AlternativeFile=` value from a font-tuner.ini's text, as written by the
+/// tray. Pure so it can be tested without a filesystem or a Win32 process.
+///
+/// Deliberately lenient in the same way `GetPrivateProfileString` is: the key
+/// match ignores case and surrounding blanks, `;`/`#` comment lines are skipped,
+/// and a value containing `=` (a path can) is kept whole. An empty value means
+/// "not set", so the caller falls back to the built-in profile.
+fn parse_alternative_file(text: &str) -> Option<&str> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if !key.trim().eq_ignore_ascii_case("AlternativeFile") {
+            continue;
+        }
+        let value = value.trim();
+        return (!value.is_empty()).then_some(value);
+    }
+    None
+}
+
 /// The profile the tray selected: `[General] AlternativeFile=ini\<name>.ini`
-/// in the install dir's font-tuner.ini, resolved relative to that dir. Read once
-/// at attach; a switch takes effect for processes started afterwards. (No
-/// live reload on purpose: a watcher thread sleeping inside this DLL wakes
-/// up after the bootstrap has unmapped us and crashes the host.)
+/// in the install dir's font-tuner.ini, resolved relative to that dir. Read at
+/// attach, and again when the tray broadcasts "reload profile".
 unsafe fn profile_path() -> Option<String> {
     let dir = self_dir()?;
     let text = std::fs::read_to_string(dir.join("font-tuner.ini")).ok()?;
-    let rel = text.lines().map(str::trim)
-        .filter_map(|l| l.split_once('='))
-        .find(|(k, _)| k.trim() == "AlternativeFile")
-        .map(|(_, v)| v.trim().to_string())?;
+    let rel = parse_alternative_file(&text)?;
     Some(dir.join(rel).to_string_lossy().into_owned())
 }
 
@@ -444,7 +460,6 @@ unsafe fn setup_dwrite_hook() {
         return;
     }
     ORIG_DGR = Some(std::mem::transmute::<usize, FnDrawGlyphRun>(*slot));
-    DGR_SLOT = slot;
     *slot = dgr_detour as usize;
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
     log("hook installed on DrawGlyphRun");
@@ -456,7 +471,6 @@ unsafe fn setup_dwrite_hook() {
     let mut fp = PAGE_PROTECTION_FLAGS(0);
     if VirtualProtect(fslot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut fp).is_ok() {
         ORIG_CGRA = Some(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis>(*fslot));
-        CGRA_SLOT = fslot;
         *fslot = cgra_detour as usize;
         let _ = VirtualProtect(fslot as *const c_void, 8, fp, &mut fp);
         log("hook installed on CreateGlyphRunAnalysis");
@@ -563,9 +577,7 @@ type FnCreateHwndRT = unsafe extern "system" fn(*mut c_void, *const c_void, *con
 type FnD2DDrawGlyphRun = unsafe extern "system" fn(*mut c_void, Vector2, *const DWRITE_GLYPH_RUN, *mut c_void, i32);
 static mut ORIG_D2DCF: Option<FnD2DCreateFactory> = None;
 static mut ORIG_DCRT: Option<FnCreateDCRT> = None;
-static mut DCRT_SLOT: *mut usize = std::ptr::null_mut();
 static mut ORIG_HWNDRT: Option<FnCreateHwndRT> = None;
-static mut HWNDRT_SLOT: *mut usize = std::ptr::null_mut();
 static D2D_DGR_ORIG: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None); // rt vtable -> orig DrawGlyphRun
 static D2D_CAPTURED: AtomicBool = AtomicBool::new(false); // log the first D2D substitution once
 
@@ -587,10 +599,10 @@ unsafe extern "system" fn d2dcf_detour(ftype: i32, riid: *const GUID, opts: *con
         // must not both capture the "original" (see VTABLE_PATCH_LOCK).
         let _guard = VTABLE_PATCH_LOCK.lock();
         if ORIG_HWNDRT.is_none() {
-            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { HWNDRT_SLOT = vtbl.add(14); ORIG_HWNDRT = Some(std::mem::transmute(o)); }
+            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { ORIG_HWNDRT = Some(std::mem::transmute(o)); }
         }
         if ORIG_DCRT.is_none() {
-            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { DCRT_SLOT = vtbl.add(16); ORIG_DCRT = Some(std::mem::transmute(o)); }
+            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { ORIG_DCRT = Some(std::mem::transmute(o)); }
         }
         log("hook installed on D2D1Factory render-target creation");
     }
@@ -890,5 +902,49 @@ pub extern "system" fn GetMsgProc(
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // "Small" tests: pure, no filesystem, no threads, deterministic.
+
+    #[test]
+    fn alternative_file_reads_the_tray_written_key() {
+        let ini = "[General]\r\nAlternativeFile=ini\\Clean Greyscale.ini\r\n\r\n[Font-tuner]\r\nAutoRun=1\r\n";
+        assert_eq!(parse_alternative_file(ini), Some("ini\\Clean Greyscale.ini"));
+    }
+
+    #[test]
+    fn alternative_file_ignores_case_blanks_and_comments() {
+        let ini = "; AlternativeFile=ini\\commented-out.ini\n\
+                   # AlternativeFile=ini\\also-not-this.ini\n\
+                   \x20 alternativefile  =   ini\\Accurate.ini   \n";
+        assert_eq!(parse_alternative_file(ini), Some("ini\\Accurate.ini"));
+    }
+
+    #[test]
+    fn alternative_file_keeps_a_value_containing_equals() {
+        // A path may contain '=', so only the first '=' separates key from value.
+        let ini = "AlternativeFile=ini\\odd=name.ini\n";
+        assert_eq!(parse_alternative_file(ini), Some("ini\\odd=name.ini"));
+    }
+
+    #[test]
+    fn alternative_file_absent_or_empty_means_use_the_default() {
+        assert_eq!(parse_alternative_file(""), None);
+        assert_eq!(parse_alternative_file("[General]\nRedrawDelay=5000\n"), None);
+        assert_eq!(parse_alternative_file("AlternativeFile=\n"), None);
+        assert_eq!(parse_alternative_file("AlternativeFile=   \n"), None);
+    }
+
+    #[test]
+    fn alternative_file_takes_the_first_of_duplicates() {
+        // GetPrivateProfileString returns the first; match that so a stray
+        // second key cannot silently change the profile.
+        let ini = "AlternativeFile=ini\\first.ini\nAlternativeFile=ini\\second.ini\n";
+        assert_eq!(parse_alternative_file(ini), Some("ini\\first.ini"));
     }
 }
