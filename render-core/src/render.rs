@@ -29,6 +29,27 @@ impl Canvas {
     fn in_bounds(&self, x: i32, y: i32) -> bool {
         x >= 0 && (x as usize) < self.w && y >= 0 && (y as usize) < self.h
     }
+    /// Build a canvas from a 32bpp top-down BGRA buffer (e.g. a DIB section).
+    pub fn from_bgra_topdown(w: usize, h: usize, bgra: &[u8]) -> Canvas {
+        let mut rgb = vec![0u8; w * h * 3];
+        for i in 0..w * h {
+            rgb[i * 3] = bgra[i * 4 + 2]; // R
+            rgb[i * 3 + 1] = bgra[i * 4 + 1]; // G
+            rgb[i * 3 + 2] = bgra[i * 4]; // B
+        }
+        Canvas { w, h, rgb }
+    }
+
+    /// Write this canvas back into a 32bpp top-down BGRA buffer (alpha=255).
+    pub fn blit_to_bgra_topdown(&self, bgra: &mut [u8]) {
+        for i in 0..self.w * self.h {
+            bgra[i * 4] = self.rgb[i * 3 + 2]; // B
+            bgra[i * 4 + 1] = self.rgb[i * 3 + 1]; // G
+            bgra[i * 4 + 2] = self.rgb[i * 3]; // R
+            bgra[i * 4 + 3] = 255; // A
+        }
+    }
+
     /// Save as PNG.
     pub fn save(&self, path: &str) -> image::ImageResult<()> {
         let img = image::RgbImage::from_raw(self.w as u32, self.h as u32, self.rgb.clone())
@@ -48,22 +69,12 @@ impl Default for Ink {
     fn default() -> Ink { Ink { fg: [0, 0, 0] } }
 }
 
-/// Render `text` at `px` pixels onto a fresh canvas using `profile`.
-/// `pen` is the baseline origin (x, y); `bg` is the background colour.
+/// Render `text` at `px` pixels onto a fresh `bg`-filled canvas using `profile`.
+/// `pen` is the baseline origin (x, y).
 pub fn render_text(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u8; 3],
                    text: &str, px: i32, pen: (i32, i32), size: (usize, usize)) -> Canvas {
-    ft.prepare(profile);
     let mut canvas = Canvas::filled(size.0, size.1, bg);
-    let (mut pen_x, base_y) = pen;
-    let lcd = profile.aa.is_lcd();
-    let bgr = ft::is_bgr(profile.aa);
-
-    for ch in text.chars() {
-        if let Some(g) = ft.render(ch, px, profile) {
-            blit_glyph(&mut canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
-            pen_x += g.advance_px;
-        }
-    }
+    draw_text_onto(&mut canvas, ft, tables, profile, ink, text, px, pen);
     canvas
 }
 
@@ -71,19 +82,38 @@ pub fn render_text(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u
 /// `ETO_GLYPH_INDEX` draw supplies.
 pub fn render_glyphs(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u8; 3],
                      glyphs: &[u16], px: i32, pen: (i32, i32), size: (usize, usize)) -> Canvas {
-    ft.prepare(profile);
     let mut canvas = Canvas::filled(size.0, size.1, bg);
-    let (mut pen_x, base_y) = pen;
-    let lcd = profile.aa.is_lcd();
-    let bgr = ft::is_bgr(profile.aa);
+    draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, pen);
+    canvas
+}
 
-    for &gi in glyphs {
-        if let Some(g) = ft.render_glyph(gi, px, profile) {
-            blit_glyph(&mut canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
+/// Composite `text` over the *existing* pixels of `canvas` (transparent draw).
+/// `pen` is the baseline origin.
+pub fn draw_text_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: &Profile,
+                      ink: Ink, text: &str, px: i32, pen: (i32, i32)) {
+    ft.prepare(profile);
+    let (mut pen_x, base_y) = pen;
+    let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
+    for ch in text.chars() {
+        if let Some(g) = ft.render(ch, px, profile) {
+            blit_glyph(canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
             pen_x += g.advance_px;
         }
     }
-    canvas
+}
+
+/// Composite a run of glyph indices over the existing pixels of `canvas`.
+pub fn draw_glyphs_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: &Profile,
+                        ink: Ink, glyphs: &[u16], px: i32, pen: (i32, i32)) {
+    ft.prepare(profile);
+    let (mut pen_x, base_y) = pen;
+    let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
+    for &gi in glyphs {
+        if let Some(g) = ft.render_glyph(gi, px, profile) {
+            blit_glyph(canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
+            pen_x += g.advance_px;
+        }
+    }
 }
 
 /// Blit one rendered glyph onto the canvas at the pen position.
