@@ -6,6 +6,7 @@ use windows::Win32::Globalization::GetUserDefaultUILanguage;
 pub struct Strings {
     pub enabled: &'static str,
     pub profile: &'static str,
+    pub reload: &'static str,
     pub sysfont: &'static str,
     pub sysfont_default: &'static str,
     pub exit: &'static str,
@@ -19,6 +20,7 @@ pub struct Strings {
 const EN: Strings = Strings {
     enabled: "Enabled",
     profile: "Profile",
+    reload: "Reload profile (running apps)",
     sysfont: "System font",
     sysfont_default: "Default (restore)",
     exit: "Exit",
@@ -32,6 +34,7 @@ const EN: Strings = Strings {
 const JA: Strings = Strings {
     enabled: "有効",
     profile: "プロファイル",
+    reload: "プロファイルを再読み込み (起動中のアプリに反映)",
     sysfont: "システムフォント",
     sysfont_default: "既定に戻す",
     exit: "終了",

@@ -20,11 +20,12 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::System::WindowsProgramming::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCSTR, PCWSTR};
+use windows::core::{w, PCSTR, PCWSTR};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_ENABLED: usize = 1;
 const ID_EXIT: usize = 2;
+const ID_RELOAD: usize = 3;
 const ID_PROFILE_BASE: usize = 100;
 const ID_SYSFONT_DEFAULT: usize = 200;
 const ID_SYSFONT_BASE: usize = 201;
@@ -294,6 +295,8 @@ impl App {
             );
             let _ = AppendMenuW(menu, MF_STRING | en, ID_ENABLED, PCWSTR(t1.as_ptr()));
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(t2.as_ptr()));
+            let tr = wide(self.s.reload);
+            let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, PCWSTR(tr.as_ptr()));
             let _ = AppendMenuW(menu, MF_POPUP, fsub.0 as usize, PCWSTR(tf.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, PCWSTR(t3.as_ptr()));
@@ -373,6 +376,12 @@ fn handle_command(hwnd: HWND, cmd: usize) {
         }
         ID_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
+        },
+        // Ask every injected process to re-read font-tuner.ini. The core's
+        // GetMsgProc handles this message on each process's own UI thread.
+        ID_RELOAD => unsafe {
+            let id = RegisterWindowMessageW(w!("FontTuner.ReloadProfile"));
+            let _ = PostMessageW(Some(HWND_BROADCAST), id, WPARAM(0), LPARAM(0));
         },
         ID_SYSFONT_DEFAULT => sysfont::restore(),
         c if (ID_SYSFONT_BASE..ID_SYSFONT_BASE + sysfont::FONTS.len()).contains(&c) => {

@@ -16,7 +16,7 @@ use core::ffi::c_void;
 use std::io::Write;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicU32};
 use std::sync::Mutex;
 
 use std::collections::HashMap;
@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use render_core::render::{draw_glyphs_onto, draw_text_onto, glyph_run_coverage_lcd, Canvas, Ink};
 use render_core::{tables_for, Aa, Ft, Profile, Tables};
 use windows::core::{PCWSTR, s, w, Interface, BOOL, GUID, HRESULT};
+use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, RECT};
 use windows::Win32::Graphics::Direct2D::{ID2D1Brush, ID2D1GdiInteropRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_DC_INITIALIZE_MODE_COPY};
 use windows_numerics::Vector2;
@@ -57,6 +58,11 @@ static mut FT: Option<Ft> = None;
 static mut TABLES: Option<Tables> = None;
 static mut PROFILE: Option<Profile> = None;
 static IN_DETOUR: AtomicBool = AtomicBool::new(false);
+/// Registered window message the tray broadcasts for "reload profile"
+/// (0 until on_attach registers it). Handled in GetMsgProc on the receiving
+/// process's own UI thread: no extra thread, no polling.
+static RELOAD_MSG: AtomicU32 = AtomicU32::new(0);
+const RELOAD_MSG_NAME: PCWSTR = w!("FontTuner.ReloadProfile");
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// Serialises all rendering (one shared FreeType face) and remembers the last
 /// font key, so we only re-extract + re-face when the font actually changes.
@@ -122,6 +128,26 @@ unsafe fn profile_path() -> Option<String> {
         .find(|(k, _)| k.trim() == "AlternativeFile")
         .map(|(_, v)| v.trim().to_string())?;
     Some(dir.join(rel).to_string_lossy().into_owned())
+}
+
+/// The active profile (path it came from, or None for the built-in default).
+unsafe fn load_profile() -> (Option<String>, Profile) {
+    let path = profile_path();
+    let p = path.as_deref().and_then(Profile::from_ini).unwrap_or_else(Profile::clean_greyscale);
+    (path, p)
+}
+
+/// Re-read font-tuner.ini and swap the profile + tables in, under RENDER_LOCK
+/// so no draw observes a half-updated pair. Called on this process's UI
+/// thread from GetMsgProc when the tray broadcasts RELOAD_MSG. If the ini is
+/// unreadable the built-in default applies, same as at attach.
+unsafe fn reload_profile() {
+    let (path, p) = load_profile();
+    if let Ok(_guard) = RENDER_LOCK.lock() {
+        TABLES = Some(tables_for(&p));
+        PROFILE = Some(p);
+    }
+    log(&format!("reloaded profile {}", path.as_deref().unwrap_or("(default)")));
 }
 
 /// Resolve the DC's font into render-core (returns the pixel size), or None.
@@ -665,11 +691,11 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     };
     FT = Some(ft);
     // Use the active font-tuner profile if present, else the default.
-    let path = profile_path();
-    let p = path.as_deref().and_then(Profile::from_ini).unwrap_or_else(Profile::clean_greyscale);
+    let (path, p) = load_profile();
     log(&format!("profile {}: {p:?}", path.as_deref().unwrap_or("(default)")));
     TABLES = Some(tables_for(&p));
     PROFILE = Some(p);
+    RELOAD_MSG.store(RegisterWindowMessageW(RELOAD_MSG_NAME), Ordering::Relaxed);
 
     let Ok(gdi32) = GetModuleHandleW(w!("gdi32.dll")) else { return 1 };
     let Some(target) = GetProcAddress(gdi32, s!("ExtTextOutW")) else { return 1 };
@@ -732,5 +758,16 @@ pub extern "system" fn GetMsgProc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    unsafe { windows::Win32::UI::WindowsAndMessaging::CallNextHookEx(None, code, wparam, lparam) }
+    use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, HC_ACTION, MSG, PM_REMOVE};
+    unsafe {
+        // Tray's "reload profile" broadcast: act once per delivered message
+        // (PM_REMOVE only, so a PeekMessage(PM_NOREMOVE) doesn't double up).
+        if code == HC_ACTION as i32 && wparam.0 as u32 == PM_REMOVE.0 && !(lparam.0 as *const MSG).is_null() {
+            let id = RELOAD_MSG.load(Ordering::Relaxed);
+            if id != 0 && (*(lparam.0 as *const MSG)).message == id {
+                reload_profile();
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
 }

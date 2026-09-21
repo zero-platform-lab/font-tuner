@@ -16,7 +16,7 @@
            Scope="perMachine"
            InstallerVersion="500">
 
-    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallInitialize" DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
 
     <!-- RenderCore64.dll (and RenderBootstrap64.dll) is injected into every process on the machine, so it
          is always "in use" by the user's terminal, shell, editor, etc.  With the
@@ -33,10 +33,16 @@
         <Directory Id="ProfilesFolder" Name="ini" />
       </Directory>
     </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
 
     <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
       <Component Id="AppExe">
-        <File Id="AppExeFile" Source="$(var.StageDir)\font-tuner.exe" KeyPath="yes" />
+        <File Id="AppExeFile" Source="$(var.StageDir)\font-tuner.exe" KeyPath="yes">
+          <!-- Start menu entry, so the tray can be launched by hand after
+               "Exit" without digging into Program Files. -->
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Font-tuner"
+                    WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+        </File>
         <RegistryValue Root="HKLM"
                        Key="Software\Microsoft\Windows\CurrentVersion\Run"
                        Name="Font-tuner"
@@ -45,6 +51,10 @@
       </Component>
       <Component Id="CoreDll">
         <File Id="RenderCore64.dll" Source="$(var.StageDir)\RenderCore64.dll" />
+        <!-- Renamed-away cores from RenameOldCore (below). Freed ones go now;
+             ones still mapped by running processes are scheduled by MSI for
+             deletion at the next reboot. -->
+        <RemoveFile Id="OldCores" Name="RenderCore64.dll.old.*" On="install" />
       </Component>
       <Component Id="BootstrapDll">
         <!-- Child-process loader stub the core injects into every process it
@@ -75,6 +85,25 @@
     <util:CloseApplication Id="CloseMacTray" Target="MacTray.exe"     CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
     <util:CloseApplication Id="CloseApp"     Target="font-tuner.exe"  CloseMessage="no" TerminateProcess="0" RebootPrompt="no" />
 
+    <!-- RenderCore64.dll is mapped into every running GUI process and keeps
+         itself loaded until each of them exits, so the file is never free to
+         overwrite. Instead of MSI's fallback (leave the old file, swap on
+         reboot - new processes keep getting the OLD core until then), rename
+         the in-use file out of the way first: Windows allows renaming a mapped
+         image. InstallFiles then finds the name free and the freshly started
+         tray hooks with the new core immediately. Must run before the old
+         product's RemoveFiles (RemoveExistingProducts), or that would queue a
+         reboot-time delete against the name the new file is about to take. -->
+    <SetProperty Id="RenameOldCore"
+                 Value="&quot;[SystemFolder]cmd.exe&quot; /c if exist &quot;[INSTALLFOLDER]RenderCore64.dll&quot; ren &quot;[INSTALLFOLDER]RenderCore64.dll&quot; RenderCore64.dll.old.%RANDOM%%RANDOM%"
+                 Before="RenameOldCore" Sequence="execute" />
+    <CustomAction Id="RenameOldCore"
+                  DllEntry="WixQuietExec64"
+                  BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
     <!-- Start Font-tuner when the install finishes. -->
     <CustomAction Id="LaunchApp"
                   FileRef="AppExeFile"
@@ -83,6 +112,7 @@
                   Return="asyncNoWait"
                   Impersonate="yes" />
     <InstallExecuteSequence>
+      <Custom Action="RenameOldCore" Before="RemoveExistingProducts" Condition="NOT REMOVE" />
       <Custom Action="LaunchApp" After="InstallFinalize" Condition="NOT Installed OR UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
