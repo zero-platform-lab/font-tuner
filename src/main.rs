@@ -26,6 +26,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const ID_ENABLED: usize = 1;
 const ID_EXIT: usize = 2;
 const ID_RELOAD: usize = 3;
+const ID_VERSION: usize = 4;
 const ID_PROFILE_BASE: usize = 100;
 const ID_SYSFONT_DEFAULT: usize = 200;
 const ID_SYSFONT_BASE: usize = 201;
@@ -86,6 +87,15 @@ fn msgbox(text: &str) {
     let c = wide("Font-tuner");
     unsafe {
         MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONERROR);
+    }
+}
+
+/// Informational popup (not an error), used for the version item.
+fn infobox(text: &str) {
+    let t = wide(text);
+    let c = wide("Font-tuner");
+    unsafe {
+        MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -299,6 +309,8 @@ impl App {
             let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, PCWSTR(tr.as_ptr()));
             let _ = AppendMenuW(menu, MF_POPUP, fsub.0 as usize, PCWSTR(tf.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let tv = wide(&format!("{} {}", self.s.version, env!("CARGO_PKG_VERSION")));
+            let _ = AppendMenuW(menu, MF_STRING, ID_VERSION, PCWSTR(tv.as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, PCWSTR(t3.as_ptr()));
             menu
         }
@@ -383,6 +395,10 @@ fn handle_command(hwnd: HWND, cmd: usize) {
             let id = RegisterWindowMessageW(w!("FontTuner.ReloadProfile"));
             let _ = PostMessageW(Some(HWND_BROADCAST), id, WPARAM(0), LPARAM(0));
         },
+        ID_VERSION => infobox(&format!(
+            "Font-tuner {}\nRenderCore64 (Rust) + FreeType\nGPL-3.0-or-later",
+            env!("CARGO_PKG_VERSION")
+        )),
         ID_SYSFONT_DEFAULT => sysfont::restore(),
         c if (ID_SYSFONT_BASE..ID_SYSFONT_BASE + sysfont::FONTS.len()).contains(&c) => {
             sysfont::apply(sysfont::FONTS[c - ID_SYSFONT_BASE]);
