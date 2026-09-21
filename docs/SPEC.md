@@ -71,8 +71,11 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64
   chain: `D2D1CreateFactory` → `CreateHwnd/DC/WicBitmapRenderTarget` and
   `ID2D1Factory1..7::CreateDevice`; `D2D1CreateDevice` →
   `ID2D1Device..6::CreateDeviceContext`; `D2D1CreateDeviceContext`. On every
-  target it patches `DrawGlyphRun` (29), the description overload (82),
-  `SetTextAntialiasMode` (34) and `SetTextRenderingParams` (36). Where the
+  target it patches `CreateCompatibleRenderTarget` (12, so offscreen bitmap
+  targets are hooked as they are made), `DrawGlyphRun` (29), the description
+  overload (82), `SetTextAntialiasMode` (34) and `SetTextRenderingParams`
+  (36). `GetDC` is probed before any font work, so targets that cannot lend
+  a DC cost nothing beyond the probe. Where the
   target lends a GDI DC the run is drawn by render-core; where it does not
   (DXGI surfaces: swap chains, composition) the OS draws with the profile's
   `[DirectWrite]` `IDWriteRenderingParams`, the antialias mode derived from

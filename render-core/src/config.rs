@@ -43,8 +43,8 @@ pub struct DwParams {
     pub contrast: f32,
     /// `ClearTypeLevel` 0..1.
     pub cleartype_level: f32,
-    /// `RenderingMode` 0..6 (`DWRITE_RENDERING_MODE`; 6 is upstream's
-    /// "natural symmetric" override, mapped when the params are built).
+    /// `RenderingMode` 0..6, passed to `DWRITE_RENDERING_MODE` as is (as
+    /// upstream's Direct2D params do; 6 = OUTLINE there).
     pub rendering_mode: i32,
 }
 
