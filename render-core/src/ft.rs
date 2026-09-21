@@ -26,6 +26,7 @@ extern "C" {
     fn shim_init() -> i32;
     fn shim_open(path: *const c_char, face_index: c_long) -> i32;
     fn shim_reface_memory(data: *const u8, len: c_long, want_family: *const c_char) -> i32;
+    fn shim_reface_memory_index(data: *const u8, len: c_long, index: c_long) -> i32;
     fn shim_render(charcode: u32, px: i32, load_flags: i32, render_mode: i32, ex: i32, ey: i32, out: *mut ShimGlyph) -> i32;
     fn shim_render_glyph(glyph_index: u32, px: i32, load_flags: i32, render_mode: i32, ex: i32, ey: i32, out: *mut ShimGlyph) -> i32;
     fn shim_set_lcd_filter(filter: i32) -> i32;
@@ -82,6 +83,13 @@ impl Ft {
     pub fn reface_memory(&self, data: &[u8], want_family: &str) -> Result<(), i32> {
         let cf = CString::new(want_family).unwrap_or_default();
         let r = unsafe { shim_reface_memory(data.as_ptr(), data.len() as c_long, cf.as_ptr()) };
+        if r == 0 { Ok(()) } else { Err(r) }
+    }
+
+    /// Swap the active face to an in-memory font file at a specific face index
+    /// (for DirectWrite's IDWriteFontFace bytes + GetIndex).
+    pub fn reface_memory_index(&self, data: &[u8], index: i64) -> Result<(), i32> {
+        let r = unsafe { shim_reface_memory_index(data.as_ptr(), data.len() as c_long, index as c_long) };
         if r == 0 { Ok(()) } else { Err(r) }
     }
 

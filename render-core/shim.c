@@ -64,6 +64,19 @@ int shim_reface_memory(const unsigned char* data, long len, const char* want_fam
     return err;
 }
 
+/* Load a specific face index from an in-memory font file (e.g. DirectWrite's
+   IDWriteFontFace bytes + GetIndex). */
+int shim_reface_memory_index(const unsigned char* data, long len, long index) {
+    if (g_face) { FT_Done_Face(g_face); g_face = 0; }
+    if (g_membuf) { free(g_membuf); g_membuf = 0; }
+    g_membuf = (unsigned char*)malloc(len);
+    if (!g_membuf) return -1;
+    memcpy(g_membuf, data, len);
+    int err = FT_New_Memory_Face(g_lib, g_membuf, len, index, &g_face);
+    if (!err && g_face) FT_Select_Charmap(g_face, FT_ENCODING_UNICODE);
+    return err;
+}
+
 /* filter: FT_LCD_FILTER_* (0 NONE, 1 DEFAULT, 2 LIGHT, 3 LEGACY1, 16 LEGACY) */
 int shim_set_lcd_filter(int filter) {
     if (!g_lib) return -1;
