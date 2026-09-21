@@ -144,6 +144,41 @@ fn advance_of(dx: Option<&[i32]>, i: usize, default: i32) -> i32 {
     dx.and_then(|d| d.get(i)).copied().unwrap_or(default)
 }
 
+/// Raw LCD subpixel coverage (3 bytes/px, **no blend**) for a glyph-index run,
+/// for the DirectWrite CLEARTYPE_3x1 alpha-texture path (IDWriteGlyphRunAnalysis::
+/// CreateAlphaTexture): the caller composites it itself, so we supply only the
+/// FreeType-hinted coverage. `pen` is the baseline in buffer coords. Returns a
+/// `w*h*3` buffer (0 = no coverage). `profile.aa` should be an LCD mode.
+pub fn glyph_run_coverage_lcd(ft: &Ft, profile: &Profile, glyphs: &[u16], px: i32,
+                              pen: (i32, i32), w: usize, h: usize) -> Vec<u8> {
+    ft.prepare(profile);
+    let mut cov = vec![0u8; w * h * 3];
+    let (mut pen_x, base_y) = pen;
+    for &gi in glyphs {
+        if let Some(g) = ft.render_glyph(gi, px, profile) {
+            if g.pixel_mode == PIXEL_MODE_LCD && g.rows > 0 && !g.buffer.is_empty() {
+                let cells = g.width / 3;
+                for row in 0..g.rows {
+                    let bi = (row * g.pitch) as usize;
+                    for cell in 0..cells {
+                        let i = bi + (cell * 3) as usize;
+                        let x = pen_x + g.left + cell;
+                        let y = base_y - g.top + row;
+                        if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
+                            let o = (y as usize * w + x as usize) * 3;
+                            for c in 0..3 {
+                                cov[o + c] = cov[o + c].max(g.buffer[i + c]);
+                            }
+                        }
+                    }
+                }
+            }
+            pen_x += g.advance_px;
+        }
+    }
+    cov
+}
+
 /// Blit one rendered glyph onto the canvas at the pen position.
 fn blit_glyph(canvas: &mut Canvas, tables: &Tables, ink: Ink, g: &ft::Glyph,
               pen_x: i32, base_y: i32, lcd: bool, bgr: bool) {
