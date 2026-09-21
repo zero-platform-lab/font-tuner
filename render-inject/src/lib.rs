@@ -37,6 +37,7 @@ use windows::Win32::System::Threading::{
 };
 
 const DLL_PROCESS_ATTACH: u32 = 1;
+const DLL_PROCESS_DETACH: u32 = 0;
 
 type FnEto = unsafe extern "system" fn(
     isize, i32, i32, u32, *const c_void, *const u16, u32, *const i32,
@@ -53,6 +54,7 @@ type FnDrawGlyphRun = unsafe extern "system" fn(
     *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
 ) -> HRESULT;
 static mut ORIG_DGR: Option<FnDrawGlyphRun> = None;
+static mut DGR_SLOT: *mut usize = std::ptr::null_mut();
 
 fn log(msg: &str) {
     if let Some(tmp) = std::env::var_os("TEMP") {
@@ -290,6 +292,7 @@ unsafe fn setup_dwrite_hook() {
         return;
     }
     ORIG_DGR = Some(std::mem::transmute::<usize, FnDrawGlyphRun>(*slot));
+    DGR_SLOT = slot;
     *slot = dgr_detour as usize;
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
     log("hook installed on DrawGlyphRun");
@@ -335,6 +338,31 @@ pub extern "system" fn DllMain(_hinst: HINSTANCE, reason: u32, _reserved: *mut c
         unsafe {
             let _ = CreateThread(None, 0, Some(on_attach), None, THREAD_CREATION_FLAGS(0), None);
         }
+    } else if reason == DLL_PROCESS_DETACH {
+        // Remove our hooks before the DLL unmaps, so no code points into freed
+        // memory (which would crash the host process on the next text draw).
+        unsafe {
+            let _ = minhook::MinHook::disable_all_hooks();
+            if let (Some(orig), false) = (ORIG_DGR, DGR_SLOT.is_null()) {
+                let mut oldp = PAGE_PROTECTION_FLAGS(0);
+                if VirtualProtect(DGR_SLOT as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_ok() {
+                    *DGR_SLOT = orig as usize;
+                    let _ = VirtualProtect(DGR_SLOT as *const c_void, 8, oldp, &mut oldp);
+                }
+            }
+        }
     }
     BOOL(1)
+}
+
+/// WH_GETMESSAGE hook procedure. Its only purpose is to make Windows map this
+/// DLL into every GUI process that pumps messages (which runs DllMain, which
+/// installs our text hooks) — the same auto-injection mechanism MacType uses.
+#[no_mangle]
+pub extern "system" fn GetMsgProc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::CallNextHookEx(None, code, wparam, lparam) }
 }
