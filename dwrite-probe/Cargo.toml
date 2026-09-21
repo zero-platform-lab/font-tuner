@@ -9,6 +9,9 @@ license = "GPL-3.0-or-later"
 name = "dwrite-probe"
 path = "src/main.rs"
 
+[dependencies]
+render-core = { path = "../render-core" }
+
 [dependencies.windows]
 version = "0.62"
 features = [
