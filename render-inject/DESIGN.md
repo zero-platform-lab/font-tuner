@@ -53,5 +53,8 @@ not the injection mechanism.
 
 ## Status
 
-Stage 1 only. Stages 2+ are deliberately not started; they need careful,
-tested, opt-in work rather than bulk code generation.
+All stages below are now implemented (GDI + DirectWrite interception, writeback,
+font resolution, cross-process and WH_GETMESSAGE injection, profile loading,
+safe unload). See `docs/RUST-PORT.md` for the current, consolidated picture and
+`../hook-probe` / `../dwrite-probe` for the single-process development stages.
+Remaining work is fidelity/robustness (see RUST-PORT.md "Not done").
