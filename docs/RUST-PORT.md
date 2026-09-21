@@ -58,15 +58,31 @@ Rendering is serialised by a mutex (one shared FreeType face, re-faced per draw)
   guard against the C++ oracle values) and `Profile::from_ini`, plus the
   bit-exact golden harness in `verify/`.
 
-## Not done / known limits
+## Port scope = MacType's full hook coverage
 
-- Direct2D / GPU DirectWrite (`ID2D1RenderTarget::DrawGlyphRun`, glyph-run
-  analysis) — only the GDI-interop bitmap path is hooked. GPU-rendered text is a
-  different-class problem (rasterisation happens on the GPU) and is out of scope.
+This is a **port**: the target is everything the C++ MacType intercepts
+(`vendor/mactype/hooklist.h`, `directwrite.cpp`), not a narrowed subset. Text
+paths MacType hooks, and where we stand:
+
+| path | MacType hooks | ours |
+|---|---|---|
+| GDI `ExtTextOutW` | yes | **done** |
+| GDI `ExtTextOutA` / `TextOutW/A` / `GetGlyphOutline*` | yes | todo (most apps hit ExtTextOutW) |
+| DirectWrite `IDWriteBitmapRenderTarget::DrawGlyphRun` (vtbl 3) | yes | **done** |
+| DirectWrite `CreateGlyphRunAnalysis` → `CreateAlphaTexture` (Chromium/Skia, VS Code) | yes | in progress |
+| Direct2D `ID2D1RenderTarget::DrawGlyphRun` (vtbl 29) / `DrawGlyphRun1` (82) / `ID2D1DeviceContext` | yes | todo |
+| factory/device hooks to reach the above (`D2D1CreateFactory`, `D2D1CreateDevice(Context)`, `DWriteCreateFactory`, `GetGdiInterop`) | yes | partial (we patch the shared vtable directly) |
+
+So Direct2D/GPU DirectWrite is **in scope** (MacType does it via
+`ID2D1RenderTarget::DrawGlyphRun`); it is simply not yet ported. Do not treat any
+path MacType covers as out of scope.
+
+## Other remaining
+
 - DPI transforms and non-natural DirectWrite measuring modes.
 - Coloured LCD is only exercised for black/greyscale text in verification.
-- System-wide auto-injection (all processes) is intentionally not wired into the
-  tray; the loader stays per-process.
+- System-wide auto-injection (all processes) is not wired into the tray; the
+  loader stays per-process.
 - `static mut` state (set once at init) should move to proper sync types.
 
 ## Build & try (single process)
