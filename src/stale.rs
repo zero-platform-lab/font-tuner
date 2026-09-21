@@ -19,9 +19,10 @@ use windows::Win32::System::Threading::{
 
 /// Exe names of processes holding the core at `dll_path` whose `GetMsgProc`
 /// RVA is not `expected`. A process that has the module but whose image we
-/// cannot read counts as stale (better to refuse than to guess). Processes we
-/// cannot open at all (other users, higher integrity — which the hook does
-/// not reach either) are skipped. A copy of the DLL loaded from another
+/// cannot read counts as stale (better to refuse than to guess). Processes
+/// whose module list we cannot even snapshot (other users, higher integrity
+/// — which the hook does not reach either) are skipped. A copy of the DLL
+/// loaded from another
 /// directory (the `loader` test harness) is not a problem: Windows resolves
 /// the hook DLL by path and maps the installed one as a separate image.
 pub fn holders_of_stale_core(dll_path: &Path, expected: usize) -> Vec<String> {
@@ -32,8 +33,9 @@ pub fn holders_of_stale_core(dll_path: &Path, expected: usize) -> Vec<String> {
             continue;
         }
         let Some(base) = module_base(pid, dll_path) else { continue };
-        let Some(p) = Remote::open(pid) else { continue };
-        if export_rva(&p, base, "GetMsgProc") != Some(expected) {
+        // The module is there: from here on anything we cannot read is stale.
+        let rva = Remote::open(pid).and_then(|p| export_rva(&p, base, "GetMsgProc"));
+        if rva != Some(expected) {
             out.push(exe);
         }
     }

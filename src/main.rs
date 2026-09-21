@@ -253,18 +253,24 @@ impl App {
         self.hook.is_some()
     }
 
-    fn set_enabled(&mut self, on: bool) {
+    /// Turn the hook on or off. On failure returns the message to show the
+    /// user; the caller shows it *after* releasing the `APP` borrow, because
+    /// `MessageBoxW` runs a modal loop that re-enters `wndproc`, and a nested
+    /// `with_app` would panic on the live `borrow_mut`.
+    #[must_use]
+    fn set_enabled(&mut self, on: bool) -> Option<String> {
+        let mut err = None;
         if on {
             self.hook = match Hook::install(&self.dir) {
                 Ok(h) => Some(h),
                 Err(e) => {
-                    match e {
-                        HookError::Install => msgbox(self.s.err_hook),
-                        HookError::Layout => msgbox(self.s.err_rva),
-                        HookError::Stale(names) => msgbox(&format!("{}
+                    err = Some(match e {
+                        HookError::Install => self.s.err_hook.to_string(),
+                        HookError::Layout => self.s.err_rva.to_string(),
+                        HookError::Stale(names) => format!("{}
 
-{}", self.s.err_stale, names.join(", "))),
-                    }
+{}", self.s.err_stale, names.join(", ")),
+                    });
                     None
                 }
             };
@@ -272,6 +278,7 @@ impl App {
             self.hook = None;
         }
         self.update_icon(NIM_MODIFY);
+        err
     }
 
     fn icon_data(&self) -> NOTIFYICONDATAW {
@@ -403,7 +410,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_DESTROY => {
                 with_app(|a| {
                     let _ = Shell_NotifyIconW(NIM_DELETE, &a.icon_data());
-                    a.set_enabled(false);
+                    let _ = a.set_enabled(false);
                     let _ = DestroyIcon(a.hicon);
                 });
                 PostQuitMessage(0);
@@ -424,7 +431,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn handle_command(hwnd: HWND, cmd: usize) {
     match cmd {
         ID_ENABLED => {
-            with_app(|a| a.set_enabled(!a.enabled()));
+            if let Some(Some(err)) = with_app(|a| a.set_enabled(!a.enabled())) {
+                msgbox(&err);
+            }
         }
         ID_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
@@ -518,10 +527,13 @@ fn main() {
                 icon_light,
             });
         });
-        with_app(|a| {
+        let err = with_app(|a| {
             a.update_icon(NIM_ADD);
-            a.set_enabled(true);
+            a.set_enabled(true)
         });
+        if let Some(Some(err)) = err {
+            msgbox(&err);
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
