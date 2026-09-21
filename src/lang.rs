@@ -15,6 +15,8 @@ pub struct Strings {
     pub tip_off: &'static str,
     pub err_no_dll: &'static str,
     pub err_hook: &'static str,
+    pub err_rva: &'static str,
+    pub err_stale: &'static str,
     pub err_already: &'static str,
 }
 
@@ -30,6 +32,8 @@ const EN: Strings = Strings {
     tip_off: "Font-tuner - off",
     err_no_dll: "RenderCore64.dll not found. Put font-tuner.exe in the Font-tuner folder.",
     err_hook: "Failed to install the hook.",
+    err_rva: "RenderCore64.dll is not laid out as expected (GetMsgProc is not at RVA 0x1000). Hook not installed: it would crash every process that still holds an older core.",
+    err_stale: "These programs still hold an older RenderCore64.dll; hooking now would crash them. Sign out and back in (or reboot), then enable Font-tuner:",
     err_already: "Font-tuner is already running.",
 };
 
@@ -45,6 +49,8 @@ const JA: Strings = Strings {
     tip_off: "Font-tuner - 無効",
     err_no_dll: "RenderCore64.dll が見つからない。font-tuner.exe を Font-tuner のフォルダに置く。",
     err_hook: "フックを張れなかった。",
+    err_rva: "RenderCore64.dll の配置が想定と違う (GetMsgProc が RVA 0x1000 にない)。古いコアを保持したままのプロセスが全部落ちるため、フックを張らない。",
+    err_stale: "古い RenderCore64.dll を保持したままのプログラムがある。今フックを張るとそれらが落ちる。サインアウトして入り直す (または再起動) してから有効にする:",
     err_already: "Font-tuner はすでに起動している。",
 };
 
