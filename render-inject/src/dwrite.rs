@@ -17,8 +17,12 @@ use render_core::{Aa, Profile};
 use windows::core::{Interface, HRESULT};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFontFile,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN, DWRITE_MATRIX,
+    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFactory1, IDWriteFactory2,
+    IDWriteFactory3, IDWriteFontFile, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN,
+    DWRITE_GRID_FIT_MODE, DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_GRID_FIT_MODE_DISABLED, DWRITE_GRID_FIT_MODE_ENABLED,
+    DWRITE_MATRIX, DWRITE_PIXEL_GEOMETRY, DWRITE_PIXEL_GEOMETRY_BGR, DWRITE_PIXEL_GEOMETRY_FLAT,
+    DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE, DWRITE_RENDERING_MODE1, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
@@ -26,9 +30,82 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS};
 
-use crate::hook::VTABLE_PATCH_LOCK;
+use crate::hook::{patch_slot, VTABLE_PATCH_LOCK};
 use crate::log;
 use crate::state::{orig, RenderState, CAPTURED, RENDER};
+
+/// What Direct2D gets told to do for text we cannot rasterise ourselves: the
+/// profile's `[DirectWrite]` values as `IDWriteRenderingParams`, plus the
+/// antialias mode and grid-fit choice derived the way upstream does
+/// (`Params::Params` in `directwrite.cpp`). Rebuilt on every profile load.
+#[derive(Clone)]
+pub(crate) struct DwRendering {
+    pub(crate) params: IDWriteRenderingParams,
+    /// `D2D1_TEXT_ANTIALIAS_MODE`: greyscale for a greyscale profile, else
+    /// DEFAULT (ClearType).
+    pub(crate) aa_mode: i32,
+    /// Upstream nudges the transform by 1/65535 when grid fitting is off, so
+    /// DirectWrite stops snapping glyphs to the pixel grid.
+    pub(crate) grid_fit_disabled: bool,
+}
+
+static DW_RENDERING: Mutex<Option<DwRendering>> = Mutex::new(None);
+
+/// The current Direct2D rendering setup, if the profile could be turned into one.
+pub(crate) fn dw_rendering() -> Option<DwRendering> {
+    DW_RENDERING.lock().ok()?.clone()
+}
+
+/// (Re)build `DW_RENDERING` from `p`. Tries `IDWriteFactory3` → 2 → 1 → 0
+/// like upstream, so the richest `CreateCustomRenderingParams` available on
+/// this OS is used.
+pub(crate) fn refresh_dw_rendering(p: &Profile) {
+    let built = unsafe { build_dw_rendering(p) };
+    if built.is_none() { log("DirectWrite rendering params: not available"); }
+    if let Ok(mut g) = DW_RENDERING.lock() { *g = built; }
+}
+
+unsafe fn build_dw_rendering(p: &Profile) -> Option<DwRendering> {
+    let f: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+    let (geometry, aa_mode) = match p.aa.mode() {
+        2 | 4 => (DWRITE_PIXEL_GEOMETRY_RGB, 0),
+        3 | 5 => (DWRITE_PIXEL_GEOMETRY_BGR, 0),
+        _ => (DWRITE_PIXEL_GEOMETRY_FLAT, 2), // D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+    };
+    let grid_fit = match p.hinting { 0 => DWRITE_GRID_FIT_MODE_DEFAULT, 1 => DWRITE_GRID_FIT_MODE_DISABLED, _ => DWRITE_GRID_FIT_MODE_ENABLED };
+    // RenderingMode 6 is not a DWRITE_RENDERING_MODE; upstream maps it to
+    // natural symmetric.
+    let (mode, mode1) = if p.dw.rendering_mode == 6 {
+        (DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC)
+    } else {
+        (DWRITE_RENDERING_MODE(p.dw.rendering_mode), DWRITE_RENDERING_MODE1(p.dw.rendering_mode))
+    };
+    let d = &p.dw;
+    let params = custom_params(&f, d.gamma, d.contrast, d.cleartype_level, geometry, mode, mode1, grid_fit)?;
+    Some(DwRendering { params, aa_mode, grid_fit_disabled: grid_fit == DWRITE_GRID_FIT_MODE_DISABLED })
+}
+
+unsafe fn custom_params(
+    f: &IDWriteFactory, gamma: f32, contrast: f32, cleartype: f32, geometry: DWRITE_PIXEL_GEOMETRY,
+    mode: DWRITE_RENDERING_MODE, mode1: DWRITE_RENDERING_MODE1, grid_fit: DWRITE_GRID_FIT_MODE,
+) -> Option<IDWriteRenderingParams> {
+    if let Ok(f3) = f.cast::<IDWriteFactory3>() {
+        if let Ok(r) = f3.CreateCustomRenderingParams(gamma, contrast, contrast, cleartype, geometry, mode1, grid_fit) {
+            return r.cast().ok();
+        }
+    }
+    if let Ok(f2) = f.cast::<IDWriteFactory2>() {
+        if let Ok(r) = f2.CreateCustomRenderingParams(gamma, contrast, contrast, cleartype, geometry, mode, grid_fit) {
+            return r.cast().ok();
+        }
+    }
+    if let Ok(f1) = f.cast::<IDWriteFactory1>() {
+        if let Ok(r) = f1.CreateCustomRenderingParams(gamma, contrast, contrast, cleartype, geometry, mode) {
+            return r.cast().ok();
+        }
+    }
+    f.CreateCustomRenderingParams(gamma, contrast, cleartype, geometry, mode).ok()
+}
 
 type FnDrawGlyphRun = unsafe extern "system" fn(
     *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
@@ -44,6 +121,12 @@ type FnCreateAlphaTexture = unsafe extern "system" fn(
     *mut c_void, i32, *const RECT, *mut u8, u32,
 ) -> HRESULT;
 static ORIG_CGRA: OnceLock<FnCreateGlyphRunAnalysis> = OnceLock::new();
+type FnCreateGlyphRunAnalysis2 = unsafe extern "system" fn(
+    *mut c_void, *const DWRITE_GLYPH_RUN, *const DWRITE_MATRIX, i32, i32, i32, i32, f32, f32, *mut *mut c_void,
+) -> HRESULT;
+type FnCreateGlyphRunAnalysis3 = FnCreateGlyphRunAnalysis2;
+static ORIG_CGRA2: OnceLock<FnCreateGlyphRunAnalysis2> = OnceLock::new();
+static ORIG_CGRA3: OnceLock<FnCreateGlyphRunAnalysis3> = OnceLock::new();
 /// Published before the vtable write, so `cat_detour` (which can only run
 /// once that write has happened) always finds it.
 static ORIG_CAT: OnceLock<FnCreateAlphaTexture> = OnceLock::new();
@@ -169,16 +252,22 @@ pub(crate) unsafe fn setup_dwrite_hook() {
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
     log("hook installed on DrawGlyphRun");
 
-    // Patch IDWriteFactory::CreateGlyphRunAnalysis (vtbl slot 23) for the
-    // analysis/coverage path (Chromium/Skia). The vtable is shared, so this
-    // covers the app's own factory too.
-    let fslot = (*(factory.as_raw() as *mut *mut usize)).add(23);
-    let mut fp = PAGE_PROTECTION_FLAGS(0);
-    if VirtualProtect(fslot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut fp).is_ok() {
-        let _ = ORIG_CGRA.set(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis>(*fslot));
-        *fslot = cgra_detour as *const () as usize;
-        let _ = VirtualProtect(fslot as *const c_void, 8, fp, &mut fp);
-        log("hook installed on CreateGlyphRunAnalysis");
+    // Patch CreateGlyphRunAnalysis for the analysis/coverage path
+    // (Chromium/Skia): IDWriteFactory slot 23, plus the IDWriteFactory2 (30)
+    // and IDWriteFactory3 (31) overloads Skia prefers when they exist — an
+    // analysis made through those never passed slot 23, so its
+    // CreateAlphaTexture found no run and drew untuned. The vtable is shared,
+    // so this covers the app's own factory too.
+    let fvtbl = *(factory.as_raw() as *mut *mut usize);
+    patch_slot(fvtbl.add(23), cgra_detour as *const () as usize, |o| { let _ = ORIG_CGRA.set(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis>(o)); });
+    log("hook installed on CreateGlyphRunAnalysis");
+    if factory.cast::<IDWriteFactory2>().is_ok() {
+        patch_slot(fvtbl.add(30), cgra2_detour as *const () as usize, |o| { let _ = ORIG_CGRA2.set(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis2>(o)); });
+        log("hook installed on IDWriteFactory2::CreateGlyphRunAnalysis");
+    }
+    if factory.cast::<IDWriteFactory3>().is_ok() {
+        patch_slot(fvtbl.add(31), cgra3_detour as *const () as usize, |o| { let _ = ORIG_CGRA3.set(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis3>(o)); });
+        log("hook installed on IDWriteFactory3::CreateGlyphRunAnalysis");
     }
 }
 
@@ -189,6 +278,34 @@ unsafe extern "system" fn cgra_detour(
     rmode: i32, mmode: i32, bx: f32, by: f32, out: *mut *mut c_void,
 ) -> HRESULT {
     let hr = (orig(&ORIG_CGRA))(this, run, ppd, transform, rmode, mmode, bx, by, out);
+    record_analysis(hr, run, bx, by, out);
+    hr
+}
+
+/// `IDWriteFactory2::CreateGlyphRunAnalysis(run, transform, renderingMode,
+/// measuringMode, gridFitMode, antialiasMode, baselineX, baselineY, out)`.
+unsafe extern "system" fn cgra2_detour(
+    this: *mut c_void, run: *const DWRITE_GLYPH_RUN, transform: *const DWRITE_MATRIX,
+    rmode: i32, mmode: i32, grid: i32, aa: i32, bx: f32, by: f32, out: *mut *mut c_void,
+) -> HRESULT {
+    let hr = (orig(&ORIG_CGRA2))(this, run, transform, rmode, mmode, grid, aa, bx, by, out);
+    record_analysis(hr, run, bx, by, out);
+    hr
+}
+
+/// `IDWriteFactory3::CreateGlyphRunAnalysis`: same shape with `DWRITE_RENDERING_MODE1`.
+unsafe extern "system" fn cgra3_detour(
+    this: *mut c_void, run: *const DWRITE_GLYPH_RUN, transform: *const DWRITE_MATRIX,
+    rmode1: i32, mmode: i32, grid: i32, aa: i32, bx: f32, by: f32, out: *mut *mut c_void,
+) -> HRESULT {
+    let hr = (orig(&ORIG_CGRA3))(this, run, transform, rmode1, mmode, grid, aa, bx, by, out);
+    record_analysis(hr, run, bx, by, out);
+    hr
+}
+
+/// After any CreateGlyphRunAnalysis overload: remember the run behind the new
+/// analysis object and make sure its CreateAlphaTexture is ours.
+unsafe fn record_analysis(hr: HRESULT, run: *const DWRITE_GLYPH_RUN, bx: f32, by: f32, out: *mut *mut c_void) {
     if hr.is_ok() && !out.is_null() && !(*out).is_null() && !run.is_null() {
         let r = &*run;
         if let Some((bytes, index)) = dwrite_font_bytes(r) {
@@ -208,7 +325,6 @@ unsafe extern "system" fn cgra_detour(
             patch_cat_vtable(*out);
         }
     }
-    hr
 }
 
 unsafe fn patch_cat_vtable(analysis: *mut c_void) {

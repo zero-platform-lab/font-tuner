@@ -30,6 +30,32 @@ impl Aa {
     pub fn is_lcd(self) -> bool { !matches!(self, Aa::Grey) }
 }
 
+/// The `[DirectWrite]` section: what the injected core hands to DirectWrite /
+/// Direct2D as `IDWriteRenderingParams` for text it cannot rasterise itself
+/// (Direct2D device contexts drawing to DXGI surfaces, where no GDI DC can be
+/// borrowed). Same keys and defaults as upstream `settings.cpp`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DwParams {
+    /// `GammaValue`; when absent, upstream derives it from the general gamma:
+    /// `g*g > 1.3 ? g*g/2 : 0.7`.
+    pub gamma: f32,
+    /// `Contrast` (enhanced contrast, also used as the greyscale contrast).
+    pub contrast: f32,
+    /// `ClearTypeLevel` 0..1.
+    pub cleartype_level: f32,
+    /// `RenderingMode` 0..6 (`DWRITE_RENDERING_MODE`; 6 is upstream's
+    /// "natural symmetric" override, mapped when the params are built).
+    pub rendering_mode: i32,
+}
+
+impl DwParams {
+    /// Upstream's defaults for a profile with no `[DirectWrite]` section.
+    pub fn derived_from(general_gamma: f32) -> DwParams {
+        let g2 = general_gamma * general_gamma;
+        DwParams { gamma: if g2 > 1.3 { g2 / 2.0 } else { 0.7 }, contrast: 1.0, cleartype_level: 1.0, rendering_mode: 5 }
+    }
+}
+
 /// A rendering profile.
 #[derive(Clone, Copy, Debug)]
 pub struct Profile {
@@ -44,39 +70,42 @@ pub struct Profile {
     pub lcd_filter: i32,
     /// Outline embolden strength in 26.6 units (NormalWeight; 0 = none).
     pub embolden: i32,
+    /// `[DirectWrite]` overrides for the paths DirectWrite/Direct2D render.
+    pub dw: DwParams,
 }
 
 impl Profile {
     /// Clean Greyscale (shipped default): greyscale, no hinting bias, gamma 1.25.
     pub fn clean_greyscale() -> Profile {
         Profile { gamma: 1.25, weight: 1.0, contrast: 1.0, gamma_mode: 0,
-                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0 }
+                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.25) }
     }
     /// Clean Sharp: LCD subpixel, no hinting, gamma 1.2, no LCD filter.
     pub fn clean_sharp() -> Profile {
         Profile { gamma: 1.20, weight: 1.0, contrast: 1.0, gamma_mode: 0,
-                  aa: Aa::LcdRgb, hinting: 1, lcd_filter: 0, embolden: 0 }
+                  aa: Aa::LcdRgb, hinting: 1, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.20) }
     }
     /// Accurate: LightLCD, autohint, gamma 1.3, LIGHT filter.
     pub fn accurate() -> Profile {
         Profile { gamma: 1.30, weight: 1.0, contrast: 1.0, gamma_mode: 0,
-                  aa: Aa::LightLcdRgb, hinting: 2, lcd_filter: 2, embolden: 0 }
+                  aa: Aa::LightLcdRgb, hinting: 2, lcd_filter: 2, embolden: 0, dw: DwParams::derived_from(1.30) }
     }
     /// Clean Dark Greyscale: greyscale tuned for dark backgrounds
     /// (gamma 1.1, contrast 0.9, slightly heavier weight).
     pub fn clean_dark_greyscale() -> Profile {
         Profile { gamma: 1.10, weight: 1.05, contrast: 0.9, gamma_mode: 0,
-                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0 }
+                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.10) }
     }
     /// Clean Sharp Dark: LCD subpixel tuned for dark backgrounds.
     pub fn clean_sharp_dark() -> Profile {
         Profile { gamma: 1.10, weight: 1.05, contrast: 0.9, gamma_mode: 0,
-                  aa: Aa::LcdRgb, hinting: 0, lcd_filter: 0, embolden: 0 }
+                  aa: Aa::LcdRgb, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.10) }
     }
 
-    /// Parse a MacType profile `.ini` into a `Profile`. Reads the first value of
-    /// each key (the `[General]`/`[FreeType]` section, not the `[DirectWrite]`
-    /// overrides). Unknown/missing keys keep sensible defaults.
+    /// Parse a MacType profile `.ini` into a `Profile`. Keys outside
+    /// `[DirectWrite]` are read first-occurrence-wins (the `[General]` /
+    /// `[FreeType]` section); `[DirectWrite]` fills `dw`. Unknown/missing keys
+    /// keep sensible defaults.
     pub fn from_ini(path: &str) -> Option<Profile> {
         let text = std::fs::read_to_string(path).ok()?;
         Some(Profile::from_ini_str(&text))
@@ -86,13 +115,26 @@ impl Profile {
     pub fn from_ini_str(text: &str) -> Profile {
         let mut p = Profile::clean_greyscale();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut in_dw = false;
+        // Explicit [DirectWrite] values; the rest is derived once the general
+        // gamma is known (upstream reads the section after [General]).
+        let mut dw: [Option<f32>; 4] = [None; 4];
         for line in text.lines() {
             let line = line.trim();
-            if line.starts_with(';') || line.starts_with('[') {
+            if line.starts_with(';') {
+                continue;
+            }
+            if line.starts_with('[') {
+                in_dw = line.trim_end_matches(']').trim_start_matches('[').trim().eq_ignore_ascii_case("DirectWrite");
                 continue;
             }
             let Some((k, v)) = line.split_once('=') else { continue };
             let (k, v) = (k.trim(), v.trim());
+            if in_dw {
+                let i = match k { "GammaValue" => 0, "Contrast" => 1, "ClearTypeLevel" => 2, "RenderingMode" => 3, _ => continue };
+                if dw[i].is_none() { dw[i] = v.parse().ok(); }
+                continue;
+            }
             if !seen.insert(k) { continue; } // first occurrence wins
             match k {
                 "HintingMode" => if let Ok(n) = v.parse() { p.hinting = n; },
@@ -108,6 +150,13 @@ impl Profile {
                 _ => {}
             }
         }
+        let d = DwParams::derived_from(p.gamma);
+        p.dw = DwParams {
+            gamma: dw[0].unwrap_or(d.gamma).clamp(0.0, 20.0),
+            contrast: dw[1].unwrap_or(d.contrast).clamp(0.0625, 10.0),
+            cleartype_level: dw[2].unwrap_or(d.cleartype_level).clamp(0.0, 1.0),
+            rendering_mode: (dw[3].unwrap_or(d.rendering_mode as f32) as i32).clamp(0, 6),
+        };
         p
     }
 }
@@ -137,6 +186,32 @@ Contrast=0.0
         assert_eq!(p.lcd_filter, 2);
         assert!((p.gamma - 1.3).abs() < 1e-6, "first (General) GammaValue wins over DirectWrite");
         assert!((p.contrast - 1.0).abs() < 1e-6);
+        assert!((p.dw.gamma - 1.4).abs() < 1e-6, "[DirectWrite] GammaValue lands in dw");
+        assert!((p.dw.contrast - 0.0).abs() < 1e-6);
+        assert!((p.dw.cleartype_level - 1.0).abs() < 1e-6, "absent key keeps the upstream default");
+        assert_eq!(p.dw.rendering_mode, 5);
+    }
+
+    #[test]
+    fn dw_params_derive_from_general_gamma_when_section_absent() {
+        // 1.25^2 = 1.5625 > 1.3 -> /2
+        let p = Profile::from_ini_str("GammaValue=1.25
+");
+        assert!((p.dw.gamma - 1.5625 / 2.0).abs() < 1e-6);
+        // 1.1^2 = 1.21 <= 1.3 -> 0.7
+        let p = Profile::from_ini_str("GammaValue=1.1
+");
+        assert!((p.dw.gamma - 0.7).abs() < 1e-6);
+        // a [DirectWrite] GammaValue must not leak into the general gamma
+        let p = Profile::from_ini_str("[DirectWrite]
+GammaValue=0.9
+RenderingMode=2
+[General]
+GammaValue=1.3
+");
+        assert!((p.gamma - 1.3).abs() < 1e-6);
+        assert!((p.dw.gamma - 0.9).abs() < 1e-6);
+        assert_eq!(p.dw.rendering_mode, 2);
     }
 
     #[test]

@@ -291,6 +291,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     if let Ok(mut guard) = RENDER.lock() {
         *guard = Some(RenderState { ft, tables: tables_for(&p), profile: p, font_key: None });
     }
+    dwrite::refresh_dw_rendering(&p);
     RELOAD_MSG.store(RegisterWindowMessageW(RELOAD_MSG_NAME), Ordering::Relaxed);
 
     let Ok(gdi32) = GetModuleHandleW(w!("gdi32.dll")) else { return 1 };

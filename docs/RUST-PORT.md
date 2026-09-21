@@ -26,12 +26,20 @@ the tray's global (or loader's single-process) WH_GETMESSAGE hook maps RenderCor
       loads the active profile (install-dir font-tuner.ini AlternativeFile, else default)
       hooks gdi32!ExtTextOutW               (retour inline detour, other threads frozen)
       patches IDWriteBitmapRenderTarget::DrawGlyphRun in the shared vtable
-      hooks IDWriteFactory::CreateGlyphRunAnalysis / D2D1CreateFactory
+      patches IDWriteFactory{,2,3}::CreateGlyphRunAnalysis (→ CreateAlphaTexture)
+      hooks d2d1!D2D1CreateFactory / D2D1CreateDevice / D2D1CreateDeviceContext, then
+        ID2D1Factory1..7::CreateDevice → ID2D1Device..6::CreateDeviceContext →
+        DrawGlyphRun (29) / DrawGlyphRun with description (82) /
+        SetTextAntialiasMode (34) / SetTextRenderingParams (36) on every target
   → each text draw:
       resolve the font from the DC / glyph run (GetFontData 'ttcf' for TTCs,
         or IDWriteFontFace file bytes + index)
       render the run with render-core (grey/LCD per profile) over the DC's pixels
       blit back, skipping the OS rasteriser
+  → Direct2D targets that lend no GDI DC (DXGI surfaces): DrawGlyphRun runs the
+      OS rasteriser with the profile's [DirectWrite] IDWriteRenderingParams,
+      greyscale/ClearType antialias mode, and upstream's 1/65535 transform
+      nudge when grid fitting is off — what upstream does for all of Direct2D
   → never unloaded from a running process (pinned); DllMain DETACH is a no-op
     reached only at process teardown
 ```
@@ -77,10 +85,12 @@ paths MacType hooks, and where we stand:
 | GDI `ExtTextOutW` | yes | **done** |
 | GDI `ExtTextOutA` / `TextOutW/A` / `GetGlyphOutline*` | yes | todo (most apps hit ExtTextOutW) |
 | DirectWrite `IDWriteBitmapRenderTarget::DrawGlyphRun` (vtbl 3) | yes | **done** |
-| DirectWrite `CreateGlyphRunAnalysis` → `CreateAlphaTexture` (Chromium/Skia, VS Code) | yes | **done** |
+| DirectWrite `CreateGlyphRunAnalysis` → `CreateAlphaTexture` (Chromium/Skia, VS Code), incl. the `IDWriteFactory2`/`3` overloads | yes | **done** |
 | Direct2D `ID2D1RenderTarget::DrawGlyphRun` (vtbl 29) | yes | **done** (via `D2D1CreateFactory` → RT creation → per-vtable patch) |
-| Direct2D `DrawGlyphRun1` (vtbl 82) / `ID2D1DeviceContext` | yes | todo |
-| factory/device hooks to reach the above (`D2D1CreateFactory`, `D2D1CreateDevice(Context)`, `DWriteCreateFactory`, `GetGdiInterop`) | yes | partial (`D2D1CreateFactory` hooked; DWrite paths patch the shared vtable directly) |
+| Direct2D `DrawGlyphRun1` (vtbl 82) / `ID2D1DeviceContext` | yes | **done** (`D2D1CreateDevice`, `D2D1CreateDeviceContext`, `ID2D1Factory1..7::CreateDevice`, `ID2D1Device..6::CreateDeviceContext`); render-core where the target lends a GDI DC, else upstream's rendering-params route |
+| Direct2D `SetTextAntialiasMode` (34) / `SetTextRenderingParams` (36) forced to the profile | yes | **done** |
+| `DWriteCreateFactory` / `GetGdiInterop` | yes | not needed: upstream uses them only to reach the shared vtables, which we patch directly from our own factory |
+| `CreateTextFormat` / `CreateFontFace` (upstream's ForceFont font substitution) | yes | todo — a separate feature (font replacement), not render tuning; no `font-tuner.ini` key yet |
 
 Do not treat any path MacType covers as out of scope: the remaining rows are
 not-yet-ported, not deliberately dropped.
