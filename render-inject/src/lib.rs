@@ -15,6 +15,7 @@ use std::io::Write;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use render_core::render::{draw_glyphs_onto, draw_text_onto, Canvas, Ink};
 use render_core::{tables_for, Ft, Profile, Tables};
@@ -49,6 +50,9 @@ static mut TABLES: Option<Tables> = None;
 static mut PROFILE: Option<Profile> = None;
 static IN_DETOUR: AtomicBool = AtomicBool::new(false);
 static CAPTURED: AtomicBool = AtomicBool::new(false);
+/// Serialises all rendering: the single global FreeType face is re-faced per
+/// call, so concurrent draws from the host's threads must not overlap.
+static RENDER_LOCK: Mutex<()> = Mutex::new(());
 
 type FnDrawGlyphRun = unsafe extern "system" fn(
     *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
@@ -114,6 +118,7 @@ unsafe fn render_into_dc(hdc_i: isize, x: i32, y: i32, options: u32,
     if str_ptr.is_null() || count == 0 {
         return None;
     }
+    let _guard = RENDER_LOCK.lock().ok()?; // serialise access to the shared face
     let ft = FT.as_ref()?;
     let tables = TABLES.as_ref()?;
     let profile = PROFILE.as_ref()?;
@@ -229,6 +234,7 @@ unsafe extern "system" fn dgr_detour(
 }
 
 unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, color: u32) -> Option<()> {
+    let _guard = RENDER_LOCK.lock().ok()?; // serialise access to the shared face
     let ft = FT.as_ref()?;
     let tables = TABLES.as_ref()?;
     let profile = PROFILE.as_ref()?;
