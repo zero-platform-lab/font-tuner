@@ -89,8 +89,6 @@ not-yet-ported, not deliberately dropped.
 
 - DPI transforms and non-natural DirectWrite measuring modes.
 - Coloured LCD is only exercised for black/greyscale text in verification.
-- `static mut` state (set once at init) should move to proper sync types; the
-  one-time patches that race are already mutex-guarded.
 
 ## Build & try (single process)
 
