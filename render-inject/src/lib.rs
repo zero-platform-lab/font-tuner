@@ -2,14 +2,15 @@
 //! render-inject — the DLL injected into each process. On load it hooks the
 //! text-drawing entry points and renders with `render-core`, replacing Windows'
 //! own text rendering inside whatever process this DLL was injected into:
-//!   * GDI: gdi32!ExtTextOutW (string + ETO_GLYPH_INDEX) — Stage 4b.
-//!   * DirectWrite: IDWriteBitmapRenderTarget::DrawGlyphRun, via a shared-vtable
-//!     patch so every render target in the process routes through us — Stage 5c.
+//!   * GDI: gdi32!ExtTextOutW (string + ETO_GLYPH_INDEX; ETO_OPAQUE/CLIPPED/dx).
+//!   * DirectWrite bitmap: IDWriteBitmapRenderTarget::DrawGlyphRun (vtbl patch).
+//!   * DirectWrite analysis (Chromium/Skia, VS Code): capture the run at
+//!     IDWriteFactory::CreateGlyphRunAnalysis, substitute render-core coverage at
+//!     IDWriteGlyphRunAnalysis::CreateAlphaTexture.
 //!
-//! Both resolve the font (cached, re-extracted only on change), honour the DC's
-//! colour/baseline, and blit over the target's current content; the GDI path
-//! also handles ETO_OPAQUE / ETO_CLIPPED / lpDx. Rendering is serialised by a
-//! mutex. Not yet covered: Direct2D/GPU DirectWrite and DPI transforms.
+//! Fonts are cached (re-extracted only on change); rendering is serialised by a
+//! mutex. Remaining per RUST-PORT.md: Direct2D ID2D1RenderTarget::DrawGlyphRun
+//! and DPI transforms.
 
 use core::ffi::c_void;
 use std::io::Write;
@@ -18,13 +19,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use render_core::render::{draw_glyphs_onto, draw_text_onto, Canvas, Ink};
-use render_core::{tables_for, Ft, Profile, Tables};
+use std::collections::HashMap;
+
+use render_core::render::{draw_glyphs_onto, draw_text_onto, glyph_run_coverage_lcd, Canvas, Ink};
+use render_core::{tables_for, Aa, Ft, Profile, Tables};
 use windows::core::{s, w, Interface, BOOL, HRESULT};
 use windows::Win32::Foundation::{HINSTANCE, RECT};
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFontFile,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN,
+    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFontFile, DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN, DWRITE_MATRIX,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetBkColor, GetCurrentObject,
@@ -60,6 +62,27 @@ type FnDrawGlyphRun = unsafe extern "system" fn(
 ) -> HRESULT;
 static mut ORIG_DGR: Option<FnDrawGlyphRun> = None;
 static mut DGR_SLOT: *mut usize = std::ptr::null_mut();
+
+// DirectWrite glyph-run *analysis* path (Chromium/Skia / VS Code): capture the
+// run at CreateGlyphRunAnalysis, substitute coverage at CreateAlphaTexture.
+type FnCreateGlyphRunAnalysis = unsafe extern "system" fn(
+    *mut c_void, *const DWRITE_GLYPH_RUN, f32, *const DWRITE_MATRIX, i32, i32, f32, f32, *mut *mut c_void,
+) -> HRESULT;
+type FnCreateAlphaTexture = unsafe extern "system" fn(
+    *mut c_void, i32, *const RECT, *mut u8, u32,
+) -> HRESULT;
+static mut ORIG_CGRA: Option<FnCreateGlyphRunAnalysis> = None;
+static mut ORIG_CAT: Option<FnCreateAlphaTexture> = None;
+static mut CAT_SLOT: *mut usize = std::ptr::null_mut();
+static ANALYSES: Mutex<Option<HashMap<usize, RunInfo>>> = Mutex::new(None);
+
+struct RunInfo {
+    bytes: Vec<u8>,
+    index: u32,
+    glyphs: Vec<u16>,
+    px: i32,
+    baseline: (i32, i32),
+}
 
 fn log(msg: &str) {
     if let Some(tmp) = std::env::var_os("TEMP") {
@@ -375,6 +398,92 @@ unsafe fn setup_dwrite_hook() {
     *slot = dgr_detour as usize;
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
     log("hook installed on DrawGlyphRun");
+
+    // Patch IDWriteFactory::CreateGlyphRunAnalysis (vtbl slot 23) for the
+    // analysis/coverage path (Chromium/Skia). The vtable is shared, so this
+    // covers the app's own factory too.
+    let fslot = (*(factory.as_raw() as *mut *mut usize)).add(23);
+    let mut fp = PAGE_PROTECTION_FLAGS(0);
+    if VirtualProtect(fslot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut fp).is_ok() {
+        ORIG_CGRA = Some(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis>(*fslot));
+        *fslot = cgra_detour as usize;
+        let _ = VirtualProtect(fslot as *const c_void, 8, fp, &mut fp);
+        log("hook installed on CreateGlyphRunAnalysis");
+    }
+}
+
+// CreateGlyphRunAnalysis: create the analysis, capture its run, patch its
+// CreateAlphaTexture slot the first time.
+unsafe extern "system" fn cgra_detour(
+    this: *mut c_void, run: *const DWRITE_GLYPH_RUN, ppd: f32, transform: *const DWRITE_MATRIX,
+    rmode: i32, mmode: i32, bx: f32, by: f32, out: *mut *mut c_void,
+) -> HRESULT {
+    let hr = (ORIG_CGRA.unwrap())(this, run, ppd, transform, rmode, mmode, bx, by, out);
+    if hr.is_ok() && !out.is_null() && !(*out).is_null() && !run.is_null() {
+        let r = &*run;
+        if let Some((bytes, index)) = dwrite_font_bytes(r) {
+            let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize).to_vec();
+            let info = RunInfo { bytes, index, glyphs, px: r.fontEmSize.round() as i32,
+                                 baseline: (bx.round() as i32, by.round() as i32) };
+            if let Ok(mut m) = ANALYSES.lock() {
+                m.get_or_insert_with(HashMap::new).insert(*out as usize, info);
+            }
+            patch_cat_vtable(*out);
+        }
+    }
+    hr
+}
+
+unsafe fn patch_cat_vtable(analysis: *mut c_void) {
+    if !CAT_SLOT.is_null() { return; }
+    let vtbl = *(analysis as *mut *mut usize);
+    let slot = vtbl.add(4);
+    let mut oldp = PAGE_PROTECTION_FLAGS(0);
+    if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() { return; }
+    ORIG_CAT = Some(std::mem::transmute::<usize, FnCreateAlphaTexture>(*slot));
+    CAT_SLOT = slot;
+    *slot = cat_detour as usize;
+    let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
+    log("hook installed on CreateAlphaTexture");
+}
+
+unsafe extern "system" fn cat_detour(
+    this: *mut c_void, tex_type: i32, bounds: *const RECT, alpha: *mut u8, size: u32,
+) -> HRESULT {
+    if tex_type == 1 && !bounds.is_null() && !alpha.is_null() && cat_fill(this, &*bounds, alpha, size).is_some() {
+        return HRESULT(0);
+    }
+    (ORIG_CAT.unwrap())(this, tex_type, bounds, alpha, size)
+}
+
+unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Option<()> {
+    let ft = FT.as_ref()?;
+    let profile = PROFILE.as_ref()?;
+    let (w, h) = ((b.right - b.left) as usize, (b.bottom - b.top) as usize);
+    if w == 0 || h == 0 || w * h * 3 != size as usize { return None; }
+    let mut cache = RENDER_LOCK.lock().ok()?;
+    let m = ANALYSES.lock().ok()?;
+    let info = m.as_ref()?.get(&(this as usize))?;
+    let key = format!("dwa:{:p}", this);
+    if cache.as_deref() != Some(key.as_str()) {
+        ft.reface_memory_index(&info.bytes, info.index as i64).ok()?;
+        *cache = Some(key);
+    }
+    // force LCD subpixel for the CLEARTYPE_3x1 texture, keep the profile's hinting
+    let lcd = Profile { aa: Aa::LcdRgb, ..*profile };
+    let pen = (info.baseline.0 - b.left, info.baseline.1 - b.top);
+    let cov = glyph_run_coverage_lcd(ft, &lcd, &info.glyphs, info.px, pen, w, h);
+    if !CAPTURED.swap(true, Ordering::SeqCst) {
+        if let Some(tmp) = std::env::var_os("TEMP") {
+            let inv: Vec<u8> = cov.iter().map(|&v| 255 - v).collect();
+            let _ = inv;
+            let p = PathBuf::from(tmp).join("render-inject-analysis.txt");
+            let _ = std::fs::write(p, format!("analysis substituted: {w}x{h}, glyphs={}", info.glyphs.len()));
+            log("substituted CreateAlphaTexture via render-core");
+        }
+    }
+    std::ptr::copy_nonoverlapping(cov.as_ptr(), alpha, size as usize);
+    Some(())
 }
 
 /// Runs off the loader lock: init render-core and install the hook.
