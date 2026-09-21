@@ -27,6 +27,7 @@ extern "C" {
     fn shim_open(path: *const c_char, face_index: c_long) -> i32;
     fn shim_reface_memory(data: *const u8, len: c_long, want_family: *const c_char) -> i32;
     fn shim_render(charcode: u32, px: i32, load_flags: i32, render_mode: i32, ex: i32, ey: i32, out: *mut ShimGlyph) -> i32;
+    fn shim_render_glyph(glyph_index: u32, px: i32, load_flags: i32, render_mode: i32, ex: i32, ey: i32, out: *mut ShimGlyph) -> i32;
     fn shim_set_lcd_filter(filter: i32) -> i32;
     fn shim_done();
 }
@@ -109,17 +110,34 @@ impl Ft {
         }
     }
 
-    /// Render one character at `px` pixels through `p`. Returns `None` if the
-    /// glyph is missing or empty.
+    /// Render one character at `px` pixels through `p`. Returns `None` only on
+    /// a hard error; a missing/empty glyph yields an empty `Glyph` (advance only).
     pub fn render(&self, ch: char, px: i32, p: &Profile) -> Option<Glyph<'_>> {
+        self.emit(p, |flags, mode, ex, ey, out| unsafe {
+            shim_render(ch as u32, px, flags, mode, ex, ey, out)
+        })
+    }
+
+    /// Render a glyph by its font glyph index (for ETO_GLYPH_INDEX draws).
+    pub fn render_glyph(&self, gi: u16, px: i32, p: &Profile) -> Option<Glyph<'_>> {
+        self.emit(p, |flags, mode, ex, ey, out| unsafe {
+            shim_render_glyph(gi as u32, px, flags, mode, ex, ey, out)
+        })
+    }
+
+    /// Shared body: run `call` (which invokes the right shim entry point) and
+    /// wrap the resulting bitmap.
+    fn emit(
+        &self,
+        p: &Profile,
+        call: impl FnOnce(i32, i32, i32, i32, *mut ShimGlyph) -> i32,
+    ) -> Option<Glyph<'_>> {
         let (flags, render_mode) = Self::flags(p);
         let mut g = ShimGlyph {
             width: 0, rows: 0, pitch: 0, pixel_mode: 0,
             left: 0, top: 0, advance_x: 0, buffer: std::ptr::null(),
         };
-        let r = unsafe {
-            shim_render(ch as u32, px, flags, render_mode, p.embolden, p.embolden, &mut g)
-        };
+        let r = call(flags, render_mode, p.embolden, p.embolden, &mut g);
         if r != 0 || g.buffer.is_null() || g.rows == 0 {
             return Some(Glyph {
                 width: 0, rows: 0, pitch: 0, pixel_mode: g.pixel_mode,

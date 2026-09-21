@@ -59,20 +59,44 @@ pub fn render_text(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u
     let bgr = ft::is_bgr(profile.aa);
 
     for ch in text.chars() {
-        let g = match ft.render(ch, px, profile) {
-            Some(g) => g,
-            None => continue,
-        };
-        if g.rows > 0 && !g.buffer.is_empty() {
-            if lcd && g.pixel_mode == PIXEL_MODE_LCD {
-                blend_lcd(&mut canvas, tables, ink, &g, pen_x, base_y, bgr);
-            } else if !lcd && g.pixel_mode == PIXEL_MODE_GRAY {
-                blend_gray(&mut canvas, tables, ink, &g, pen_x, base_y);
-            }
+        if let Some(g) = ft.render(ch, px, profile) {
+            blit_glyph(&mut canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
+            pen_x += g.advance_px;
         }
-        pen_x += g.advance_px;
     }
     canvas
+}
+
+/// Like [`render_text`] but the input is a run of font glyph indices, as an
+/// `ETO_GLYPH_INDEX` draw supplies.
+pub fn render_glyphs(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u8; 3],
+                     glyphs: &[u16], px: i32, pen: (i32, i32), size: (usize, usize)) -> Canvas {
+    ft.prepare(profile);
+    let mut canvas = Canvas::filled(size.0, size.1, bg);
+    let (mut pen_x, base_y) = pen;
+    let lcd = profile.aa.is_lcd();
+    let bgr = ft::is_bgr(profile.aa);
+
+    for &gi in glyphs {
+        if let Some(g) = ft.render_glyph(gi, px, profile) {
+            blit_glyph(&mut canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
+            pen_x += g.advance_px;
+        }
+    }
+    canvas
+}
+
+/// Blit one rendered glyph onto the canvas at the pen position.
+fn blit_glyph(canvas: &mut Canvas, tables: &Tables, ink: Ink, g: &ft::Glyph,
+              pen_x: i32, base_y: i32, lcd: bool, bgr: bool) {
+    if g.rows == 0 || g.buffer.is_empty() {
+        return;
+    }
+    if lcd && g.pixel_mode == PIXEL_MODE_LCD {
+        blend_lcd(canvas, tables, ink, g, pen_x, base_y, bgr);
+    } else if !lcd && g.pixel_mode == PIXEL_MODE_GRAY {
+        blend_gray(canvas, tables, ink, g, pen_x, base_y);
+    }
 }
 
 fn blend_gray(c: &mut Canvas, t: &Tables, ink: Ink, g: &ft::Glyph, pen_x: i32, base_y: i32) {
