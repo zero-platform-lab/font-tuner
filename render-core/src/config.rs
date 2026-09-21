@@ -79,6 +79,11 @@ impl Profile {
     /// overrides). Unknown/missing keys keep sensible defaults.
     pub fn from_ini(path: &str) -> Option<Profile> {
         let text = std::fs::read_to_string(path).ok()?;
+        Some(Profile::from_ini_str(&text))
+    }
+
+    /// Parse profile settings from the text of a MacType `.ini`.
+    pub fn from_ini_str(text: &str) -> Profile {
         let mut p = Profile::clean_greyscale();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for line in text.lines() {
@@ -103,6 +108,42 @@ impl Profile {
                 _ => {}
             }
         }
-        Some(p)
+        p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_ini_parses_accurate() {
+        let ini = "\
+; Accurate
+[General]
+HintingMode=2
+AntiAliasMode=4
+GammaValue=1.3
+Contrast=1.0
+RenderWeight=1.0
+LcdFilter=2
+[DirectWrite]
+GammaValue=1.4
+Contrast=0.0
+";
+        let p = Profile::from_ini_str(ini);
+        assert_eq!(p.hinting, 2);
+        assert_eq!(p.aa, Aa::LightLcdRgb);
+        assert_eq!(p.lcd_filter, 2);
+        assert!((p.gamma - 1.3).abs() < 1e-6, "first (General) GammaValue wins over DirectWrite");
+        assert!((p.contrast - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn from_ini_greyscale_defaults() {
+        let p = Profile::from_ini_str("AntiAliasMode=0\nHintingMode=0\nGammaValue=1.25\n");
+        assert_eq!(p.aa, Aa::Grey);
+        assert_eq!(p.hinting, 0);
+        assert!((p.gamma - 1.25).abs() < 1e-6);
     }
 }
