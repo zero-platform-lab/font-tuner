@@ -3,7 +3,7 @@ name = "hook-probe"
 version = "0.1.0"
 edition = "2021"
 description = "Stage 2: in-process ExtTextOutW interception, log-only (no injection, no output change)"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "hook-probe"

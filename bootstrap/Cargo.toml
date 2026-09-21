@@ -2,7 +2,7 @@
 name = "render-bootstrap"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 description = "Child-process bootstrap that loads RenderCore64.dll (replacement for the closed-source upstream bootstrap)"
 repository = "https://github.com/zero-platform-Lab/font-tuner"
 

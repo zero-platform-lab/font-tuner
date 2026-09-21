@@ -3,7 +3,7 @@ name = "dwrite-probe"
 version = "0.1.0"
 edition = "2021"
 description = "Stage 5a: intercept DirectWrite IDWriteBitmapRenderTarget::DrawGlyphRun (log-only)"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "dwrite-probe"

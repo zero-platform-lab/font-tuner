@@ -3,7 +3,7 @@ name = "dwrite-analysis-probe"
 version = "0.1.0"
 edition = "2021"
 description = "Intercept IDWriteGlyphRunAnalysis::CreateAlphaTexture (the Chromium/Skia glyph coverage path)"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "dwrite-analysis-probe"

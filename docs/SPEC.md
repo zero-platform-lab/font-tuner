@@ -165,5 +165,5 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
 
 ## 7. Licensing
 
-GPL-3.0-or-later. Bundles the MacType core and a FreeType fork from `vendor/`
+GPL-3.0-only. Bundles a FreeType fork from `vendor/`
 under their respective licenses. Tray icon art is CC0.

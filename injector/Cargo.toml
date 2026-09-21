@@ -3,7 +3,7 @@ name = "injector"
 version = "0.1.0"
 edition = "2021"
 description = "Inject a DLL into a target process (by exe name) via LoadLibraryW"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "injector"

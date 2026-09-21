@@ -3,7 +3,7 @@ name = "d2d-probe"
 version = "0.1.0"
 edition = "2021"
 description = "Intercept ID2D1RenderTarget::DrawGlyphRun (Direct2D path: WPF / native D2D)"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "d2d-probe"

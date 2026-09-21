@@ -6,7 +6,7 @@ Windows のフォント描画チューナ。上流の非公開 (Delphi 製) ト�
 - 64bit プロセスのみ (32bit は対象外)
 - Windows 11 前提
 - UI は日本語 / 英語 (OS の UI 言語で切替)
-- ライセンス: GPL-3.0-or-later。権利関係の詳細は [NOTICE.md](NOTICE.md)
+- ライセンス: GPL-3.0-only。権利関係の詳細は [NOTICE.md](NOTICE.md)
 
 ## 使い方
 

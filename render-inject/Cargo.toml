@@ -3,7 +3,7 @@ name = "render-inject"
 version = "0.1.0"
 edition = "2021"
 description = "Injected DLL that renders text with render-core (SKELETON ONLY — no hooking)"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 
 [lib]
 name = "RenderCore64"

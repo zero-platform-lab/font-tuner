@@ -396,8 +396,15 @@ fn handle_command(hwnd: HWND, cmd: usize) {
             let _ = PostMessageW(Some(HWND_BROADCAST), id, WPARAM(0), LPARAM(0));
         },
         ID_VERSION => infobox(&format!(
-            "Font-tuner {}\nRenderCore64 (Rust) + FreeType\nGPL-3.0-or-later",
-            env!("CARGO_PKG_VERSION")
+            "Font-tuner {}\n\
+             License: GPL-3.0-only\n\
+             Source: {}\n\n\
+             Rendering core: RenderCore64 (Rust port), statically linked with\n\
+             the FreeType library.\n\
+             Portions of this software are copyright \u{00A9} The FreeType\n\
+             Project (www.freetype.org). All rights reserved.",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_REPOSITORY"),
         )),
         ID_SYSFONT_DEFAULT => sysfont::restore(),
         c if (ID_SYSFONT_BASE..ID_SYSFONT_BASE + sysfont::FONTS.len()).contains(&c) => {

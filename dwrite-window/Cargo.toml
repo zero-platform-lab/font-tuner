@@ -3,7 +3,7 @@ name = "dwrite-window"
 version = "0.1.0"
 edition = "2021"
 description = "A Win32 window that draws text via DirectWrite (IDWriteBitmapRenderTarget) — injection target"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "dwrite-window"

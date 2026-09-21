@@ -9,7 +9,7 @@ exclude = ["render-core", "render-inject", "hook-probe", "injector", "text-windo
 name = "font-tuner"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 description = "Font rendering tuner for Windows (tray + RenderCore64 injector)"
 repository = "https://github.com/zero-platform-Lab/font-tuner"
 
