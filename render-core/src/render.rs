@@ -11,6 +11,7 @@ pub struct Canvas {
     pub w: usize,
     pub h: usize,
     pub rgb: Vec<u8>, // w*h*3
+    clip: Option<(i32, i32, i32, i32)>, // (left, top, right, bottom), exclusive r/b
 }
 
 impl Canvas {
@@ -23,11 +24,32 @@ impl Canvas {
         for px in rgb.chunks_exact_mut(3) {
             px.copy_from_slice(&bg);
         }
-        Canvas { w, h, rgb }
+        Canvas { w, h, rgb, clip: None }
+    }
+    /// Restrict subsequent drawing to `rect` (left, top, right, bottom); `None`
+    /// clears the clip.
+    pub fn set_clip(&mut self, rect: Option<(i32, i32, i32, i32)>) {
+        self.clip = rect;
+    }
+    /// Fill a rectangle with a solid colour (for ETO_OPAQUE background).
+    pub fn fill_rect(&mut self, rect: (i32, i32, i32, i32), rgb: [u8; 3]) {
+        let (l, t, r, b) = rect;
+        for y in t.max(0)..b.min(self.h as i32) {
+            for x in l.max(0)..r.min(self.w as i32) {
+                let idx = (y as usize * self.w + x as usize) * 3;
+                self.rgb[idx..idx + 3].copy_from_slice(&rgb);
+            }
+        }
     }
     #[inline]
     fn in_bounds(&self, x: i32, y: i32) -> bool {
-        x >= 0 && (x as usize) < self.w && y >= 0 && (y as usize) < self.h
+        if x < 0 || (x as usize) >= self.w || y < 0 || (y as usize) >= self.h {
+            return false;
+        }
+        match self.clip {
+            Some((l, t, r, b)) => x >= l && x < r && y >= t && y < b,
+            None => true,
+        }
     }
     /// Build a canvas from a 32bpp top-down BGRA buffer (e.g. a DIB section).
     pub fn from_bgra_topdown(w: usize, h: usize, bgra: &[u8]) -> Canvas {
@@ -37,7 +59,7 @@ impl Canvas {
             rgb[i * 3 + 1] = bgra[i * 4 + 1]; // G
             rgb[i * 3 + 2] = bgra[i * 4]; // B
         }
-        Canvas { w, h, rgb }
+        Canvas { w, h, rgb, clip: None }
     }
 
     /// Write this canvas back into a 32bpp top-down BGRA buffer (alpha=255).
@@ -74,7 +96,7 @@ impl Default for Ink {
 pub fn render_text(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u8; 3],
                    text: &str, px: i32, pen: (i32, i32), size: (usize, usize)) -> Canvas {
     let mut canvas = Canvas::filled(size.0, size.1, bg);
-    draw_text_onto(&mut canvas, ft, tables, profile, ink, text, px, pen);
+    draw_text_onto(&mut canvas, ft, tables, profile, ink, text, px, pen, None);
     canvas
 }
 
@@ -83,37 +105,43 @@ pub fn render_text(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u
 pub fn render_glyphs(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u8; 3],
                      glyphs: &[u16], px: i32, pen: (i32, i32), size: (usize, usize)) -> Canvas {
     let mut canvas = Canvas::filled(size.0, size.1, bg);
-    draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, pen);
+    draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, pen, None);
     canvas
 }
 
 /// Composite `text` over the *existing* pixels of `canvas` (transparent draw).
-/// `pen` is the baseline origin.
+/// `pen` is the baseline origin. `dx`, if given, overrides each glyph's advance
+/// (as ExtTextOutW's lpDx does), one entry per character.
 pub fn draw_text_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: &Profile,
-                      ink: Ink, text: &str, px: i32, pen: (i32, i32)) {
+                      ink: Ink, text: &str, px: i32, pen: (i32, i32), dx: Option<&[i32]>) {
     ft.prepare(profile);
     let (mut pen_x, base_y) = pen;
     let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
-    for ch in text.chars() {
+    for (i, ch) in text.chars().enumerate() {
         if let Some(g) = ft.render(ch, px, profile) {
             blit_glyph(canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
-            pen_x += g.advance_px;
+            pen_x += advance_of(dx, i, g.advance_px);
         }
     }
 }
 
 /// Composite a run of glyph indices over the existing pixels of `canvas`.
 pub fn draw_glyphs_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: &Profile,
-                        ink: Ink, glyphs: &[u16], px: i32, pen: (i32, i32)) {
+                        ink: Ink, glyphs: &[u16], px: i32, pen: (i32, i32), dx: Option<&[i32]>) {
     ft.prepare(profile);
     let (mut pen_x, base_y) = pen;
     let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
-    for &gi in glyphs {
+    for (i, &gi) in glyphs.iter().enumerate() {
         if let Some(g) = ft.render_glyph(gi, px, profile) {
             blit_glyph(canvas, tables, ink, &g, pen_x, base_y, lcd, bgr);
-            pen_x += g.advance_px;
+            pen_x += advance_of(dx, i, g.advance_px);
         }
     }
+}
+
+#[inline]
+fn advance_of(dx: Option<&[i32]>, i: usize, default: i32) -> i32 {
+    dx.and_then(|d| d.get(i)).copied().unwrap_or(default)
 }
 
 /// Blit one rendered glyph onto the canvas at the pen position.

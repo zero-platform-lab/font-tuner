@@ -22,10 +22,10 @@ use windows::core::{s, w, PCWSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, ExtTextOutW,
-    GetCurrentObject, GetFontData, GetGlyphIndicesW, GetObjectW, GetTextAlign, GetTextColor,
-    GetTextMetricsW, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER,
-    DIB_RGB_COLORS, ETO_OPTIONS, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
-    FONT_QUALITY, HDC, LOGFONTW, OBJ_FONT, TEXTMETRICW, TRANSPARENT,
+    GetBkColor, GetCurrentObject, GetFontData, GetGlyphIndicesW, GetObjectW, GetTextAlign,
+    GetTextColor, GetTextMetricsW, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
+    BITMAPINFOHEADER, DIB_RGB_COLORS, ETO_OPTIONS, FONT_CHARSET, FONT_CLIP_PRECISION,
+    FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, LOGFONTW, OBJ_FONT, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -104,16 +104,38 @@ unsafe extern "system" fn detour(
     let align = GetTextAlign(hdc).0;
     let base_y = if align & TA_BASELINE == TA_BASELINE { y } else { y + tm.tmAscent };
 
+    // ExtTextOutW options and the optional rectangle (opaque fill / clip).
+    const ETO_OPAQUE: u32 = 0x0002;
+    const ETO_CLIPPED: u32 = 0x0004;
+    const ETO_GLYPH_INDEX: u32 = 0x0010;
+    let rect = if _rect.is_null() {
+        None
+    } else {
+        let r = *(_rect as *const windows::Win32::Foundation::RECT);
+        Some((r.left, r.top, r.right, r.bottom))
+    };
+    let dx: Option<&[i32]> = if _dx.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(_dx, count as usize))
+    };
+
     // Composite over the *existing* DIB content (transparent draw), so text sits
     // on whatever is already there rather than a fresh white fill.
-    const ETO_GLYPH_INDEX: u32 = 0x0010;
     let dib = std::slice::from_raw_parts_mut(DIB, (W * H * 4) as usize);
     let mut canvas = Canvas::from_bgra_topdown(W as usize, H as usize, dib);
+    if let (true, Some(r)) = (_options & ETO_OPAQUE != 0, rect) {
+        let bk = GetBkColor(hdc).0;
+        canvas.fill_rect(r, [(bk & 0xFF) as u8, ((bk >> 8) & 0xFF) as u8, ((bk >> 16) & 0xFF) as u8]);
+    }
+    if let (true, Some(r)) = (_options & ETO_CLIPPED != 0, rect) {
+        canvas.set_clip(Some(r));
+    }
     if _options & ETO_GLYPH_INDEX != 0 {
         let glyphs = std::slice::from_raw_parts(str_ptr, count as usize);
-        draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, (x, base_y));
+        draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, (x, base_y), dx);
     } else {
-        draw_text_onto(&mut canvas, ft, tables, profile, ink, &text, px, (x, base_y));
+        draw_text_onto(&mut canvas, ft, tables, profile, ink, &text, px, (x, base_y), dx);
     }
     canvas.blit_to_bgra_topdown(dib);
 
