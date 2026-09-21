@@ -3,7 +3,7 @@ members = ["bootstrap"]
 # Experimental Rust port of the C++ glyph-rendering core. Kept out of the main
 # workspace: it links the FreeType fork lib produced by build-core.ps1 and is
 # not part of the shipped product. Build it on its own from render-core/.
-exclude = ["render-core"]
+exclude = ["render-core", "render-inject"]
 
 [package]
 name = "font-tuner"
