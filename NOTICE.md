@@ -21,7 +21,7 @@ Font-tuner は GPL-3.0-only で配布する。MSI に同梱するものと、そ
 | もの | 理由 |
 |---|---|
 | 純正 MacType のバイナリ一式 (コア DLL、トレイ、ウィザード、ブートストラップ、更新ツール) | Font-tuner が置き換える対象。コアは Rust 移植 (`RenderCore64.dll`) に置き換え済み |
-| Microsoft Detours / IniParser / MinHook | C++ コアを同梱しなくなったので不要。フックは純 Rust の retour + iced-x86 |
+| Microsoft Detours / IniParser / MinHook | C++ コアを同梱しなくなったので不要 (サブモジュールからも外した)。フックは純 Rust の retour + iced-x86 |
 | `easyhk64.dll` (EasyHook) / `wow64ext` | 使わない (32bit 非対応) |
 
 ## 系譜

@@ -45,7 +45,7 @@ Windows のフォント描画チューナ。上流の非公開 (Delphi 製) ト�
 ```powershell
 git clone --recurse-submodules https://github.com/zero-platform-Lab/font-tuner
 cd font-tuner
-.\build-msi.ps1     # build-core.ps1 (Detours, IniParser, FreeType, Core DLL) → cargo → wix
+.\build-msi.ps1     # build-core.ps1 (FreeType の静的ライブラリ) → cargo → wix
 ```
 
 `build-core.ps1` は上流のプロジェクトファイルを書き換えず、`build/mactype.props` で include / lib パスを注入する。
