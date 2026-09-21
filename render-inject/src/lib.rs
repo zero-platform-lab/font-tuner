@@ -14,23 +14,16 @@
 
 use core::ffi::c_void;
 use std::io::Write;
-use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering, AtomicU32};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
-use std::collections::HashMap;
 
-use render_core::render::{draw_glyphs_onto, draw_text_onto, glyph_run_coverage_lcd, Canvas, Ink};
-use render_core::{tables_for, Aa, Ft, Profile, Tables};
-use windows::core::{PCWSTR, s, w, Interface, BOOL, GUID, HRESULT};
+use render_core::render::{draw_glyphs_onto, draw_text_onto, Canvas, Ink};
+use render_core::{tables_for, Ft};
+use windows::core::{PCWSTR, s, w, BOOL};
 use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HMODULE, RECT};
-use windows::Win32::Graphics::Direct2D::{ID2D1Brush, ID2D1GdiInteropRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_DC_INITIALIZE_MODE_COPY};
-use windows_numerics::Vector2;
-use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFontFile, DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN, DWRITE_MATRIX,
-};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HMODULE, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetBkColor, GetCurrentObject,
     GetFontData, GetObjectW, GetTextAlign, GetTextColor, GetTextExtentPoint32W, GetTextExtentPointI,
@@ -41,15 +34,20 @@ use windows::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW, GetProcAddress,
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
 };
-use windows::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS};
 use windows::Win32::System::Threading::{
-    CreateMutexW, CreateThread, GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread,
-    SuspendThread, THREAD_CREATION_FLAGS, THREAD_SUSPEND_RESUME,
+    CreateMutexW, CreateThread, GetCurrentProcessId, THREAD_CREATION_FLAGS,
 };
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-};
-use retour::RawDetour;
+
+mod dwrite;
+mod d2d;
+mod hook;
+mod state;
+mod profile;
+use dwrite::setup_dwrite_hook;
+use state::{orig, RenderState, CAPTURED, RENDER};
+use d2d::setup_d2d_hook;
+use hook::install_hook;
+use profile::{load_profile, reload_profile, RELOAD_MSG, RELOAD_MSG_NAME, SELF_HINST};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
@@ -63,31 +61,6 @@ type FnEto = unsafe extern "system" fn(
 /// cannot overwrite it with a pointer to our own jump.
 static ORIG: OnceLock<FnEto> = OnceLock::new();
 
-/// Everything a draw needs, behind one lock.
-///
-/// FreeType, the blend tables, the profile and the "last font" cache used to be
-/// four separate `static mut`s that every call site promised to touch only while
-/// holding RENDER_LOCK. Nothing enforced that promise, and a reload swapping
-/// tables and profile separately could be observed half-applied. Keeping them in
-/// one struct behind one mutex makes the promise unbypassable: there is no way to
-/// reach the face or the profile without the guard.
-struct RenderState {
-    ft: Ft,
-    tables: Tables,
-    profile: Profile,
-    /// Identity of the face currently loaded into `ft`, so a draw only
-    /// re-extracts and re-faces when the font actually changes.
-    font_key: Option<String>,
-}
-
-// SAFETY: `Ft` owns raw FreeType handles, which are not thread-safe on their
-// own. The only access is through RENDER's mutex, so at most one thread ever
-// touches the library or the face at a time — the condition FreeType requires.
-unsafe impl Send for RenderState {}
-
-/// `None` until `on_attach` initialises FreeType; a draw that arrives first
-/// simply falls back to the OS rasteriser.
-static RENDER: Mutex<Option<RenderState>> = Mutex::new(None);
 thread_local! {
     // Per-thread re-entrancy guard for the GDI detour. Must be thread-local, not
     // a process-global flag: a global one makes every *other* thread's
@@ -96,46 +69,9 @@ thread_local! {
     // thread re-entering (our own GDI calls / nested draws).
     static IN_DETOUR: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
-/// Serialises the one-time vtable patches (CreateAlphaTexture, D2D factory
-/// render-target creation). Without it two threads racing the first call both
-/// pass the `is_null()`/`is_none()` check and both patch the slot; the loser
-/// then captures the "original" from a slot already holding our detour, so the
-/// detour calls itself — infinite recursion, host crash. (The D2D DrawGlyphRun
-/// path already guards with D2D_DGR_ORIG's mutex; these paths did not.)
-static VTABLE_PATCH_LOCK: Mutex<()> = Mutex::new(());
-/// Registered window message the tray broadcasts for "reload profile"
-/// (0 until on_attach registers it). Handled in GetMsgProc on the receiving
-/// process's own UI thread: no extra thread, no polling.
-static RELOAD_MSG: AtomicU32 = AtomicU32::new(0);
-const RELOAD_MSG_NAME: PCWSTR = w!("FontTuner.ReloadProfile");
-static CAPTURED: AtomicBool = AtomicBool::new(false);
 
-type FnDrawGlyphRun = unsafe extern "system" fn(
-    *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
-) -> HRESULT;
-static ORIG_DGR: OnceLock<FnDrawGlyphRun> = OnceLock::new();
 
-// DirectWrite glyph-run *analysis* path (Chromium/Skia / VS Code): capture the
-// run at CreateGlyphRunAnalysis, substitute coverage at CreateAlphaTexture.
-type FnCreateGlyphRunAnalysis = unsafe extern "system" fn(
-    *mut c_void, *const DWRITE_GLYPH_RUN, f32, *const DWRITE_MATRIX, i32, i32, f32, f32, *mut *mut c_void,
-) -> HRESULT;
-type FnCreateAlphaTexture = unsafe extern "system" fn(
-    *mut c_void, i32, *const RECT, *mut u8, u32,
-) -> HRESULT;
-static ORIG_CGRA: OnceLock<FnCreateGlyphRunAnalysis> = OnceLock::new();
-/// Also the "CreateAlphaTexture is patched" flag: it is published before the
-/// vtable write, and the detour can only run once that write has happened.
-static ORIG_CAT: OnceLock<FnCreateAlphaTexture> = OnceLock::new();
-static ANALYSES: Mutex<Option<HashMap<usize, RunInfo>>> = Mutex::new(None);
 
-struct RunInfo {
-    bytes: Vec<u8>,
-    index: u32,
-    glyphs: Vec<u16>,
-    px: i32,
-    baseline: (i32, i32),
-}
 
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 fn log(msg: &str) {
@@ -148,84 +84,12 @@ fn log(msg: &str) {
     }
 }
 
-/// A detour's trampoline back to the real function.
-///
-/// Every `ORIG_*` is published before the corresponding patch goes live, so a
-/// detour that is running always finds it. If it somehow did not, the process
-/// has already jumped into our code with no way back, and this aborts rather
-/// than calling a null pointer.
-#[inline]
-fn orig<F: Copy>(cell: &OnceLock<F>) -> F {
-    *cell.get().expect("detour ran before its trampoline was published")
-}
 
-/// This DLL's module handle, stored as an address because `HINSTANCE` is not
-/// `Sync`. Set in DllMain before any other thread of ours starts.
-static SELF_HINST: OnceLock<usize> = OnceLock::new();
 
-/// Directory this DLL was loaded from (the install dir: font-tuner.ini + ini\).
-unsafe fn self_dir() -> Option<PathBuf> {
-    let hinst = HINSTANCE(*SELF_HINST.get()? as *mut c_void);
-    let mut buf = [0u16; 260];
-    let n = GetModuleFileNameW(Some(hinst.into()), &mut buf);
-    if n == 0 { return None; }
-    PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])).parent().map(|p| p.to_path_buf())
-}
 
-/// The `AlternativeFile=` value from a font-tuner.ini's text, as written by the
-/// tray. Pure so it can be tested without a filesystem or a Win32 process.
-///
-/// Deliberately lenient in the same way `GetPrivateProfileString` is: the key
-/// match ignores case and surrounding blanks, `;`/`#` comment lines are skipped,
-/// and a value containing `=` (a path can) is kept whole. An empty value means
-/// "not set", so the caller falls back to the built-in profile.
-fn parse_alternative_file(text: &str) -> Option<&str> {
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with(';') || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else { continue };
-        if !key.trim().eq_ignore_ascii_case("AlternativeFile") {
-            continue;
-        }
-        let value = value.trim();
-        return (!value.is_empty()).then_some(value);
-    }
-    None
-}
 
-/// The profile the tray selected: `[General] AlternativeFile=ini\<name>.ini`
-/// in the install dir's font-tuner.ini, resolved relative to that dir. Read at
-/// attach, and again when the tray broadcasts "reload profile".
-unsafe fn profile_path() -> Option<String> {
-    let dir = self_dir()?;
-    let text = std::fs::read_to_string(dir.join("font-tuner.ini")).ok()?;
-    let rel = parse_alternative_file(&text)?;
-    Some(dir.join(rel).to_string_lossy().into_owned())
-}
 
-/// The active profile (path it came from, or None for the built-in default).
-unsafe fn load_profile() -> (Option<String>, Profile) {
-    let path = profile_path();
-    let p = path.as_deref().and_then(Profile::from_ini).unwrap_or_else(Profile::clean_greyscale);
-    (path, p)
-}
 
-/// Re-read font-tuner.ini and swap the profile + tables in, under RENDER_LOCK
-/// so no draw observes a half-updated pair. Called on this process's UI
-/// thread from GetMsgProc when the tray broadcasts RELOAD_MSG. If the ini is
-/// unreadable the built-in default applies, same as at attach.
-unsafe fn reload_profile() {
-    let (path, p) = load_profile();
-    if let Ok(mut guard) = RENDER.lock() {
-        if let Some(st) = guard.as_mut() {
-            st.tables = tables_for(&p);
-            st.profile = p;
-        }
-    }
-    log(&format!("reloaded profile {}", path.as_deref().unwrap_or("(default)")));
-}
 
 /// Resolve the DC's font into render-core (returns the pixel size), or None.
 /// Re-extracts + re-faces only when the font differs from `cache`.
@@ -393,444 +257,6 @@ unsafe fn render_into_dc(hdc_i: isize, x: i32, y: i32, options: u32,
     Some(1) // handled; skip GDI
 }
 
-// ---- DirectWrite (IDWriteBitmapRenderTarget::DrawGlyphRun) ----
-
-/// Extract the font-file bytes + face index for a run's font face.
-unsafe fn dwrite_font_bytes(run: &DWRITE_GLYPH_RUN) -> Option<(Vec<u8>, u32)> {
-    let face = run.fontFace.deref().as_ref()?;
-    let mut n = 0u32;
-    face.GetFiles(&mut n, None).ok()?;
-    let mut files: Vec<Option<IDWriteFontFile>> = vec![None; n as usize];
-    face.GetFiles(&mut n, Some(files.as_mut_ptr())).ok()?;
-    let file = files.into_iter().next()??;
-    let mut key: *mut c_void = std::ptr::null_mut();
-    let mut keysz = 0u32;
-    file.GetReferenceKey(&mut key, &mut keysz).ok()?;
-    let loader = file.GetLoader().ok()?;
-    let stream = loader.CreateStreamFromKey(key as *const c_void, keysz).ok()?;
-    let size = stream.GetFileSize().ok()?;
-    let mut frag: *mut c_void = std::ptr::null_mut();
-    let mut ctx: *mut c_void = std::ptr::null_mut();
-    stream.ReadFileFragment(&mut frag, 0, size, &mut ctx).ok()?;
-    let bytes = std::slice::from_raw_parts(frag as *const u8, size as usize).to_vec();
-    stream.ReleaseFileFragment(ctx);
-    Some((bytes, face.GetIndex()))
-}
-
-unsafe extern "system" fn dgr_detour(
-    this: *mut c_void, bx: f32, by: f32, mm: i32,
-    run: *const DWRITE_GLYPH_RUN, rp: *mut c_void, color: u32, bbox: *mut RECT,
-) -> HRESULT {
-    if !run.is_null() && dgr_render(this, &*run, bx, by, color).is_some() {
-        return HRESULT(0); // S_OK
-    }
-    (orig(&ORIG_DGR))(this, bx, by, mm, run, rp, color, bbox)
-}
-
-unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, color: u32) -> Option<()> {
-    let mut guard = RENDER.lock().ok()?; // serialises every draw
-    let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
-    let brt = IDWriteBitmapRenderTarget::from_raw_borrowed(&this)?;
-    let hdc = brt.GetMemoryDC();
-    let size = brt.GetSize().ok()?;
-    let (w, h) = (size.cx, size.cy);
-    if w <= 0 || h <= 0 { return None; }
-
-    // key on the font-face identity; only re-extract on a miss.
-    let face = r.fontFace.deref().as_ref()?;
-    let key = format!("dw:{:x}:{}", face.as_raw() as usize, face.GetIndex());
-    if font_key.as_deref() != Some(key.as_str()) {
-        let (bytes, index) = dwrite_font_bytes(r)?;
-        ft.reface_memory_index(&bytes, index as i64).ok()?;
-        *font_key = Some(key);
-    }
-    let px = r.fontEmSize.round() as i32;
-    let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
-    let ink = Ink { fg: [(color & 0xFF) as u8, ((color >> 8) & 0xFF) as u8, ((color >> 16) & 0xFF) as u8] };
-
-    let memdc = CreateCompatibleDC(Some(hdc));
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: 0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits: *mut c_void = std::ptr::null_mut();
-    let hbmp = CreateDIBSection(Some(memdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
-    let old = SelectObject(memdc, hbmp.into());
-    let _ = BitBlt(memdc, 0, 0, w, h, Some(hdc), 0, 0, SRCCOPY);
-    let dib = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
-    let mut canvas = Canvas::from_bgra_topdown(w as usize, h as usize, dib);
-    draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px,
-                     (bx.round() as i32, by.round() as i32), None);
-    canvas.blit_to_bgra_topdown(dib);
-    if !CAPTURED.swap(true, Ordering::SeqCst) {
-        if let Some(tmp) = std::env::var_os("TEMP") {
-            let p = PathBuf::from(tmp).join("render-inject-dwrite.png");
-            let _ = canvas.save(&p.to_string_lossy());
-            log(&format!("captured DirectWrite render to {}", p.display()));
-        }
-    }
-    let _ = BitBlt(hdc, 0, 0, w, h, Some(memdc), 0, 0, SRCCOPY);
-    SelectObject(memdc, old);
-    let _ = DeleteObject(hbmp.into());
-    let _ = DeleteDC(memdc);
-    Some(())
-}
-
-/// Patch DrawGlyphRun in the shared IDWriteBitmapRenderTarget vtable (slot 3),
-/// so every render target in this process routes through us.
-unsafe fn setup_dwrite_hook() {
-    let Ok(factory) = DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) else {
-        log("dwrite factory failed"); return;
-    };
-    let Ok(gdi) = factory.GetGdiInterop() else { return };
-    let Ok(brt) = gdi.CreateBitmapRenderTarget(None, 8, 8) else { return };
-    let obj = brt.as_raw() as *mut *mut usize;
-    let vtbl = *obj;
-    let slot = vtbl.add(3);
-    let mut oldp = PAGE_PROTECTION_FLAGS(0);
-    if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() {
-        return;
-    }
-    let _ = ORIG_DGR.set(std::mem::transmute::<usize, FnDrawGlyphRun>(*slot));
-    *slot = dgr_detour as usize;
-    let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
-    log("hook installed on DrawGlyphRun");
-
-    // Patch IDWriteFactory::CreateGlyphRunAnalysis (vtbl slot 23) for the
-    // analysis/coverage path (Chromium/Skia). The vtable is shared, so this
-    // covers the app's own factory too.
-    let fslot = (*(factory.as_raw() as *mut *mut usize)).add(23);
-    let mut fp = PAGE_PROTECTION_FLAGS(0);
-    if VirtualProtect(fslot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut fp).is_ok() {
-        let _ = ORIG_CGRA.set(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis>(*fslot));
-        *fslot = cgra_detour as usize;
-        let _ = VirtualProtect(fslot as *const c_void, 8, fp, &mut fp);
-        log("hook installed on CreateGlyphRunAnalysis");
-    }
-}
-
-// CreateGlyphRunAnalysis: create the analysis, capture its run, patch its
-// CreateAlphaTexture slot the first time.
-unsafe extern "system" fn cgra_detour(
-    this: *mut c_void, run: *const DWRITE_GLYPH_RUN, ppd: f32, transform: *const DWRITE_MATRIX,
-    rmode: i32, mmode: i32, bx: f32, by: f32, out: *mut *mut c_void,
-) -> HRESULT {
-    let hr = (orig(&ORIG_CGRA))(this, run, ppd, transform, rmode, mmode, bx, by, out);
-    if hr.is_ok() && !out.is_null() && !(*out).is_null() && !run.is_null() {
-        let r = &*run;
-        if let Some((bytes, index)) = dwrite_font_bytes(r) {
-            let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize).to_vec();
-            let info = RunInfo { bytes, index, glyphs, px: r.fontEmSize.round() as i32,
-                                 baseline: (bx.round() as i32, by.round() as i32) };
-            if let Ok(mut m) = ANALYSES.lock() {
-                let map = m.get_or_insert_with(HashMap::new);
-                // Bound the map: analysis objects that are never followed by a
-                // CreateAlphaTexture (so never evicted below) would otherwise
-                // leak an entry each. If it grows past the cap, drop everything;
-                // in-flight analyses then fall back to untuned rendering — a
-                // one-off visual blip, never a crash or unbounded growth.
-                if map.len() >= 4096 { map.clear(); }
-                map.insert(*out as usize, info);
-            }
-            patch_cat_vtable(*out);
-        }
-    }
-    hr
-}
-
-unsafe fn patch_cat_vtable(analysis: *mut c_void) {
-    if ORIG_CAT.get().is_some() { return; } // fast path, no lock once patched
-    let _guard = VTABLE_PATCH_LOCK.lock();
-    if ORIG_CAT.get().is_some() { return; } // re-check under the lock
-    let vtbl = *(analysis as *mut *mut usize);
-    let slot = vtbl.add(4);
-    let mut oldp = PAGE_PROTECTION_FLAGS(0);
-    if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() { return; }
-    // Publish the trampoline before the vtable write: cat_detour reads ORIG_CAT,
-    // and it can only run once the slot below points at it.
-    let _ = ORIG_CAT.set(std::mem::transmute::<usize, FnCreateAlphaTexture>(*slot));
-    *slot = cat_detour as usize;
-    let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
-    log("hook installed on CreateAlphaTexture");
-}
-
-unsafe extern "system" fn cat_detour(
-    this: *mut c_void, tex_type: i32, bounds: *const RECT, alpha: *mut u8, size: u32,
-) -> HRESULT {
-    if tex_type == 1 && !bounds.is_null() && !alpha.is_null() && cat_fill(this, &*bounds, alpha, size).is_some() {
-        // The analysis has produced its texture; drop its captured run so the
-        // map does not grow for the life of the process.
-        if let Ok(mut m) = ANALYSES.lock() {
-            if let Some(map) = m.as_mut() { map.remove(&(this as usize)); }
-        }
-        return HRESULT(0);
-    }
-    (orig(&ORIG_CAT))(this, tex_type, bounds, alpha, size)
-}
-
-unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Option<()> {
-    let (w, h) = ((b.right - b.left) as usize, (b.bottom - b.top) as usize);
-    if w == 0 || h == 0 || w * h * 3 != size as usize { return None; }
-    let mut guard = RENDER.lock().ok()?;
-    let RenderState { ft, profile, font_key, .. } = guard.as_mut()?;
-    let m = ANALYSES.lock().ok()?;
-    let info = m.as_ref()?.get(&(this as usize))?;
-    // Key on the font identity (face index + file length), not the analysis
-    // object address: addresses are recycled, so keying on `this` would reuse a
-    // stale face when a freed analysis's pointer is handed to a different font.
-    let key = format!("dwa:{}:{}", info.index, info.bytes.len());
-    if font_key.as_deref() != Some(key.as_str()) {
-        ft.reface_memory_index(&info.bytes, info.index as i64).ok()?;
-        *font_key = Some(key);
-    }
-    // force LCD subpixel for the CLEARTYPE_3x1 texture, keep the profile's hinting
-    let lcd = Profile { aa: Aa::LcdRgb, ..*profile };
-    let pen = (info.baseline.0 - b.left, info.baseline.1 - b.top);
-    let cov = glyph_run_coverage_lcd(ft, &lcd, &info.glyphs, info.px, pen, w, h);
-    if !CAPTURED.swap(true, Ordering::SeqCst) {
-        if let Some(tmp) = std::env::var_os("TEMP") {
-            let inv: Vec<u8> = cov.iter().map(|&v| 255 - v).collect();
-            let _ = inv;
-            let p = PathBuf::from(tmp).join("render-inject-analysis.txt");
-            let _ = std::fs::write(p, format!("analysis substituted: {w}x{h}, glyphs={}", info.glyphs.len()));
-            log("substituted CreateAlphaTexture via render-core");
-        }
-    }
-    std::ptr::copy_nonoverlapping(cov.as_ptr(), alpha, size as usize);
-    Some(())
-}
-
-// ---- Direct2D (ID2D1RenderTarget::DrawGlyphRun) ----
-type FnD2DCreateFactory = unsafe extern "system" fn(i32, *const GUID, *const c_void, *mut *mut c_void) -> HRESULT;
-type FnCreateDCRT = unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
-type FnCreateHwndRT = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
-type FnD2DDrawGlyphRun = unsafe extern "system" fn(*mut c_void, Vector2, *const DWRITE_GLYPH_RUN, *mut c_void, i32);
-static ORIG_D2DCF: OnceLock<FnD2DCreateFactory> = OnceLock::new();
-static ORIG_DCRT: OnceLock<FnCreateDCRT> = OnceLock::new();
-static ORIG_HWNDRT: OnceLock<FnCreateHwndRT> = OnceLock::new();
-static D2D_DGR_ORIG: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None); // rt vtable -> orig DrawGlyphRun
-static D2D_CAPTURED: AtomicBool = AtomicBool::new(false); // log the first D2D substitution once
-
-unsafe fn patch_slot(slot: *mut usize, newv: usize) -> Option<usize> {
-    let mut oldp = PAGE_PROTECTION_FLAGS(0);
-    if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() { return None; }
-    let old = *slot;
-    *slot = newv;
-    let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
-    Some(old)
-}
-
-unsafe extern "system" fn d2dcf_detour(ftype: i32, riid: *const GUID, opts: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    let hr = (orig(&ORIG_D2DCF))(ftype, riid, opts, out);
-    if hr.is_ok() && !out.is_null() && !(*out).is_null() {
-        let vtbl = *(*out as *mut *mut usize);
-        // ID2D1Factory: CreateHwndRenderTarget = slot 14, CreateDCRenderTarget = slot 16.
-        // Serialise the one-time patch: two threads creating factories at once
-        // must not both capture the "original" (see VTABLE_PATCH_LOCK).
-        let _guard = VTABLE_PATCH_LOCK.lock();
-        if ORIG_HWNDRT.get().is_none() {
-            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { let _ = ORIG_HWNDRT.set(std::mem::transmute(o)); }
-        }
-        if ORIG_DCRT.get().is_none() {
-            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { let _ = ORIG_DCRT.set(std::mem::transmute(o)); }
-        }
-        log("hook installed on D2D1Factory render-target creation");
-    }
-    hr
-}
-
-unsafe extern "system" fn create_dc_detour(this: *mut c_void, props: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    let hr = (orig(&ORIG_DCRT))(this, props, out);
-    if hr.is_ok() && !out.is_null() && !(*out).is_null() { patch_rt_dgr(*out); }
-    hr
-}
-unsafe extern "system" fn create_hwnd_detour(this: *mut c_void, p1: *const c_void, p2: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    let hr = (orig(&ORIG_HWNDRT))(this, p1, p2, out);
-    if hr.is_ok() && !out.is_null() && !(*out).is_null() { patch_rt_dgr(*out); }
-    hr
-}
-
-unsafe fn patch_rt_dgr(rt: *mut c_void) {
-    let vtbl = *(rt as *mut *mut usize);
-    let vptr = vtbl as usize;
-    let Ok(mut m) = D2D_DGR_ORIG.lock() else { return };
-    let map = m.get_or_insert_with(HashMap::new);
-    if map.contains_key(&vptr) { return; }
-    if let Some(old) = patch_slot(vtbl.add(29), d2d_dgr_detour as usize) {
-        map.insert(vptr, old);
-        log("hook installed on D2D DrawGlyphRun");
-    }
-}
-
-unsafe extern "system" fn d2d_dgr_detour(this: *mut c_void, baseline: Vector2, run: *const DWRITE_GLYPH_RUN, brush: *mut c_void, measuring: i32) {
-    if !run.is_null() && d2d_substitute(this, baseline, &*run, brush).is_some() {
-        return;
-    }
-    let vptr = *(this as *const usize); // this's vtable pointer
-    let orig = D2D_DGR_ORIG.lock().ok().and_then(|m| m.as_ref().and_then(|map| map.get(&vptr).copied()));
-    if let Some(o) = orig {
-        let f: FnD2DDrawGlyphRun = std::mem::transmute(o);
-        f(this, baseline, run, brush, measuring);
-    }
-}
-
-/// Read the run's ink color from the D2D brush. D2D DrawGlyphRun paints with
-/// the given brush, so mirroring the GDI/DWrite paths means honoring it — a
-/// solid-color brush yields its RGB; anything else falls back to black. Colors
-/// are premultiplied-free sRGB floats in 0..1.
-unsafe fn d2d_brush_ink(brush: *mut c_void) -> Ink {
-    if brush.is_null() { return Ink::default(); }
-    let Some(b) = ID2D1Brush::from_raw_borrowed(&brush) else { return Ink::default() };
-    let Ok(scb) = b.cast::<ID2D1SolidColorBrush>() else { return Ink::default() };
-    let c = scb.GetColor();
-    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    Ink { fg: [to8(c.r), to8(c.g), to8(c.b)] }
-}
-
-unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_RUN, brush: *mut c_void) -> Option<()> {
-    let mut guard = RENDER.lock().ok()?;
-    let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
-    let (bytes, index) = dwrite_font_bytes(r)?;
-    let key = format!("d2d:{index}:{}", bytes.len());
-    if font_key.as_deref() != Some(key.as_str()) {
-        ft.reface_memory_index(&bytes, index as i64).ok()?;
-        *font_key = Some(key);
-    }
-    let px = r.fontEmSize.round() as i32;
-    let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
-    let adv: f32 = if r.glyphAdvances.is_null() { 0.0 }
-        else { std::slice::from_raw_parts(r.glyphAdvances, r.glyphCount as usize).iter().sum() };
-
-    let rt = ID2D1RenderTarget::from_raw_borrowed(&this)?;
-    let gi: ID2D1GdiInteropRenderTarget = rt.cast().ok()?;
-    let hdc = gi.GetDC(D2D1_DC_INITIALIZE_MODE_COPY).ok()?;
-
-    // region around the text baseline
-    let bx = baseline.X.round() as i32;
-    let by = baseline.Y.round() as i32;
-    let rw = (adv.ceil() as i32 + px).clamp(1, 8192);
-    let rh = (px * 2).clamp(1, 8192);
-    let rx = bx;
-    let ry = by - px - px / 4;
-
-    let memdc = CreateCompatibleDC(Some(hdc));
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: rw, biHeight: -rh, biPlanes: 1, biBitCount: 32, biCompression: 0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits: *mut c_void = std::ptr::null_mut();
-    let hbmp = CreateDIBSection(Some(memdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
-    let old = SelectObject(memdc, hbmp.into());
-    let _ = BitBlt(memdc, 0, 0, rw, rh, Some(hdc), rx, ry, SRCCOPY);
-    let dib = std::slice::from_raw_parts_mut(bits as *mut u8, (rw * rh * 4) as usize);
-    let mut canvas = Canvas::from_bgra_topdown(rw as usize, rh as usize, dib);
-    let ink = d2d_brush_ink(brush);
-    draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, (bx - rx, by - ry), None);
-    canvas.blit_to_bgra_topdown(dib);
-    let _ = BitBlt(hdc, rx, ry, rw, rh, Some(memdc), 0, 0, SRCCOPY);
-    SelectObject(memdc, old);
-    let _ = DeleteObject(hbmp.into());
-    let _ = DeleteDC(memdc);
-    let _ = gi.ReleaseDC(None);
-    if !D2D_CAPTURED.swap(true, Ordering::SeqCst) {
-        log(&format!("substituted D2D DrawGlyphRun via render-core ({} glyphs, {px}px)", glyphs.len()));
-    }
-    Some(())
-}
-
-/// Installed inline detours, kept alive for the life of the process (the DLL
-/// pins itself, so they are never disabled). retour patches the target's first
-/// bytes non-atomically and does NOT stop other threads while doing so, so a
-/// thread executing inside those bytes at that instant would fault. We suspend
-/// every other thread in this process around the patch — the same window
-/// MinHook closes internally — then leak the detour so it stays enabled.
-static DETOURS: Mutex<Vec<RawDetour>> = Mutex::new(Vec::new());
-
-/// Suspend all threads in this process except the caller, for the duration of
-/// the returned guard. Resumed (in reverse) on drop. Best-effort: threads that
-/// cannot be opened/suspended are skipped.
-struct FrozenThreads(Vec<isize>);
-impl FrozenThreads {
-    unsafe fn all_but_current() -> FrozenThreads {
-        let pid = GetCurrentProcessId();
-        let me = GetCurrentThreadId();
-        let mut handles = Vec::new();
-        if let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
-            let mut e = THREADENTRY32 { dwSize: core::mem::size_of::<THREADENTRY32>() as u32, ..Default::default() };
-            if Thread32First(snap, &mut e).is_ok() {
-                loop {
-                    if e.th32OwnerProcessID == pid && e.th32ThreadID != me {
-                        if let Ok(h) = OpenThread(THREAD_SUSPEND_RESUME, false, e.th32ThreadID) {
-                            // SuspendThread returns (DWORD)-1 on failure.
-                            if SuspendThread(h) != u32::MAX {
-                                handles.push(h.0 as isize);
-                            } else {
-                                let _ = CloseHandle(h);
-                            }
-                        }
-                    }
-                    if Thread32Next(snap, &mut e).is_err() { break; }
-                }
-            }
-            let _ = CloseHandle(snap);
-        }
-        FrozenThreads(handles)
-    }
-}
-impl Drop for FrozenThreads {
-    fn drop(&mut self) {
-        for &h in self.0.iter().rev() {
-            unsafe {
-                let hh = HANDLE(h as *mut c_void);
-                ResumeThread(hh);
-                let _ = CloseHandle(hh);
-            }
-        }
-    }
-}
-
-/// Create + enable an inline detour on `target`, with other threads frozen
-/// around the byte patch. Returns the trampoline (original) on success.
-unsafe fn install_hook(target: *const (), detour: *const ()) -> Option<*const ()> {
-    let d = match RawDetour::new(target, detour) {
-        Ok(d) => d,
-        Err(e) => { log(&format!("detour new failed: {e:?}")); return None; }
-    };
-    let tramp = d.trampoline() as *const () as *const ();
-    let ok = {
-        let _frozen = FrozenThreads::all_but_current();
-        d.enable().is_ok()
-    };
-    if !ok { log("detour enable failed"); return None; }
-    if let Ok(mut v) = DETOURS.lock() { v.push(d); }
-    Some(tramp)
-}
-
-/// Hook d2d1!D2D1CreateFactory so we can patch render-target DrawGlyphRun.
-unsafe fn setup_d2d_hook() {
-    let d2d1 = match GetModuleHandleW(w!("d2d1.dll")) {
-        Ok(h) if !h.is_invalid() => h,
-        _ => match windows::Win32::System::LibraryLoader::LoadLibraryW(w!("d2d1.dll")) {
-            Ok(h) => h.into(),
-            Err(_) => { log("d2d1.dll not available"); return; }
-        },
-    };
-    let Some(target) = GetProcAddress(d2d1, s!("D2D1CreateFactory")) else { return };
-    if let Some(tramp) = install_hook(target as *const (), d2dcf_detour as *const ()) {
-        let _ = ORIG_D2DCF.set(std::mem::transmute::<*const (), FnD2DCreateFactory>(tramp));
-        log("hook installed on D2D1CreateFactory");
-    } else {
-        log("D2D1CreateFactory hook failed");
-    }
-}
 
 /// Runs off the loader lock: init render-core and install the hook.
 unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
@@ -934,49 +360,5 @@ pub extern "system" fn GetMsgProc(
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // "Small" tests: pure, no filesystem, no threads, deterministic.
-
-    #[test]
-    fn alternative_file_reads_the_tray_written_key() {
-        let ini = "[General]\r\nAlternativeFile=ini\\Clean Greyscale.ini\r\n\r\n[Font-tuner]\r\nAutoRun=1\r\n";
-        assert_eq!(parse_alternative_file(ini), Some("ini\\Clean Greyscale.ini"));
-    }
-
-    #[test]
-    fn alternative_file_ignores_case_blanks_and_comments() {
-        let ini = "; AlternativeFile=ini\\commented-out.ini\n\
-                   # AlternativeFile=ini\\also-not-this.ini\n\
-                   \x20 alternativefile  =   ini\\Accurate.ini   \n";
-        assert_eq!(parse_alternative_file(ini), Some("ini\\Accurate.ini"));
-    }
-
-    #[test]
-    fn alternative_file_keeps_a_value_containing_equals() {
-        // A path may contain '=', so only the first '=' separates key from value.
-        let ini = "AlternativeFile=ini\\odd=name.ini\n";
-        assert_eq!(parse_alternative_file(ini), Some("ini\\odd=name.ini"));
-    }
-
-    #[test]
-    fn alternative_file_absent_or_empty_means_use_the_default() {
-        assert_eq!(parse_alternative_file(""), None);
-        assert_eq!(parse_alternative_file("[General]\nRedrawDelay=5000\n"), None);
-        assert_eq!(parse_alternative_file("AlternativeFile=\n"), None);
-        assert_eq!(parse_alternative_file("AlternativeFile=   \n"), None);
-    }
-
-    #[test]
-    fn alternative_file_takes_the_first_of_duplicates() {
-        // GetPrivateProfileString returns the first; match that so a stray
-        // second key cannot silently change the profile.
-        let ini = "AlternativeFile=ini\\first.ini\nAlternativeFile=ini\\second.ini\n";
-        assert_eq!(parse_alternative_file(ini), Some("ini\\first.ini"));
     }
 }
