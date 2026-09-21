@@ -21,8 +21,7 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory3, IDWriteFontFile, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN,
     DWRITE_GRID_FIT_MODE, DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_GRID_FIT_MODE_DISABLED, DWRITE_GRID_FIT_MODE_ENABLED,
     DWRITE_MATRIX, DWRITE_PIXEL_GEOMETRY, DWRITE_PIXEL_GEOMETRY_BGR, DWRITE_PIXEL_GEOMETRY_FLAT,
-    DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE, DWRITE_RENDERING_MODE1, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
-    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+    DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE, DWRITE_RENDERING_MODE1,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
@@ -73,13 +72,10 @@ unsafe fn build_dw_rendering(p: &Profile) -> Option<DwRendering> {
         _ => (DWRITE_PIXEL_GEOMETRY_FLAT, 2), // D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
     };
     let grid_fit = match p.hinting { 0 => DWRITE_GRID_FIT_MODE_DEFAULT, 1 => DWRITE_GRID_FIT_MODE_DISABLED, _ => DWRITE_GRID_FIT_MODE_ENABLED };
-    // RenderingMode 6 is not a DWRITE_RENDERING_MODE; upstream maps it to
-    // natural symmetric.
-    let (mode, mode1) = if p.dw.rendering_mode == 6 {
-        (DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC)
-    } else {
-        (DWRITE_RENDERING_MODE(p.dw.rendering_mode), DWRITE_RENDERING_MODE1(p.dw.rendering_mode))
-    };
+    // RenderingMode is passed through as upstream's D2D params do (its
+    // GetD2DParams keeps 6 = OUTLINE; only its analysis-path params remap 6
+    // to natural symmetric, and that path is rendered by us, not DirectWrite).
+    let (mode, mode1) = (DWRITE_RENDERING_MODE(p.dw.rendering_mode), DWRITE_RENDERING_MODE1(p.dw.rendering_mode));
     let d = &p.dw;
     let params = custom_params(&f, d.gamma, d.contrast, d.cleartype_level, geometry, mode, mode1, grid_fit)?;
     Some(DwRendering { params, aa_mode, grid_fit_disabled: grid_fit == DWRITE_GRID_FIT_MODE_DISABLED })

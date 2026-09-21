@@ -30,6 +30,7 @@
 
 use core::ffi::c_void;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -44,7 +45,7 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::DWRITE_GLYPH_RUN;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
-    BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY,
+    BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HDC, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::core::{s, w};
@@ -70,6 +71,7 @@ type FnD2DDrawGlyphRun = unsafe extern "system" fn(*mut c_void, Vector2, *const 
 /// `ID2D1DeviceContext::DrawGlyphRun(baseline, run, description, brush, measuring)`.
 type FnD2DDrawGlyphRun1 = unsafe extern "system" fn(*mut c_void, Vector2, *const DWRITE_GLYPH_RUN, *const c_void, *mut c_void, i32);
 type FnSetTextAaMode = unsafe extern "system" fn(*mut c_void, i32);
+type FnCreateCompatibleRT = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *const c_void, u32, *mut *mut c_void) -> HRESULT;
 type FnSetTextRenderingParams = unsafe extern "system" fn(*mut c_void, *mut c_void);
 
 static ORIG_D2DCF: OnceLock<FnD2DCreateFactory> = OnceLock::new();
@@ -91,6 +93,10 @@ const SLOTS_FACTORY_CREATE_DEVICE: [usize; 7] = [17, 27, 28, 29, 30, 31, 32];
 /// `CreateDeviceContext` in ID2D1Device … ID2D1Device6, in that order.
 const SLOTS_DEVICE_CREATE_CONTEXT: [usize; 7] = [4, 11, 12, 15, 16, 19, 20];
 // ID2D1RenderTarget / ID2D1DeviceContext
+/// `CreateCompatibleRenderTarget(size*, pixelSize*, format*, options, out)`:
+/// offscreen bitmap targets have their own vtable, so they are hooked as
+/// they are made (upstream `HookRenderTarget` does the same).
+const SLOT_CREATE_COMPATIBLE_RT: usize = 12;
 const SLOT_DRAW_GLYPH_RUN: usize = 29;
 const SLOT_SET_TEXT_AA_MODE: usize = 34;
 const SLOT_SET_TEXT_RENDERING_PARAMS: usize = 36;
@@ -171,6 +177,7 @@ unsafe fn hook_device(dev: *mut c_void) {
 /// profile's rendering params to it (as upstream does at creation).
 unsafe fn hook_render_target(rt: *mut c_void) {
     let mut n = 0;
+    n += patch_once(rt, SLOT_CREATE_COMPATIBLE_RT, create_compatible_detour as *const ()) as u32;
     n += patch_once(rt, SLOT_DRAW_GLYPH_RUN, d2d_dgr_detour as *const ()) as u32;
     n += patch_once(rt, SLOT_SET_TEXT_AA_MODE, set_text_aa_detour as *const ()) as u32;
     n += patch_once(rt, SLOT_SET_TEXT_RENDERING_PARAMS, set_text_rp_detour as *const ()) as u32;
@@ -210,6 +217,13 @@ unsafe extern "system" fn create_wic_detour(this: *mut c_void, bitmap: *const c_
     if hr.is_ok() && !out.is_null() && !(*out).is_null() { hook_render_target(*out); }
     hr
 }
+unsafe extern "system" fn create_compatible_detour(this: *mut c_void, size: *const c_void, pixel_size: *const c_void, format: *const c_void, options: u32, out: *mut *mut c_void) -> HRESULT {
+    let Some(o) = slot_orig(this, SLOT_CREATE_COMPATIBLE_RT) else { return HRESULT(-1) };
+    let f: FnCreateCompatibleRT = std::mem::transmute(o);
+    let hr = f(this, size, pixel_size, format, options, out);
+    if hr.is_ok() && !out.is_null() && !(*out).is_null() { hook_render_target(*out); }
+    hr
+}
 /// One detour serves every `ID2D1FactoryN::CreateDevice`: the signatures are
 /// identical. We cannot tell which slot the app called, so the original of
 /// any patched slot on this vtable is used — they all create the same device
@@ -242,7 +256,11 @@ unsafe extern "system" fn set_text_aa_detour(this: *mut c_void, mode: i32) {
 unsafe extern "system" fn set_text_rp_detour(this: *mut c_void, params: *mut c_void) {
     let Some(o) = slot_orig(this, SLOT_SET_TEXT_RENDERING_PARAMS) else { return };
     let f: FnSetTextRenderingParams = std::mem::transmute(o);
-    f(this, dw_rendering().map_or(params, |d| d.params.as_raw()));
+    // Keep our clone alive across the call: a profile reload on another
+    // thread may replace DW_RENDERING meanwhile, and this clone is then the
+    // only reference behind the raw pointer we pass.
+    let dw = dw_rendering();
+    f(this, dw.as_ref().map_or(params, |d| d.params.as_raw()));
 }
 
 /// Run the original draw with the grid-fit nudge upstream applies: with
@@ -296,11 +314,26 @@ unsafe fn d2d_brush_ink(brush: *mut c_void) -> Ink {
 }
 
 unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_RUN, brush: *mut c_void) -> Option<()> {
+    // Can this target lend a GDI DC at all? Ask first: on DXGI-surface
+    // device contexts (most Direct2D 1.1 apps) it cannot, and that answer
+    // must not cost a font-file read or the render lock.
+    let rt = ID2D1RenderTarget::from_raw_borrowed(&this)?;
+    let gi: ID2D1GdiInteropRenderTarget = rt.cast().ok()?;
+    let hdc = gi.GetDC(D2D1_DC_INITIALIZE_MODE_COPY).ok()?;
+    let result = d2d_substitute_on_dc(hdc, baseline, r, brush);
+    let _ = gi.ReleaseDC(None);
+    result
+}
+
+unsafe fn d2d_substitute_on_dc(hdc: HDC, baseline: Vector2, r: &DWRITE_GLYPH_RUN, brush: *mut c_void) -> Option<()> {
     let mut guard = RENDER.lock().ok()?;
     let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
-    let (bytes, index) = dwrite_font_bytes(r)?;
-    let key = format!("d2d:{index}:{}", bytes.len());
+    // Key on the font-face identity like the DirectWrite path; the file is
+    // read and refaced only on a miss.
+    let face = r.fontFace.deref().as_ref()?;
+    let key = format!("d2d:{:x}:{}", face.as_raw() as usize, face.GetIndex());
     if font_key.as_deref() != Some(key.as_str()) {
+        let (bytes, index) = dwrite_font_bytes(r)?;
         ft.reface_memory_index(&bytes, index as i64).ok()?;
         *font_key = Some(key);
     }
@@ -308,10 +341,6 @@ unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_
     let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
     let adv: f32 = if r.glyphAdvances.is_null() { 0.0 }
         else { std::slice::from_raw_parts(r.glyphAdvances, r.glyphCount as usize).iter().sum() };
-
-    let rt = ID2D1RenderTarget::from_raw_borrowed(&this)?;
-    let gi: ID2D1GdiInteropRenderTarget = rt.cast().ok()?;
-    let hdc = gi.GetDC(D2D1_DC_INITIALIZE_MODE_COPY).ok()?;
 
     // region around the text baseline
     let bx = baseline.X.round() as i32;
@@ -343,7 +372,6 @@ unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_
     SelectObject(memdc, old);
     let _ = DeleteObject(hbmp.into());
     let _ = DeleteDC(memdc);
-    let _ = gi.ReleaseDC(None);
     if !D2D_CAPTURED.swap(true, Ordering::SeqCst) {
         log(&format!("substituted D2D DrawGlyphRun via render-core ({} glyphs, {px}px)", glyphs.len()));
     }
