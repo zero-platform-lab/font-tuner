@@ -62,7 +62,21 @@ static mut ORIG: Option<FnEto> = None;
 static mut FT: Option<Ft> = None;
 static mut TABLES: Option<Tables> = None;
 static mut PROFILE: Option<Profile> = None;
-static IN_DETOUR: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    // Per-thread re-entrancy guard for the GDI detour. Must be thread-local, not
+    // a process-global flag: a global one makes every *other* thread's
+    // ExtTextOutW fall back to untuned GDI whenever one thread is mid-render, so
+    // multi-window apps render inconsistently. We only need to stop the same
+    // thread re-entering (our own GDI calls / nested draws).
+    static IN_DETOUR: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+/// Serialises the one-time vtable patches (CreateAlphaTexture, D2D factory
+/// render-target creation). Without it two threads racing the first call both
+/// pass the `is_null()`/`is_none()` check and both patch the slot; the loser
+/// then captures the "original" from a slot already holding our detour, so the
+/// detour calls itself — infinite recursion, host crash. (The D2D DrawGlyphRun
+/// path already guards with D2D_DGR_ORIG's mutex; these paths did not.)
+static VTABLE_PATCH_LOCK: Mutex<()> = Mutex::new(());
 /// Registered window message the tray broadcasts for "reload profile"
 /// (0 until on_attach registers it). Handled in GetMsgProc on the receiving
 /// process's own UI thread: no extra thread, no polling.
@@ -194,12 +208,13 @@ unsafe extern "system" fn detour(
     hdc_i: isize, x: i32, y: i32, options: u32,
     rect: *const c_void, str_ptr: *const u16, count: u32, dx: *const i32,
 ) -> i32 {
-    // Guard against re-entrancy (our own GDI calls, or nested draws).
-    if IN_DETOUR.swap(true, Ordering::SeqCst) {
+    // Guard against re-entrancy (our own GDI calls, or nested draws) on this
+    // thread only.
+    if IN_DETOUR.with(|f| f.replace(true)) {
         return (ORIG.unwrap())(hdc_i, x, y, options, rect, str_ptr, count, dx);
     }
     let r = render_into_dc(hdc_i, x, y, options, rect, str_ptr, count, dx);
-    IN_DETOUR.store(false, Ordering::SeqCst);
+    IN_DETOUR.with(|f| f.set(false));
     match r {
         Some(v) => v,
         None => (ORIG.unwrap())(hdc_i, x, y, options, rect, str_ptr, count, dx),
@@ -462,7 +477,14 @@ unsafe extern "system" fn cgra_detour(
             let info = RunInfo { bytes, index, glyphs, px: r.fontEmSize.round() as i32,
                                  baseline: (bx.round() as i32, by.round() as i32) };
             if let Ok(mut m) = ANALYSES.lock() {
-                m.get_or_insert_with(HashMap::new).insert(*out as usize, info);
+                let map = m.get_or_insert_with(HashMap::new);
+                // Bound the map: analysis objects that are never followed by a
+                // CreateAlphaTexture (so never evicted below) would otherwise
+                // leak an entry each. If it grows past the cap, drop everything;
+                // in-flight analyses then fall back to untuned rendering — a
+                // one-off visual blip, never a crash or unbounded growth.
+                if map.len() >= 4096 { map.clear(); }
+                map.insert(*out as usize, info);
             }
             patch_cat_vtable(*out);
         }
@@ -471,14 +493,18 @@ unsafe extern "system" fn cgra_detour(
 }
 
 unsafe fn patch_cat_vtable(analysis: *mut c_void) {
-    if !CAT_SLOT.is_null() { return; }
+    if !CAT_SLOT.is_null() { return; } // fast path, no lock once patched
+    let _guard = VTABLE_PATCH_LOCK.lock();
+    if !CAT_SLOT.is_null() { return; } // re-check under the lock
     let vtbl = *(analysis as *mut *mut usize);
     let slot = vtbl.add(4);
     let mut oldp = PAGE_PROTECTION_FLAGS(0);
     if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() { return; }
     ORIG_CAT = Some(std::mem::transmute::<usize, FnCreateAlphaTexture>(*slot));
-    CAT_SLOT = slot;
     *slot = cat_detour as usize;
+    // Publish CAT_SLOT last: cat_detour keys off ORIG_CAT, and another thread's
+    // fast-path check keys off CAT_SLOT, so ORIG_CAT must be set before CAT_SLOT.
+    CAT_SLOT = slot;
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
     log("hook installed on CreateAlphaTexture");
 }
@@ -487,6 +513,11 @@ unsafe extern "system" fn cat_detour(
     this: *mut c_void, tex_type: i32, bounds: *const RECT, alpha: *mut u8, size: u32,
 ) -> HRESULT {
     if tex_type == 1 && !bounds.is_null() && !alpha.is_null() && cat_fill(this, &*bounds, alpha, size).is_some() {
+        // The analysis has produced its texture; drop its captured run so the
+        // map does not grow for the life of the process.
+        if let Ok(mut m) = ANALYSES.lock() {
+            if let Some(map) = m.as_mut() { map.remove(&(this as usize)); }
+        }
         return HRESULT(0);
     }
     (ORIG_CAT.unwrap())(this, tex_type, bounds, alpha, size)
@@ -500,7 +531,10 @@ unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Op
     let profile = PROFILE.as_ref()?;
     let m = ANALYSES.lock().ok()?;
     let info = m.as_ref()?.get(&(this as usize))?;
-    let key = format!("dwa:{:p}", this);
+    // Key on the font identity (face index + file length), not the analysis
+    // object address: addresses are recycled, so keying on `this` would reuse a
+    // stale face when a freed analysis's pointer is handed to a different font.
+    let key = format!("dwa:{}:{}", info.index, info.bytes.len());
     if cache.as_deref() != Some(key.as_str()) {
         ft.reface_memory_index(&info.bytes, info.index as i64).ok()?;
         *cache = Some(key);
@@ -548,12 +582,15 @@ unsafe extern "system" fn d2dcf_detour(ftype: i32, riid: *const GUID, opts: *con
     let hr = (ORIG_D2DCF.unwrap())(ftype, riid, opts, out);
     if hr.is_ok() && !out.is_null() && !(*out).is_null() {
         let vtbl = *(*out as *mut *mut usize);
-        // ID2D1Factory: CreateHwndRenderTarget = slot 14, CreateDCRenderTarget = slot 16
+        // ID2D1Factory: CreateHwndRenderTarget = slot 14, CreateDCRenderTarget = slot 16.
+        // Serialise the one-time patch: two threads creating factories at once
+        // must not both capture the "original" (see VTABLE_PATCH_LOCK).
+        let _guard = VTABLE_PATCH_LOCK.lock();
         if ORIG_HWNDRT.is_none() {
-            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { ORIG_HWNDRT = Some(std::mem::transmute(o)); HWNDRT_SLOT = vtbl.add(14); }
+            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { HWNDRT_SLOT = vtbl.add(14); ORIG_HWNDRT = Some(std::mem::transmute(o)); }
         }
         if ORIG_DCRT.is_none() {
-            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { ORIG_DCRT = Some(std::mem::transmute(o)); DCRT_SLOT = vtbl.add(16); }
+            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { DCRT_SLOT = vtbl.add(16); ORIG_DCRT = Some(std::mem::transmute(o)); }
         }
         log("hook installed on D2D1Factory render-target creation");
     }
