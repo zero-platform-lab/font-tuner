@@ -1,37 +1,154 @@
-//! Safe-ish wrapper over the FreeType C shim (`shim.c`).
+//! FreeType driver: direct FFI to the fork's static `freetype64.lib` (no C
+//! shim). FreeType does the glyph rasterisation; this module drives it with the
+//! load flags / render mode that the upstream `FreeTypePrepare` selects for a
+//! profile.
 //!
-//! FreeType does the glyph rasterisation; this module just drives it with the
-//! load flags / render mode that MacType's `FreeTypePrepare` selects for a
-//! profile. The shim keeps a single process-global library + face, so `Ft` is a
-//! non-clonable handle; dropping it tears FreeType down.
+//! Only the leading fields of `FT_FaceRec` / `FT_GlyphSlotRec` are declared:
+//! FreeType allocates both, we only read through pointers, so trailing fields
+//! can be left out. Offsets follow the fork's headers
+//! (`vendor/freetype/include/freetype/{freetype,ftimage}.h`). Note that
+//! `FT_Long` / `FT_Pos` / `FT_Fixed` are C `long`, i.e. **32-bit on Windows
+//! x64** — hence `c_long`, never `i64`.
 
-use std::ffi::CString;
-use std::os::raw::{c_char, c_long};
+use std::cell::{Cell, UnsafeCell};
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_long, c_short, c_uchar, c_uint, c_ulong, c_ushort, c_void};
 
 use crate::config::{Aa, Profile};
 
-#[repr(C)]
-struct ShimGlyph {
-    width: i32,
-    rows: i32,
-    pitch: i32,
-    pixel_mode: i32,
-    left: i32,
-    top: i32,
-    advance_x: i32,
-    buffer: *const u8,
+// ---- FreeType ABI ---------------------------------------------------------
+
+mod sys {
+    use super::*;
+
+    pub type FT_Library = *mut c_void;
+    pub type FT_Face = *mut FT_FaceRec;
+    pub type FT_GlyphSlot = *mut FT_GlyphSlotRec;
+
+    #[repr(C)]
+    pub struct FT_Generic {
+        pub data: *mut c_void,
+        pub finalizer: Option<unsafe extern "C" fn(*mut c_void)>,
+    }
+
+    #[repr(C)]
+    pub struct FT_BBox {
+        pub x_min: c_long,
+        pub y_min: c_long,
+        pub x_max: c_long,
+        pub y_max: c_long,
+    }
+
+    #[repr(C)]
+    pub struct FT_Vector {
+        pub x: c_long,
+        pub y: c_long,
+    }
+
+    #[repr(C)]
+    pub struct FT_Bitmap {
+        pub rows: c_uint,
+        pub width: c_uint,
+        pub pitch: c_int,
+        pub buffer: *mut c_uchar,
+        pub num_grays: c_ushort,
+        pub pixel_mode: c_uchar,
+        pub palette_mode: c_uchar,
+        pub palette: *mut c_void,
+    }
+
+    #[repr(C)]
+    pub struct FT_Outline {
+        pub n_contours: c_ushort,
+        pub n_points: c_ushort,
+        pub points: *mut FT_Vector,
+        pub tags: *mut c_uchar,
+        pub contours: *mut c_ushort,
+        pub flags: c_int,
+    }
+
+    #[repr(C)]
+    pub struct FT_Glyph_Metrics {
+        pub width: c_long,
+        pub height: c_long,
+        pub hori_bearing_x: c_long,
+        pub hori_bearing_y: c_long,
+        pub hori_advance: c_long,
+        pub vert_bearing_x: c_long,
+        pub vert_bearing_y: c_long,
+        pub vert_advance: c_long,
+    }
+
+    /// Leading fields of `FT_GlyphSlotRec` (through `outline`).
+    #[repr(C)]
+    pub struct FT_GlyphSlotRec {
+        pub library: FT_Library,
+        pub face: FT_Face,
+        pub next: FT_GlyphSlot,
+        pub glyph_index: c_uint,
+        pub generic: FT_Generic,
+        pub metrics: FT_Glyph_Metrics,
+        pub linear_hori_advance: c_long,
+        pub linear_vert_advance: c_long,
+        pub advance: FT_Vector,
+        pub format: c_uint,
+        pub bitmap: FT_Bitmap,
+        pub bitmap_left: c_int,
+        pub bitmap_top: c_int,
+        pub outline: FT_Outline,
+    }
+
+    /// Leading fields of `FT_FaceRec` (through `charmap`).
+    #[repr(C)]
+    pub struct FT_FaceRec {
+        pub num_faces: c_long,
+        pub face_index: c_long,
+        pub face_flags: c_long,
+        pub style_flags: c_long,
+        pub num_glyphs: c_long,
+        pub family_name: *mut c_char,
+        pub style_name: *mut c_char,
+        pub num_fixed_sizes: c_int,
+        pub available_sizes: *mut c_void,
+        pub num_charmaps: c_int,
+        pub charmaps: *mut c_void,
+        pub generic: FT_Generic,
+        pub bbox: FT_BBox,
+        pub units_per_em: c_ushort,
+        pub ascender: c_short,
+        pub descender: c_short,
+        pub height: c_short,
+        pub max_advance_width: c_short,
+        pub max_advance_height: c_short,
+        pub underline_position: c_short,
+        pub underline_thickness: c_short,
+        pub glyph: FT_GlyphSlot,
+        pub size: *mut c_void,
+        pub charmap: *mut c_void,
+    }
+
+    /// `FT_ENC_TAG('u','n','i','c')`.
+    pub const FT_ENCODING_UNICODE: c_uint = 0x756E_6963;
+    /// `FT_IMAGE_TAG('o','u','t','l')`.
+    pub const FT_GLYPH_FORMAT_OUTLINE: c_uint = 0x6F75_746C;
+
+    extern "C" {
+        pub fn FT_Init_FreeType(alibrary: *mut FT_Library) -> c_int;
+        pub fn FT_Done_FreeType(library: FT_Library) -> c_int;
+        pub fn FT_New_Face(library: FT_Library, path: *const c_char, face_index: c_long, aface: *mut FT_Face) -> c_int;
+        pub fn FT_New_Memory_Face(library: FT_Library, base: *const c_uchar, size: c_long, face_index: c_long, aface: *mut FT_Face) -> c_int;
+        pub fn FT_Done_Face(face: FT_Face) -> c_int;
+        pub fn FT_Select_Charmap(face: FT_Face, encoding: c_uint) -> c_int;
+        pub fn FT_Set_Pixel_Sizes(face: FT_Face, pixel_width: c_uint, pixel_height: c_uint) -> c_int;
+        pub fn FT_Load_Glyph(face: FT_Face, glyph_index: c_uint, load_flags: i32) -> c_int;
+        pub fn FT_Get_Char_Index(face: FT_Face, charcode: c_ulong) -> c_uint;
+        pub fn FT_Outline_EmboldenXY(outline: *mut FT_Outline, xstrength: c_long, ystrength: c_long) -> c_int;
+        pub fn FT_Render_Glyph(slot: FT_GlyphSlot, render_mode: c_uint) -> c_int;
+        pub fn FT_Library_SetLcdFilter(library: FT_Library, filter: c_uint) -> c_int;
+    }
 }
 
-extern "C" {
-    fn shim_init() -> i32;
-    fn shim_open(path: *const c_char, face_index: c_long) -> i32;
-    fn shim_reface_memory(data: *const u8, len: c_long, want_family: *const c_char) -> i32;
-    fn shim_reface_memory_index(data: *const u8, len: c_long, index: c_long) -> i32;
-    fn shim_render(charcode: u32, px: i32, load_flags: i32, render_mode: i32, ex: i32, ey: i32, out: *mut ShimGlyph) -> i32;
-    fn shim_render_glyph(glyph_index: u32, px: i32, load_flags: i32, render_mode: i32, ex: i32, ey: i32, out: *mut ShimGlyph) -> i32;
-    fn shim_set_lcd_filter(filter: i32) -> i32;
-    fn shim_done();
-}
+use sys::*;
 
 // FreeType constants (stable public ABI).
 const FT_LOAD_NO_HINTING: i32 = 0x2;
@@ -59,42 +176,103 @@ pub struct Glyph<'a> {
     pub buffer: &'a [u8],
 }
 
-/// Owned FreeType handle (process-global; only construct one).
+/// Owned FreeType library + one active face. `&self` methods mutate FreeType
+/// state (the glyph slot, the active face) exactly as the C globals did; a
+/// `Glyph` borrowed from `render` is valid until the next `render`/`reface`.
 pub struct Ft {
-    _priv: (),
+    lib: FT_Library,
+    face: Cell<FT_Face>,
+    /// Backing bytes for `FT_New_Memory_Face`; FreeType reads them for the
+    /// face's whole life, so they are replaced only after `FT_Done_Face`.
+    membuf: UnsafeCell<Vec<u8>>,
 }
 
 impl Ft {
     /// Initialise FreeType and open a face from a font file.
     pub fn open(path: &str, face_index: i64) -> Result<Ft, i32> {
-        unsafe {
-            let r = shim_init();
-            if r != 0 { return Err(r); }
-            let c = CString::new(path).map_err(|_| -1)?;
-            let r = shim_open(c.as_ptr(), face_index as c_long);
-            if r != 0 { return Err(r); }
+        let mut lib: FT_Library = std::ptr::null_mut();
+        let r = unsafe { FT_Init_FreeType(&mut lib) };
+        if r != 0 { return Err(r); }
+        let ft = Ft { lib, face: Cell::new(std::ptr::null_mut()), membuf: UnsafeCell::new(Vec::new()) };
+        let c = CString::new(path).map_err(|_| -1)?;
+        let mut face: FT_Face = std::ptr::null_mut();
+        let r = unsafe { FT_New_Face(lib, c.as_ptr(), face_index as c_long, &mut face) };
+        if r != 0 { return Err(r); }
+        ft.adopt(face);
+        Ok(ft)
+    }
+
+    /// Release the current face (if any) and take `face` as the active one.
+    fn adopt(&self, face: FT_Face) {
+        self.drop_face();
+        if !face.is_null() {
+            unsafe { FT_Select_Charmap(face, FT_ENCODING_UNICODE); }
         }
-        Ok(Ft { _priv: () })
+        self.face.set(face);
+    }
+
+    fn drop_face(&self) {
+        let f = self.face.replace(std::ptr::null_mut());
+        if !f.is_null() {
+            unsafe { FT_Done_Face(f); }
+        }
+    }
+
+    /// Copy `data` into the backing buffer (after dropping the face that may
+    /// still reference the old bytes) and return its pointer + length.
+    fn stage_memory(&self, data: &[u8]) -> (*const u8, c_long) {
+        self.drop_face();
+        // SAFETY: no face references membuf now, and no other borrow of it is
+        // live (Glyph borrows the slot bitmap, not membuf).
+        let buf = unsafe { &mut *self.membuf.get() };
+        buf.clear();
+        buf.extend_from_slice(data);
+        (buf.as_ptr(), buf.len() as c_long)
     }
 
     /// Swap the active face to an in-memory font file (e.g. GDI `GetFontData`
     /// bytes), keeping the FreeType library. For a TTC, `want_family` picks the
-    /// matching face by family name. `Ok` on success.
+    /// matching face by family name (case-insensitive); falls back to face 0.
     pub fn reface_memory(&self, data: &[u8], want_family: &str) -> Result<(), i32> {
-        let cf = CString::new(want_family).unwrap_or_default();
-        let r = unsafe { shim_reface_memory(data.as_ptr(), data.len() as c_long, cf.as_ptr()) };
-        if r == 0 { Ok(()) } else { Err(r) }
+        let (base, len) = self.stage_memory(data);
+        let mut chosen: c_long = 0;
+        if !want_family.is_empty() {
+            // Probe face -1 for the face count, then open each to compare names.
+            let mut probe: FT_Face = std::ptr::null_mut();
+            let perr = unsafe { FT_New_Memory_Face(self.lib, base, len, -1, &mut probe) };
+            let n = if perr == 0 { unsafe { (*probe).num_faces } } else { 1 };
+            if perr == 0 { unsafe { FT_Done_Face(probe); } }
+            for i in 0..n {
+                let mut f: FT_Face = std::ptr::null_mut();
+                if unsafe { FT_New_Memory_Face(self.lib, base, len, i, &mut f) } != 0 { continue; }
+                let name = unsafe { (*f).family_name };
+                let matched = !name.is_null()
+                    && unsafe { CStr::from_ptr(name) }.to_bytes().eq_ignore_ascii_case(want_family.as_bytes());
+                unsafe { FT_Done_Face(f); }
+                if matched { chosen = i; break; }
+            }
+        }
+        let mut face: FT_Face = std::ptr::null_mut();
+        let r = unsafe { FT_New_Memory_Face(self.lib, base, len, chosen, &mut face) };
+        if r != 0 { return Err(r); }
+        self.adopt(face);
+        Ok(())
     }
 
     /// Swap the active face to an in-memory font file at a specific face index
     /// (for DirectWrite's IDWriteFontFace bytes + GetIndex).
     pub fn reface_memory_index(&self, data: &[u8], index: i64) -> Result<(), i32> {
-        let r = unsafe { shim_reface_memory_index(data.as_ptr(), data.len() as c_long, index as c_long) };
-        if r == 0 { Ok(()) } else { Err(r) }
+        let (base, len) = self.stage_memory(data);
+        let mut face: FT_Face = std::ptr::null_mut();
+        let r = unsafe { FT_New_Memory_Face(self.lib, base, len, index as c_long, &mut face) };
+        if r != 0 { return Err(r); }
+        self.adopt(face);
+        Ok(())
     }
 
+    /// filter: FT_LCD_FILTER_* (0 NONE, 1 DEFAULT, 2 LIGHT, 3 LEGACY1, 16 LEGACY)
     fn set_lcd_filter(&self, filter: i32) {
-        unsafe { shim_set_lcd_filter(filter); }
+        unsafe { FT_Library_SetLcdFilter(self.lib, filter as c_uint); }
     }
 
     /// FreeType load flags + render mode for a profile's AA + hinting.
@@ -121,53 +299,82 @@ impl Ft {
     /// Render one character at `px` pixels through `p`. Returns `None` only on
     /// a hard error; a missing/empty glyph yields an empty `Glyph` (advance only).
     pub fn render(&self, ch: char, px: i32, p: &Profile) -> Option<Glyph<'_>> {
-        self.emit(p, |flags, mode, ex, ey, out| unsafe {
-            shim_render(ch as u32, px, flags, mode, ex, ey, out)
-        })
+        let face = self.face.get();
+        if face.is_null() { return None; }
+        let gi = unsafe { FT_Get_Char_Index(face, ch as c_ulong) };
+        self.emit(gi, px, p)
     }
 
     /// Render a glyph by its font glyph index (for ETO_GLYPH_INDEX draws).
     pub fn render_glyph(&self, gi: u16, px: i32, p: &Profile) -> Option<Glyph<'_>> {
-        self.emit(p, |flags, mode, ex, ey, out| unsafe {
-            shim_render_glyph(gi as u32, px, flags, mode, ex, ey, out)
-        })
+        self.emit(gi as c_uint, px, p)
     }
 
-    /// Shared body: run `call` (which invokes the right shim entry point) and
-    /// wrap the resulting bitmap.
-    fn emit(
-        &self,
-        p: &Profile,
-        call: impl FnOnce(i32, i32, i32, i32, *mut ShimGlyph) -> i32,
-    ) -> Option<Glyph<'_>> {
+    /// Load + render glyph `gi` into the face's slot and wrap the bitmap.
+    fn emit(&self, gi: c_uint, px: i32, p: &Profile) -> Option<Glyph<'_>> {
+        let face = self.face.get();
+        if face.is_null() { return None; }
         let (flags, render_mode) = Self::flags(p);
-        let mut g = ShimGlyph {
-            width: 0, rows: 0, pitch: 0, pixel_mode: 0,
-            left: 0, top: 0, advance_x: 0, buffer: std::ptr::null(),
-        };
-        let r = call(flags, render_mode, p.embolden, p.embolden, &mut g);
-        if r != 0 || g.buffer.is_null() || g.rows == 0 {
-            return Some(Glyph {
-                width: 0, rows: 0, pitch: 0, pixel_mode: g.pixel_mode,
-                left: g.left, top: g.top, advance_px: g.advance_x >> 6, buffer: &[],
-            });
+        // SAFETY: face is a live FT_Face from FreeType; slot is owned by it.
+        unsafe {
+            if FT_Set_Pixel_Sizes(face, 0, px as c_uint) != 0 { return None; }
+            if FT_Load_Glyph(face, gi, flags) != 0 { return None; }
+            let slot = (*face).glyph;
+            if (*slot).format == FT_GLYPH_FORMAT_OUTLINE && p.embolden != 0 {
+                FT_Outline_EmboldenXY(&mut (*slot).outline, p.embolden as c_long, p.embolden as c_long);
+            }
+            if FT_Render_Glyph(slot, render_mode as c_uint) != 0 { return None; }
+            let s = &*slot;
+            let (left, top, advance_px) = (s.bitmap_left, s.bitmap_top, s.advance.x >> 6);
+            let b = &s.bitmap;
+            if b.buffer.is_null() || b.rows == 0 {
+                return Some(Glyph {
+                    width: 0, rows: 0, pitch: 0, pixel_mode: b.pixel_mode as i32,
+                    left, top, advance_px, buffer: &[],
+                });
+            }
+            let len = (b.pitch.unsigned_abs() * b.rows) as usize;
+            let buffer = std::slice::from_raw_parts(b.buffer, len);
+            Some(Glyph {
+                width: b.width as i32, rows: b.rows as i32, pitch: b.pitch, pixel_mode: b.pixel_mode as i32,
+                left, top, advance_px, buffer,
+            })
         }
-        let len = (g.pitch.abs() * g.rows) as usize;
-        let buffer = unsafe { std::slice::from_raw_parts(g.buffer, len) };
-        Some(Glyph {
-            width: g.width, rows: g.rows, pitch: g.pitch, pixel_mode: g.pixel_mode,
-            left: g.left, top: g.top, advance_px: g.advance_x >> 6, buffer,
-        })
     }
 }
 
 impl Drop for Ft {
     fn drop(&mut self) {
-        unsafe { shim_done(); }
+        self.drop_face();
+        unsafe { FT_Done_FreeType(self.lib); }
     }
 }
 
 /// Convenience: does this profile need BGR subpixel order?
 pub fn is_bgr(aa: Aa) -> bool {
     matches!(aa, Aa::LcdBgr | Aa::LightLcdBgr)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::sys::*;
+    use std::mem::{offset_of, size_of};
+
+    // Offsets on x64 Windows (long = 4 bytes), derived from the fork's headers.
+    #[test]
+    fn face_rec_offsets() {
+        assert_eq!(offset_of!(FT_FaceRec, family_name), 24);
+        assert_eq!(offset_of!(FT_FaceRec, glyph), 24 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + 8 + 16 + 16 + 2 + 14);
+    }
+
+    #[test]
+    fn glyph_slot_offsets() {
+        assert_eq!(size_of::<FT_Bitmap>(), 40);
+        assert_eq!(offset_of!(FT_GlyphSlotRec, metrics), 48);
+        assert_eq!(offset_of!(FT_GlyphSlotRec, advance), 48 + 32 + 8);
+        assert_eq!(offset_of!(FT_GlyphSlotRec, format), 96);
+        assert_eq!(offset_of!(FT_GlyphSlotRec, bitmap), 104);
+        assert_eq!(offset_of!(FT_GlyphSlotRec, bitmap_left), 144);
+        assert_eq!(offset_of!(FT_GlyphSlotRec, outline), 152);
+    }
 }
