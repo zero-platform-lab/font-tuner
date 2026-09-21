@@ -1,5 +1,5 @@
 //! render-core: an experimental, offline Rust port of the MacType glyph
-//! *rendering* core (vendor/mactype/ft.cpp) — the gamma/contrast/LCD tuning and
+//! *rendering* core (upstream MacType ft.cpp, commit 05052e8) — the gamma/contrast/LCD tuning and
 //! linear-space blend that sit on top of FreeType.
 //!
 //! Scope: it turns "a character + a profile" into pixels, exactly as MacType

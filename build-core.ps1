@@ -2,10 +2,10 @@
 # (snowie2000/freetype, which adds FT_Glyph_To_BitmapEx) as a static lib.
 # render-core links build/lib/freetype64.lib; everything else is Rust.
 #
-# The C++ MacType core is not built (vendor/mactype stays as the reference
-# the port is checked against); Microsoft Detours and IniParser are not even
-# vendored any more. The render core is RenderCore64.dll
-# (render-inject/render-core) and hooks with retour.
+# Nothing of upstream MacType is vendored or built any more: the render core
+# is RenderCore64.dll (render-inject/render-core), hooking is retour, and the
+# port is checked against the upstream source on GitHub (commit 05052e8, see
+# docs/RUST-PORT.md).
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $vs   = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath

@@ -26,7 +26,7 @@ use crate::log;
 /// pass the `is_null()`/`is_none()` check and both patch the slot; the loser
 /// then captures the "original" from a slot already holding our detour, so the
 /// detour calls itself — infinite recursion, host crash. (The D2D DrawGlyphRun
-/// path already guards with D2D_DGR_ORIG's mutex; these paths did not.)
+/// path already guards with SLOT_ORIG's mutex; these paths did not.)
 pub(crate) static VTABLE_PATCH_LOCK: Mutex<()> = Mutex::new(());
 
 /// Installed inline detours, kept alive for the life of the process (the DLL

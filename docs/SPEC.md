@@ -15,7 +15,7 @@ adds a tray-menu system-font switcher. Windows 11, 64-bit only.
 font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64-bit GUI process
                                                           maps RenderCore64.dll
                                                           (hook proc lives there)
-                          core DllMain hooks the font APIs (GDI / DirectWrite)
+                          core DllMain hooks the font APIs (GDI / DirectWrite / Direct2D)
                           │
                           └─ on child-process spawn, core injects RenderBootstrap64.dll
                              (GdippInjectDLL), which LoadLibraryW's the core in the child
@@ -62,10 +62,23 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64
   module instances in one process; a per-process named mutex
   (`Local\FontTuner.Attached.<pid>`) ensures only the first attach hooks, so a
   second attach cannot detour over our own jump and corrupt the trampoline.
-* **One-time vtable patches** (CreateAlphaTexture, D2D factory RT creation) are
-  serialised by a mutex and re-checked under it; otherwise two racing threads
-  both capture the "original" from an already-patched slot and the detour calls
-  itself → infinite recursion.
+* **One-time vtable patches** (CreateAlphaTexture, every Direct2D creation and
+  text slot) are serialised by a mutex and re-checked under it; otherwise two
+  racing threads both capture the "original" from an already-patched slot and
+  the detour calls itself → infinite recursion. Direct2D slots are keyed by
+  (vtable, slot) in one map, since each render-target class has its own vtable.
+* **Direct2D reach** — `render-inject/src/d2d.rs` walks upstream's creation
+  chain: `D2D1CreateFactory` → `CreateHwnd/DC/WicBitmapRenderTarget` and
+  `ID2D1Factory1..7::CreateDevice`; `D2D1CreateDevice` →
+  `ID2D1Device..6::CreateDeviceContext`; `D2D1CreateDeviceContext`. On every
+  target it patches `DrawGlyphRun` (29), the description overload (82),
+  `SetTextAntialiasMode` (34) and `SetTextRenderingParams` (36). Where the
+  target lends a GDI DC the run is drawn by render-core; where it does not
+  (DXGI surfaces: swap chains, composition) the OS draws with the profile's
+  `[DirectWrite]` `IDWriteRenderingParams`, the antialias mode derived from
+  `AntiAliasMode`, and the 1/65535 transform nudge upstream applies when
+  `HintingMode=1`. Slot numbers were checked against the `windows` crate's
+  vtable definitions.
 * **Re-entrancy** is guarded per-thread (`thread_local`), so one thread
   rendering never forces another thread's draw down the untuned GDI path.
 * **Hook-install guards in the tray** (`Hook::install`, `src/stale.rs`) —
@@ -134,6 +147,18 @@ Hinting modes: **0** = none (outline as-is, softest, most faithful shape);
 **2** = TrueType bytecode (font's own hints, strongest, crispest at small sizes,
 can distort shape slightly). All profiles use DirectWrite `RenderingMode=2`
 (GDI_CLASSIC) so GDI and DirectWrite text match.
+
+The `[DirectWrite]` section (`GammaValue`, `Contrast`, `ClearTypeLevel`,
+`RenderingMode`) is what Direct2D is told to use for text we cannot rasterise
+ourselves (1.2). Defaults follow upstream: gamma derived from the general one
+(`g² > 1.3 ? g²/2 : 0.7`), contrast 1.0, ClearType level 1.0, mode 5.
+
+`[Experimental] ClipBoxFix` (default 1) pads the metrics `GetGlyphOutline`
+reports for a metrics-only query — origin up by `floor(1.5·DPI/96)` px, black
+box grown the same, both capped to the font's ascent/height — so apps that
+clip glyphs to those metrics (Java2D) do not cut off the heavier rendered
+glyphs. Per-process sections such as `[Experimental@idea64.exe]` are read
+by upstream only; the core has no per-process settings.
 
 ### 2.2 Menu order
 

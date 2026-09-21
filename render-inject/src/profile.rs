@@ -87,6 +87,7 @@ pub(crate) unsafe fn reload_profile() {
             st.profile = p;
         }
     }
+    crate::dwrite::refresh_dw_rendering(&p);
     log(&format!("reloaded profile {}", path.as_deref().unwrap_or("(default)")));
 }
 
