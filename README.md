@@ -26,7 +26,8 @@ Windows のフォント描画チューナ。上流の非公開 (Delphi 製) ト�
 
 - **Chrome / Edge のレンダラー / GPU プロセスには描画差し替えを適用できない。**
   これらのプロセスは `MITIGATION_FORCE_MS_SIGNED_BINS` (Microsoft 署名必須) により
-  未署名 DLL の読み込みを拒否するため、`RenderCore64.dll` を注入できない。
+  未署名 DLL の読み込みを拒否する。
+  そのため `RenderCore64.dll` を注入できない。
   crashpad-handler や utility など、この緩和が無い子プロセスには注入される。
   レンダラーに適用するにはブラウザ側で `RendererCodeIntegrityEnabled=0` ポリシーの
   設定が必要 (サンドボックスの保護を下げるため本ソフトでは設定しない)。

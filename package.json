@@ -1,0 +1,15 @@
+{
+  "name": "font-tuner-docs",
+  "version": "0.0.0",
+  "private": true,
+  "description": "font-tuner の日本語ドキュメント (README/NOTICE/AGENTS) の textlint 設定。配布物ではない",
+  "scripts": {
+    "lint:text": "textlint README.md NOTICE.md AGENTS.md",
+    "lint:text:fix": "textlint --fix README.md NOTICE.md AGENTS.md"
+  },
+  "devDependencies": {
+    "textlint": "^15.8.0",
+    "textlint-rule-preset-ja-technical-writing": "^12.0.2",
+    "textlint-rule-prh": "^6.1.0"
+  }
+}

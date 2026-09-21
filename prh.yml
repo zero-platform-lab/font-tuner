@@ -1,0 +1,21 @@
+version: 1
+# AI っぽい/不自然な言い回しの辞書。textlint-rule-prh が pattern を検出し expected を提案する。
+# 誤検出を避けるため、文脈によらずほぼ不自然なものだけを入れる。指摘が出たら1件足す。
+rules:
+  - expected: 特にハマりやすいのは
+    pattern: 効く罠
+  - expected: これが
+    pattern: これこそが
+  - expected: と言える
+    patterns:
+      - と言えよう
+      - と言えるでしょう
+  - expected: 実際に確認する
+    patterns:
+      - 現実を見る
+      - 現実を見ます
+      - 現実を見て
+  - expected: チェックリスト
+    pattern: ルーブリック
+  - expected: カタカナ語
+    pattern: 借用語

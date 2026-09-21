@@ -4,3 +4,4 @@
 /build/pkg/
 /dist/
 /vendor/mactype/x64/
+node_modules/

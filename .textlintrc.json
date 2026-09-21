@@ -1,0 +1,9 @@
+{
+  "rules": {
+    "preset-ja-technical-writing": {
+      "ja-no-mixed-period": false,
+      "sentence-length": { "max": 150 }
+    },
+    "prh": { "rulePaths": ["./prh.yml"] }
+  }
+}
