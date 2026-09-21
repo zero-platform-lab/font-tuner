@@ -1,4 +1,4 @@
-#![allow(non_snake_case)] // crate/DLL name RenderCore64 mirrors MacType64.Core
+#![allow(non_snake_case)] // DLL name RenderCore64 / Win32 export names
 //! render-inject — the DLL injected into each process. On load it hooks the
 //! text-drawing entry points and renders with `render-core`, replacing Windows'
 //! own text rendering inside whatever process this DLL was injected into:
@@ -23,8 +23,8 @@ use std::collections::HashMap;
 
 use render_core::render::{draw_glyphs_onto, draw_text_onto, glyph_run_coverage_lcd, Canvas, Ink};
 use render_core::{tables_for, Aa, Ft, Profile, Tables};
-use windows::core::{s, w, Interface, BOOL, GUID, HRESULT};
-use windows::Win32::Foundation::{HINSTANCE, RECT};
+use windows::core::{PCWSTR, s, w, Interface, BOOL, GUID, HRESULT};
+use windows::Win32::Foundation::{HINSTANCE, HMODULE, RECT};
 use windows::Win32::Graphics::Direct2D::{ID2D1Brush, ID2D1GdiInteropRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_DC_INITIALIZE_MODE_COPY};
 use windows_numerics::Vector2;
 use windows::Win32::Graphics::DirectWrite::{
@@ -36,7 +36,10 @@ use windows::Win32::Graphics::Gdi::{
     GetTextMetricsW, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HDC, LOGFONTW,
     OBJ_FONT, SRCCOPY, TEXTMETRICW,
 };
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW, GetProcAddress,
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+};
 use windows::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS};
 use windows::Win32::System::Threading::{
     CreateThread, GetCurrentProcessId, THREAD_CREATION_FLAGS,
@@ -74,6 +77,7 @@ type FnCreateAlphaTexture = unsafe extern "system" fn(
     *mut c_void, i32, *const RECT, *mut u8, u32,
 ) -> HRESULT;
 static mut ORIG_CGRA: Option<FnCreateGlyphRunAnalysis> = None;
+static mut CGRA_SLOT: *mut usize = std::ptr::null_mut();
 static mut ORIG_CAT: Option<FnCreateAlphaTexture> = None;
 static mut CAT_SLOT: *mut usize = std::ptr::null_mut();
 static ANALYSES: Mutex<Option<HashMap<usize, RunInfo>>> = Mutex::new(None);
@@ -95,33 +99,29 @@ fn log(msg: &str) {
     }
 }
 
-/// Path the tray writes the active profile to: %LOCALAPPDATA%\font-tuner\profile.ini
-fn profile_path() -> Option<String> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|b| PathBuf::from(b).join("font-tuner").join("profile.ini"))
-        .map(|p| p.to_string_lossy().into_owned())
+static mut SELF_HINST: HINSTANCE = HINSTANCE(std::ptr::null_mut());
+
+/// Directory this DLL was loaded from (the install dir: font-tuner.ini + ini\).
+unsafe fn self_dir() -> Option<PathBuf> {
+    let mut buf = [0u16; 260];
+    let n = GetModuleFileNameW(Some(SELF_HINST.into()), &mut buf);
+    if n == 0 { return None; }
+    PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])).parent().map(|p| p.to_path_buf())
 }
 
-/// Reload TABLES/PROFILE when the profile file changes (tray profile switch).
-fn watch_profile(path: String) {
-    let mtime = |p: &str| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
-    let mut last = mtime(&path);
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let cur = mtime(&path);
-        if cur != last {
-            last = cur;
-            if let Some(p) = Profile::from_ini(&path) {
-                if RENDER_LOCK.lock().is_ok() {
-                    unsafe {
-                        TABLES = Some(tables_for(&p));
-                        PROFILE = Some(p);
-                    }
-                }
-                log("profile reloaded");
-            }
-        }
-    }
+/// The profile the tray selected: `[General] AlternativeFile=ini\<name>.ini`
+/// in the install dir's font-tuner.ini, resolved relative to that dir. Read once
+/// at attach; a switch takes effect for processes started afterwards. (No
+/// live reload on purpose: a watcher thread sleeping inside this DLL wakes
+/// up after the bootstrap has unmapped us and crashes the host.)
+unsafe fn profile_path() -> Option<String> {
+    let dir = self_dir()?;
+    let text = std::fs::read_to_string(dir.join("font-tuner.ini")).ok()?;
+    let rel = text.lines().map(str::trim)
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == "AlternativeFile")
+        .map(|(_, v)| v.trim().to_string())?;
+    Some(dir.join(rel).to_string_lossy().into_owned())
 }
 
 /// Resolve the DC's font into render-core (returns the pixel size), or None.
@@ -408,6 +408,7 @@ unsafe fn setup_dwrite_hook() {
     let mut fp = PAGE_PROTECTION_FLAGS(0);
     if VirtualProtect(fslot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut fp).is_ok() {
         ORIG_CGRA = Some(std::mem::transmute::<usize, FnCreateGlyphRunAnalysis>(*fslot));
+        CGRA_SLOT = fslot;
         *fslot = cgra_detour as usize;
         let _ = VirtualProtect(fslot as *const c_void, 8, fp, &mut fp);
         log("hook installed on CreateGlyphRunAnalysis");
@@ -459,11 +460,11 @@ unsafe extern "system" fn cat_detour(
 }
 
 unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Option<()> {
-    let ft = FT.as_ref()?;
-    let profile = PROFILE.as_ref()?;
     let (w, h) = ((b.right - b.left) as usize, (b.bottom - b.top) as usize);
     if w == 0 || h == 0 || w * h * 3 != size as usize { return None; }
     let mut cache = RENDER_LOCK.lock().ok()?;
+    let ft = FT.as_ref()?;
+    let profile = PROFILE.as_ref()?;
     let m = ANALYSES.lock().ok()?;
     let info = m.as_ref()?.get(&(this as usize))?;
     let key = format!("dwa:{:p}", this);
@@ -495,7 +496,9 @@ type FnCreateHwndRT = unsafe extern "system" fn(*mut c_void, *const c_void, *con
 type FnD2DDrawGlyphRun = unsafe extern "system" fn(*mut c_void, Vector2, *const DWRITE_GLYPH_RUN, *mut c_void, i32);
 static mut ORIG_D2DCF: Option<FnD2DCreateFactory> = None;
 static mut ORIG_DCRT: Option<FnCreateDCRT> = None;
+static mut DCRT_SLOT: *mut usize = std::ptr::null_mut();
 static mut ORIG_HWNDRT: Option<FnCreateHwndRT> = None;
+static mut HWNDRT_SLOT: *mut usize = std::ptr::null_mut();
 static D2D_DGR_ORIG: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None); // rt vtable -> orig DrawGlyphRun
 static D2D_CAPTURED: AtomicBool = AtomicBool::new(false); // log the first D2D substitution once
 
@@ -514,10 +517,10 @@ unsafe extern "system" fn d2dcf_detour(ftype: i32, riid: *const GUID, opts: *con
         let vtbl = *(*out as *mut *mut usize);
         // ID2D1Factory: CreateHwndRenderTarget = slot 14, CreateDCRenderTarget = slot 16
         if ORIG_HWNDRT.is_none() {
-            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { ORIG_HWNDRT = Some(std::mem::transmute(o)); }
+            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { ORIG_HWNDRT = Some(std::mem::transmute(o)); HWNDRT_SLOT = vtbl.add(14); }
         }
         if ORIG_DCRT.is_none() {
-            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { ORIG_DCRT = Some(std::mem::transmute(o)); }
+            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { ORIG_DCRT = Some(std::mem::transmute(o)); DCRT_SLOT = vtbl.add(16); }
         }
         log("hook installed on D2D1Factory render-target creation");
     }
@@ -573,10 +576,10 @@ unsafe fn d2d_brush_ink(brush: *mut c_void) -> Ink {
 }
 
 unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_RUN, brush: *mut c_void) -> Option<()> {
+    let mut cache = RENDER_LOCK.lock().ok()?;
     let ft = FT.as_ref()?;
     let tables = TABLES.as_ref()?;
     let profile = PROFILE.as_ref()?;
-    let mut cache = RENDER_LOCK.lock().ok()?;
     let (bytes, index) = dwrite_font_bytes(r)?;
     let key = format!("d2d:{index}:{}", bytes.len());
     if cache.as_deref() != Some(key.as_str()) {
@@ -664,13 +667,9 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     // Use the active font-tuner profile if present, else the default.
     let path = profile_path();
     let p = path.as_deref().and_then(Profile::from_ini).unwrap_or_else(Profile::clean_greyscale);
-    log(&format!("profile: {p:?}"));
+    log(&format!("profile {}: {p:?}", path.as_deref().unwrap_or("(default)")));
     TABLES = Some(tables_for(&p));
     PROFILE = Some(p);
-    // Watch the profile file so tray profile switches take effect live.
-    if let Some(path) = path {
-        std::thread::spawn(move || watch_profile(path));
-    }
 
     let Ok(gdi32) = GetModuleHandleW(w!("gdi32.dll")) else { return 1 };
     let Some(target) = GetProcAddress(gdi32, s!("ExtTextOutW")) else { return 1 };
@@ -691,40 +690,42 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
 }
 
 #[no_mangle]
-pub extern "system" fn DllMain(_hinst: HINSTANCE, reason: u32, _reserved: *mut c_void) -> BOOL {
+pub extern "system" fn DllMain(hinst: HINSTANCE, reason: u32, reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
+            SELF_HINST = hinst;
+            // Pin ourselves for the life of the process. This DLL is mapped
+            // into every GUI process by the tray's WH_GETMESSAGE hook; when
+            // that hook goes away (tray off / exit / MSI upgrade / uninstall)
+            // Windows FreeLibrary's us in every one of them at once. If any
+            // code of ours can still run afterwards — the on_attach thread
+            // still starting up, a thread inside a detour rendering glyphs —
+            // that process executes unmapped memory and dies, and so does
+            // every other process on the machine. Pinning makes FreeLibrary a
+            // no-op, so the hooks simply stay installed until the process
+            // exits. Contract: turning font-tuner off, switching profile and
+            // upgrading all take effect for processes started afterwards;
+            // running processes keep what they have.
+            let mut me = HMODULE::default();
+            let _ = GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                PCWSTR(DllMain as *const () as *const u16),
+                &mut me,
+            );
             let _ = CreateThread(None, 0, Some(on_attach), None, THREAD_CREATION_FLAGS(0), None);
         }
     } else if reason == DLL_PROCESS_DETACH {
-        // Remove our hooks before the DLL unmaps, so no code points into freed
-        // memory (which would crash the host process on the next text draw).
-        unsafe {
-            let _ = minhook::MinHook::disable_all_hooks();
-            if let (Some(orig), false) = (ORIG_DGR, DGR_SLOT.is_null()) {
-                let mut oldp = PAGE_PROTECTION_FLAGS(0);
-                if VirtualProtect(DGR_SLOT as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_ok() {
-                    *DGR_SLOT = orig as usize;
-                    let _ = VirtualProtect(DGR_SLOT as *const c_void, 8, oldp, &mut oldp);
-                }
-            }
-            // Restore every patched Direct2D DrawGlyphRun slot (keyed by vtable).
-            if let Ok(m) = D2D_DGR_ORIG.lock() {
-                if let Some(map) = m.as_ref() {
-                    for (&vptr, &orig) in map {
-                        let slot = (vptr as *mut usize).add(29);
-                        let _ = patch_slot(slot, orig);
-                    }
-                }
-            }
-        }
+        // Pinned above, so this only ever runs at process termination. The
+        // process is being torn down and will not draw again; touching
+        // vtables or MinHook (thread suspension) here is pointless and can
+        // itself fault. Do nothing, as the C++ core does on termination.
     }
     BOOL(1)
 }
 
 /// WH_GETMESSAGE hook procedure. Its only purpose is to make Windows map this
 /// DLL into every GUI process that pumps messages (which runs DllMain, which
-/// installs our text hooks) — the same auto-injection mechanism MacType uses.
+/// installs our text hooks) — the same auto-injection mechanism the C++ core uses.
 #[no_mangle]
 pub extern "system" fn GetMsgProc(
     code: i32,

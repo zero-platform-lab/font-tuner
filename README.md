@@ -1,7 +1,7 @@
 # Font-tuner
 
-MacType のトレイローダ。非公開 (Delphi 製) の MacTray / MacWiz / ブートストラップを使わず、
-公開ソースの描画 DLL (`MacType64.Core.dll`) を自前でビルドして同梱する。
+Windows のフォント描画チューナ。上流の非公開 (Delphi 製) トレイ / ウィザード / ブートストラップを使わず、
+公開ソースの描画 DLL (`RenderCore64.dll`) を自前でビルドして同梱する。
 
 - 64bit プロセスのみ (32bit は対象外)
 - Windows 11 前提
@@ -16,7 +16,7 @@ MacType のトレイローダ。非公開 (Delphi 製) の MacTray / MacWiz / �
 | 項目 | 動作 |
 |---|---|
 | 有効 | フックの ON/OFF。OFF にしても既に DLL を読み込み済みのプロセスからは DLL をアンロードしない。以降に起動するプロセスへ注入しなくなるだけ |
-| プロファイル | `ini\*.ini` の一覧。選ぶと `MacType.ini` の `AlternativeFile=` を書き換える。新規プロセスから反映 |
+| プロファイル | `ini\*.ini` の一覧。選ぶと `font-tuner.ini` の `AlternativeFile=` を書き換える。新規プロセスから反映 |
 | システムフォント | シェルの UI フォントを切替 (BIZ UDPゴシック / BIZ UDゴシック / Noto Sans JP / メイリオ)。初回に元設定を退避し「既定に戻す」で復元 |
 | 終了 | フックを外して終了 |
 
@@ -26,7 +26,7 @@ MacType のトレイローダ。非公開 (Delphi 製) の MacTray / MacWiz / �
 
 - **Chrome / Edge のレンダラー / GPU プロセスには描画差し替えを適用できない。**
   これらのプロセスは `MITIGATION_FORCE_MS_SIGNED_BINS` (Microsoft 署名必須) により
-  未署名 DLL の読み込みを拒否するため、`MacType64.Core.dll` を注入できない。
+  未署名 DLL の読み込みを拒否するため、`RenderCore64.dll` を注入できない。
   crashpad-handler や utility など、この緩和が無い子プロセスには注入される。
   レンダラーに適用するにはブラウザ側で `RendererCodeIntegrityEnabled=0` ポリシーの
   設定が必要 (サンドボックスの保護を下げるため本ソフトでは設定しない)。
@@ -51,8 +51,8 @@ cd font-tuner
 
 ## 仕組み
 
-`SetWindowsHookEx(WH_GETMESSAGE)` のフックプロシージャに `MacType64.Core.dll` が export する `GetMsgProc` を指定するだけ。
-これで GUI を持つ全 64bit プロセスに DLL がマップされ、DLL 側の `DllMain` が自分の隣の `MacType.ini` を読んで GDI / DirectWrite をフックする。
+`SetWindowsHookEx(WH_GETMESSAGE)` のフックプロシージャに `RenderCore64.dll` が export する `GetMsgProc` を指定するだけ。
+これで GUI を持つ全 64bit プロセスに DLL がマップされ、DLL 側の `DllMain` が自分の隣の `font-tuner.ini` を読んで GDI / DirectWrite をフックする。
 Font-tuner 自身は `[UnloadDll]` に載せてあり、描画差し替えの対象外。
 
 Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.

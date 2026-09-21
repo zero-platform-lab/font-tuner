@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
-//! MTBootStrap64.dll: the file the MacType core loads into every child
+//! RenderBootstrap64.dll: the file the core loads into every child
 //! process it spawns (expfunc.cpp, GdippInjectDLL). The real one is closed
-//! source; all we need it to do is pull MacType64.Core.dll from the same
+//! source; all we need it to do is pull RenderCore64.dll from the same
 //! folder, whose DllMain then hooks the process on its own.
 //!
 //! Scope: this reaches ordinary child processes (e.g. Chrome's
@@ -20,7 +20,7 @@ use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::System::Threading::{CreateThread, THREAD_CREATION_FLAGS};
 use windows::core::PCWSTR;
 
-const CORE: &str = "MacType64.Core.dll";
+const CORE: &str = "RenderCore64.dll";
 
 #[unsafe(no_mangle)]
 extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *const c_void) -> i32 {

@@ -10,7 +10,7 @@ name = "font-tuner"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "Tray loader for MacType (replacement for the closed-source MacTray)"
+description = "Font rendering tuner for Windows (tray + RenderCore64 injector)"
 repository = "https://github.com/zero-platform-Lab/font-tuner"
 
 [dependencies.windows]

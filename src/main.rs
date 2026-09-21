@@ -1,7 +1,7 @@
-//! font-tuner: a small tray loader for MacType.
+//! font-tuner: a small tray loader for the RenderCore64 text-rendering DLL.
 //!
 //! It does what the closed-source MacTray does in "tray mode": install a
-//! global WH_GETMESSAGE hook whose procedure lives in MacType64.dll, so that
+//! global WH_GETMESSAGE hook whose procedure lives in RenderCore64.dll, so that
 //! every 64-bit GUI process maps the DLL and its DllMain hooks the font APIs.
 //! 32-bit processes are out of scope.
 
@@ -88,19 +88,19 @@ fn msgbox(text: &str) {
     }
 }
 
-/// The MacType install folder: next to this exe, else the default location.
-fn mactype_dir() -> Option<PathBuf> {
+/// The Font-tuner install folder: next to this exe, else the default location.
+fn install_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let here = exe.parent()?.to_path_buf();
     if here.join(DLL_NAME).exists() {
         return Some(here);
     }
     let pf = std::env::var_os("ProgramFiles")?;
-    let d = Path::new(&pf).join("MacType");
+    let d = Path::new(&pf).join("Font-tuner");
     d.join(DLL_NAME).exists().then_some(d)
 }
 
-/// A global WH_GETMESSAGE hook backed by MacType's exported `GetMsgProc`.
+/// A global WH_GETMESSAGE hook backed by RenderCore64's exported `GetMsgProc`.
 struct Hook {
     hhook: HHOOK,
 }
@@ -156,7 +156,7 @@ impl Profiles {
             let rank = ORDER.iter().position(|o| *o == lower).unwrap_or(ORDER.len());
             (rank, lower)
         });
-        Profiles { ini: dir.join("MacType.ini"), names }
+        Profiles { ini: dir.join("font-tuner.ini"), names }
     }
 
     fn ini_path(&self) -> Vec<u16> {
@@ -391,7 +391,7 @@ fn handle_command(hwnd: HWND, cmd: usize) {
 
 fn main() {
     let s = lang::current();
-    let Some(dir) = mactype_dir() else {
+    let Some(dir) = install_dir() else {
         msgbox(s.err_no_dll);
         return;
     };

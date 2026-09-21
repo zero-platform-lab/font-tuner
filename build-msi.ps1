@@ -1,8 +1,8 @@
 # Build everything and wrap it in an MSI with WiX v6:
 #   1. native static libs incl. the FreeType fork (build-core.ps1)
 #   2. RenderCore64.dll = the Rust render-inject core (links render-core)
-#   3. font-tuner.exe + MTBootStrap64.dll (release, workspace)
-#   4. build/pkg = exe + DLLs + MacType.ini + ini\*.ini
+#   3. font-tuner.exe + RenderBootstrap64.dll (release, workspace)
+#   4. build/pkg = exe + DLLs + font-tuner.ini + ini\*.ini
 #   5. wix build
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
@@ -22,13 +22,13 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $stage = "$PSScriptRoot\build\pkg"
 # Clean the stage each run: it is harvested wholesale (ini\*.ini via WiX Files,
 # and the DLLs by name), so stale files from an earlier build — removed
-# profiles, the old MacType core — would otherwise leak into the MSI.
+# profiles, the old C++ core — would otherwise leak into the MSI.
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage, "$stage\ini", dist | Out-Null
 Copy-Item target\release\font-tuner.exe $stage -Force
-Copy-Item target\release\MTBootStrap64.dll $stage -Force
+Copy-Item target\release\RenderBootstrap64.dll $stage -Force
 Copy-Item render-inject\target\release\RenderCore64.dll $stage -Force
-Copy-Item profiles\MacType.ini $stage -Force
+Copy-Item profiles\font-tuner.ini $stage -Force
 Copy-Item profiles\ini\*.ini "$stage\ini" -Force
 
 wix build wix\font-tuner.wxs -ext WixToolset.Util.wixext -arch x64 `

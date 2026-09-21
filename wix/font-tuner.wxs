@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Font-tuner installer. Self-contained: ships font-tuner.exe, the MacType core
+  Font-tuner installer. Self-contained: ships font-tuner.exe, the RenderCore64 core
   DLL built from source, and the rendering profiles. Registers Font-tuner to run
   at logon, stops the closed-source MacTray if it is running, and starts it.
 -->
@@ -18,7 +18,7 @@
 
     <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
 
-    <!-- MTBootStrap64.dll is injected into every process on the machine, so it
+    <!-- RenderCore64.dll (and RenderBootstrap64.dll) is injected into every process on the machine, so it
          is always "in use" by the user's terminal, shell, editor, etc.  With the
          Restart Manager enabled, msiexec would close ALL of those to replace the
          DLL - it has killed the user's PowerShell / Claude Code session more
@@ -49,15 +49,15 @@
       <Component Id="BootstrapDll">
         <!-- Child-process loader stub the core injects into every process it
              spawns (expfunc.cpp GdippInjectDLL). Rust replacement for the
-             closed-source MTBootStrap64.dll. Reaches ordinary child processes
+             closed-source upstream bootstrap. Reaches ordinary child processes
              (e.g. Chrome's crashpad-handler / utility processes); it does NOT
              reach Chrome/Edge renderer & GPU processes, which block unsigned
              DLLs via MITIGATION_FORCE_MS_SIGNED_BINS. -->
-        <File Id="MTBootStrap64.dll" Source="$(var.StageDir)\MTBootStrap64.dll" />
+        <File Id="RenderBootstrap64.dll" Source="$(var.StageDir)\RenderBootstrap64.dll" />
       </Component>
       <Component Id="MainIni" NeverOverwrite="yes" Permanent="no">
         <!-- User-edited; never clobbered on upgrade. -->
-        <File Id="MacType.ini" Source="$(var.StageDir)\MacType.ini" />
+        <File Id="FontTunerIni" Source="$(var.StageDir)\font-tuner.ini" />
       </Component>
     </ComponentGroup>
 
