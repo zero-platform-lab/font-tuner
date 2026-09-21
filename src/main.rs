@@ -14,14 +14,14 @@ mod sysfont;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::*;
-use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::System::Registry::*;
-use windows::Win32::System::Threading::*;
-use windows::Win32::System::WindowsProgramming::*;
-use windows::Win32::UI::Shell::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{w, PCSTR, PCWSTR};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::Threading::{CreateMutexW};
+use windows::Win32::System::WindowsProgramming::{GetPrivateProfileStringW, WritePrivateProfileStringW};
+use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE, Shell_NotifyIconW};
+use windows::Win32::UI::WindowsAndMessaging::{WM_DESTROY, WM_SETTINGCHANGE, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HHOOK, HICON, HMENU, HOOKPROC, HWND_BROADCAST, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, SetWindowsHookExW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_GETMESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW};
+use windows::core::{s, w, PCWSTR};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_ENABLED: usize = 1;
@@ -43,7 +43,9 @@ fn taskbar_is_light() -> bool {
     let sub = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
     let name = wide("SystemUsesLightTheme");
     let mut data: u32 = 0;
-    let mut size = std::mem::size_of::<u32>() as u32;
+    let mut size = struct_size::<u32>();
+    // SAFETY: the key/value names are NUL-terminated, `data` is a DWORD and
+    // `size` says so; all outlive the call.
     let r = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -51,8 +53,8 @@ fn taskbar_is_light() -> bool {
             PCWSTR(name.as_ptr()),
             RRF_RT_REG_DWORD,
             None,
-            Some(&mut data as *mut _ as *mut _),
-            Some(&mut size),
+            Some((&raw mut data).cast()),
+            Some(&raw mut size),
         )
     };
     r == ERROR_SUCCESS && data != 0
@@ -61,6 +63,8 @@ fn taskbar_is_light() -> bool {
 /// Load the small (tray-sized) themed icon from our own resources.
 fn load_tray_icon(light: bool) -> HICON {
     let id = if light { IDI_TRAY_LIGHT } else { IDI_TRAY_DARK };
+    // SAFETY: a MAKEINTRESOURCE id from our own resource script, loaded
+    // from our own module; the fallback is a stock icon.
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap_or_default();
         let cx = GetSystemMetrics(SM_CXSMICON);
@@ -83,9 +87,15 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// `sizeof(T)` as the `cbSize` value Win32 structs carry.
+fn struct_size<T>() -> u32 {
+    u32::try_from(std::mem::size_of::<T>()).expect("Win32 structs are far smaller than 4 GiB")
+}
+
 fn msgbox(text: &str) {
     let t = wide(text);
     let c = wide("Font-tuner");
+    // SAFETY: both strings are NUL-terminated and outlive the modal call.
     unsafe {
         MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONERROR);
     }
@@ -95,6 +105,7 @@ fn msgbox(text: &str) {
 fn infobox(text: &str) {
     let t = wide(text);
     let c = wide("Font-tuner");
+    // SAFETY: as in `msgbox`.
     unsafe {
         MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
     }
@@ -121,6 +132,9 @@ fn install_dir() -> Option<PathBuf> {
 /// would land on random bytes in them and they would all crash on their next
 /// message. So the tray refuses to hook a core whose export has moved.
 const HOOK_PROC_RVA: usize = 0x1000;
+
+/// The function type behind `HOOKPROC` (`Option<HookProcFn>`).
+type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 
 /// A global WH_GETMESSAGE hook backed by RenderCore64's exported `GetMsgProc`.
 struct Hook {
@@ -153,16 +167,18 @@ impl Hook {
             return Err(HookError::Stale(stale));
         }
         let path = wide(dll.to_str().ok_or(HookError::Install)?);
+        // SAFETY: `path` is NUL-terminated; the export name is a literal;
+        // GetMsgProc is written with HOOKPROC's exact signature, which the
+        // transmute types; the DLL stays loaded (it pins itself).
         unsafe {
             let hmod = LoadLibraryW(PCWSTR(path.as_ptr())).map_err(|_| HookError::Install)?;
-            let proc_ = GetProcAddress(hmod, PCSTR(b"GetMsgProc\0".as_ptr())).ok_or(HookError::Install)?;
+            let proc_ = GetProcAddress(hmod, s!("GetMsgProc")).ok_or(HookError::Install)?;
             // The mapped image must agree with the file we just inspected.
-            if proc_ as usize - hmod.0 as usize != HOOK_PROC_RVA {
+            if (proc_ as *const ()).addr().wrapping_sub(hmod.0.addr()) != HOOK_PROC_RVA {
                 return Err(HookError::Layout);
             }
-            let hookproc: HOOKPROC = Some(std::mem::transmute(proc_));
-            let hhook = SetWindowsHookExW(WH_GETMESSAGE, hookproc, Some(HINSTANCE(hmod.0)), 0)
-                .map_err(|_| HookError::Install)?;
+            let hookproc: HOOKPROC = Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, HookProcFn>(proc_));
+            let hhook = SetWindowsHookExW(WH_GETMESSAGE, hookproc, Some(HINSTANCE(hmod.0)), 0).map_err(|_| HookError::Install)?;
             Ok(Hook { hhook })
         }
     }
@@ -170,6 +186,7 @@ impl Hook {
 
 impl Drop for Hook {
     fn drop(&mut self) {
+        // SAFETY: unhooking the hook `install` set, once.
         unsafe {
             let _ = UnhookWindowsHookEx(self.hhook);
         }
@@ -183,15 +200,6 @@ struct Profiles {
 
 impl Profiles {
     fn load(dir: &Path) -> Profiles {
-        let mut names: Vec<String> = std::fs::read_dir(dir.join("ini"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                let n = e.file_name().into_string().ok()?;
-                n.to_ascii_lowercase().ends_with(".ini").then_some(n)
-            })
-            .collect();
         // Preferred menu order: greyscale pair first, then Accurate, then the
         // LCD "Clean" series. Anything else falls in afterwards, alphabetically.
         const ORDER: &[&str] = &[
@@ -201,6 +209,15 @@ impl Profiles {
             "clean sharp.ini",
             "clean sharp dark.ini",
         ];
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("ini"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().into_string().ok()?;
+                n.to_ascii_lowercase().ends_with(".ini").then_some(n)
+            })
+            .collect();
         names.sort_by_key(|n| {
             let lower = n.to_ascii_lowercase();
             let rank = ORDER.iter().position(|o| *o == lower).unwrap_or(ORDER.len());
@@ -217,6 +234,7 @@ impl Profiles {
     fn current(&self) -> String {
         let mut buf = [0u16; 260];
         let (sec, key, def, file) = (wide("General"), wide("AlternativeFile"), wide(""), self.ini_path());
+        // SAFETY: every string is NUL-terminated and `buf` outlives the call.
         let n = unsafe {
             GetPrivateProfileStringW(
                 PCWSTR(sec.as_ptr()),
@@ -233,6 +251,7 @@ impl Profiles {
     fn select(&self, name: &str) -> bool {
         let val = wide(&format!("ini\\{name}"));
         let (sec, key, file) = (wide("General"), wide("AlternativeFile"), self.ini_path());
+        // SAFETY: every string is NUL-terminated and outlives the call.
         unsafe {
             WritePrivateProfileStringW(
                 PCWSTR(sec.as_ptr()),
@@ -291,7 +310,7 @@ impl App {
 
     fn icon_data(&self) -> NOTIFYICONDATAW {
         let mut d = NOTIFYICONDATAW {
-            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            cbSize: struct_size::<NOTIFYICONDATAW>(),
             hWnd: self.hwnd,
             uID: 1,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
@@ -306,6 +325,7 @@ impl App {
     }
 
     fn update_icon(&self, how: NOTIFY_ICON_MESSAGE) {
+        // SAFETY: `icon_data` fills a complete NOTIFYICONDATAW for our window.
         unsafe {
             let _ = Shell_NotifyIconW(how, &self.icon_data());
         }
@@ -322,6 +342,7 @@ impl App {
         self.hicon = load_tray_icon(light);
         self.icon_light = light;
         self.update_icon(NIM_MODIFY);
+        // SAFETY: `old` is an icon we loaded and no longer reference.
         unsafe {
             let _ = DestroyIcon(old);
         }
@@ -330,6 +351,8 @@ impl App {
     fn build_menu(&mut self) -> HMENU {
         // Re-read ini\ each time so files added or removed show up without a restart.
         self.profiles = Profiles::load(&self.dir);
+        // SAFETY: menu handles created here are returned to the caller, which
+        // destroys them after TrackPopupMenu; every string is NUL-terminated.
         unsafe {
             let menu = CreatePopupMenu().unwrap_or_default();
             let sub = CreatePopupMenu().unwrap_or_default();
@@ -381,18 +404,22 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: a window procedure on our own window; every call below uses
+    // `hwnd` or values we own. `with_app` borrows are dropped before the
+    // modal TrackPopupMenu loop, which re-enters this procedure.
     unsafe {
         match msg {
             WM_TRAY => {
-                let ev = lparam.0 as u32;
+                // The low word carries the mouse event for NIF_MESSAGE icons.
+                let ev = u32::try_from(lparam.0 & 0xFFFF).unwrap_or(0);
                 if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP || ev == WM_CONTEXTMENU {
                     // Build the menu, then drop the borrow: TrackPopupMenu runs a
                     // modal loop that re-enters this procedure.
-                    let Some(menu) = with_app(|a| a.build_menu()) else {
+                    let Some(menu) = with_app(App::build_menu) else {
                         return LRESULT(0);
                     };
                     let mut pt = POINT::default();
-                    let _ = GetCursorPos(&mut pt);
+                    let _ = GetCursorPos(&raw mut pt);
                     let _ = SetForegroundWindow(hwnd);
                     let cmd = TrackPopupMenu(
                         menu,
@@ -402,8 +429,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         None,
                         hwnd,
                         None,
-                    )
-                    .0 as usize;
+                    );
+                    let cmd = usize::try_from(cmd.0).unwrap_or(0);
                     let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
                     let _ = DestroyMenu(menu);
                     handle_command(hwnd, cmd);
@@ -412,7 +439,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_SETTINGCHANGE => {
                 // Fires on theme (light/dark) changes; swap the icon if needed.
-                with_app(|a| a.refresh_theme_icon());
+                with_app(App::refresh_theme_icon);
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -443,11 +470,13 @@ fn handle_command(hwnd: HWND, cmd: usize) {
                 msgbox(&err);
             }
         }
+        // SAFETY: destroying our own window.
         ID_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
         },
         // Ask every injected process to re-read font-tuner.ini. The core's
         // GetMsgProc handles this message on each process's own UI thread.
+        // SAFETY: a static message name; broadcasting a registered message.
         ID_RELOAD => unsafe {
             let id = RegisterWindowMessageW(w!("FontTuner.ReloadProfile"));
             let _ = PostMessageW(Some(HWND_BROADCAST), id, WPARAM(0), LPARAM(0));
@@ -484,6 +513,9 @@ fn main() {
         msgbox(s.err_no_dll);
         return;
     };
+    // SAFETY: the tray's window setup and message loop: every string is
+    // NUL-terminated and lives to the end of `main`, the class/window are
+    // ours, and `msg` is our own MSG.
     unsafe {
         let name = wide("Local\\font-tuner");
         let _mutex = CreateMutexW(None, false, PCWSTR(name.as_ptr()));
@@ -500,7 +532,7 @@ fn main() {
             lpszClassName: PCWSTR(class.as_ptr()),
             ..Default::default()
         };
-        RegisterClassW(&wc);
+        RegisterClassW(&raw const wc);
         let Ok(hwnd) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(class.as_ptr()),
@@ -544,9 +576,9 @@ fn main() {
         }
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        while GetMessageW(&raw mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&raw const msg);
+            DispatchMessageW(&raw const msg);
         }
         APP.with(|a| *a.borrow_mut() = None);
     }

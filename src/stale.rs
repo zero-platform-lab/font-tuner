@@ -10,9 +10,9 @@
 
 use std::path::Path;
 
+use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS};
 use windows::Win32::Foundation::{CloseHandle, ERROR_BAD_LENGTH, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
@@ -27,6 +27,7 @@ use windows::Win32::System::Threading::{
 /// the hook DLL by path and maps the installed one as a separate image.
 pub fn holders_of_stale_core(dll_path: &Path, expected: usize) -> Vec<String> {
     let mut out = Vec::new();
+    // SAFETY: no arguments.
     let me = unsafe { GetCurrentProcessId() };
     for (pid, exe) in processes() {
         if pid == me {
@@ -51,18 +52,22 @@ fn wide_to_string(w: &[u16]) -> String {
     String::from_utf16_lossy(&w[..n])
 }
 
+/// `sizeof(T)` as the `dwSize` field Toolhelp structures want.
+fn struct_size<T>() -> u32 {
+    u32::try_from(std::mem::size_of::<T>()).expect("Win32 structs are far smaller than 4 GiB")
+}
+
 fn processes() -> Vec<(u32, String)> {
     let mut v = Vec::new();
+    // SAFETY: a Toolhelp walk over our own entry struct; the snapshot handle
+    // is closed before returning.
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return v };
-        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-        if Process32FirstW(snap, &mut e).is_ok() {
-            loop {
-                v.push((e.th32ProcessID, wide_to_string(&e.szExeFile)));
-                if Process32NextW(snap, &mut e).is_err() {
-                    break;
-                }
-            }
+        let mut e = PROCESSENTRY32W { dwSize: struct_size::<PROCESSENTRY32W>(), ..Default::default() };
+        let mut ok = Process32FirstW(snap, &raw mut e).is_ok();
+        while ok {
+            v.push((e.th32ProcessID, wide_to_string(&e.szExeFile)));
+            ok = Process32NextW(snap, &raw mut e).is_ok();
         }
         let _ = CloseHandle(snap);
     }
@@ -72,6 +77,7 @@ fn processes() -> Vec<(u32, String)> {
 /// Base address of the module loaded from `dll_path` in `pid`, if any.
 fn module_base(pid: u32, dll_path: &Path) -> Option<usize> {
     let want = dll_path.to_string_lossy();
+    // SAFETY: as in `processes`, with the retry Microsoft Learn asks for.
     unsafe {
         // A module snapshot fails with ERROR_BAD_LENGTH while the target is
         // mid-load; Microsoft Learn says to retry until it succeeds. Give up
@@ -88,18 +94,14 @@ fn module_base(pid: u32, dll_path: &Path) -> Option<usize> {
             }
         }
         let snap = snap?;
-        let mut e = MODULEENTRY32W { dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32, ..Default::default() };
+        let mut e = MODULEENTRY32W { dwSize: struct_size::<MODULEENTRY32W>(), ..Default::default() };
         let mut found = None;
-        if Module32FirstW(snap, &mut e).is_ok() {
-            loop {
-                if wide_to_string(&e.szExePath).eq_ignore_ascii_case(&want) {
-                    found = Some(e.modBaseAddr as usize);
-                    break;
-                }
-                if Module32NextW(snap, &mut e).is_err() {
-                    break;
-                }
+        let mut ok = Module32FirstW(snap, &raw mut e).is_ok();
+        while ok && found.is_none() {
+            if wide_to_string(&e.szExePath).eq_ignore_ascii_case(&want) {
+                found = Some(e.modBaseAddr.addr());
             }
+            ok = Module32NextW(snap, &raw mut e).is_ok();
         }
         let _ = CloseHandle(snap);
         found
@@ -110,16 +112,20 @@ struct Remote(HANDLE);
 
 impl Remote {
     fn open(pid: u32) -> Option<Remote> {
+        // SAFETY: the handle is closed in `drop`.
         unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok().map(Remote) }
     }
     fn exited(&self) -> bool {
+        // SAFETY: a zero-timeout wait on our own process handle.
         unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
     }
     fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; len];
         let mut got = 0usize;
+        // SAFETY: `buf` is `len` bytes; the remote address is only read, and
+        // a bad one fails the call rather than faulting us.
         unsafe {
-            ReadProcessMemory(self.0, addr as *const _, buf.as_mut_ptr() as *mut _, len, Some(&mut got)).ok()?;
+            ReadProcessMemory(self.0, std::ptr::with_exposed_provenance(addr), buf.as_mut_ptr().cast(), len, Some(&raw mut got)).ok()?;
         }
         (got == len).then_some(buf)
     }
@@ -133,6 +139,7 @@ impl Remote {
 
 impl Drop for Remote {
     fn drop(&mut self) {
+        // SAFETY: closing the handle `open` received, once.
         unsafe {
             let _ = CloseHandle(self.0);
         }

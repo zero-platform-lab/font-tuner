@@ -56,6 +56,7 @@ const JA: Strings = Strings {
 
 pub fn current() -> Strings {
     // Primary language id 0x11 = Japanese.
+    // SAFETY: no arguments, no preconditions.
     let lang = unsafe { GetUserDefaultUILanguage() };
     if lang & 0x3ff == 0x11 { JA } else { EN }
 }
