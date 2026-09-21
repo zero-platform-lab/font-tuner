@@ -23,8 +23,10 @@ use std::collections::HashMap;
 
 use render_core::render::{draw_glyphs_onto, draw_text_onto, glyph_run_coverage_lcd, Canvas, Ink};
 use render_core::{tables_for, Aa, Ft, Profile, Tables};
-use windows::core::{s, w, Interface, BOOL, HRESULT};
+use windows::core::{s, w, Interface, BOOL, GUID, HRESULT};
 use windows::Win32::Foundation::{HINSTANCE, RECT};
+use windows::Win32::Graphics::Direct2D::{ID2D1GdiInteropRenderTarget, ID2D1RenderTarget, D2D1_DC_INITIALIZE_MODE_COPY};
+use windows_numerics::Vector2;
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFontFile, DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN, DWRITE_MATRIX,
 };
@@ -486,6 +488,148 @@ unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Op
     Some(())
 }
 
+// ---- Direct2D (ID2D1RenderTarget::DrawGlyphRun) ----
+type FnD2DCreateFactory = unsafe extern "system" fn(i32, *const GUID, *const c_void, *mut *mut c_void) -> HRESULT;
+type FnCreateDCRT = unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+type FnCreateHwndRT = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+type FnD2DDrawGlyphRun = unsafe extern "system" fn(*mut c_void, Vector2, *const DWRITE_GLYPH_RUN, *mut c_void, i32);
+static mut ORIG_D2DCF: Option<FnD2DCreateFactory> = None;
+static mut ORIG_DCRT: Option<FnCreateDCRT> = None;
+static mut ORIG_HWNDRT: Option<FnCreateHwndRT> = None;
+static D2D_DGR_ORIG: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None); // rt vtable -> orig DrawGlyphRun
+
+unsafe fn patch_slot(slot: *mut usize, newv: usize) -> Option<usize> {
+    let mut oldp = PAGE_PROTECTION_FLAGS(0);
+    if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() { return None; }
+    let old = *slot;
+    *slot = newv;
+    let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
+    Some(old)
+}
+
+unsafe extern "system" fn d2dcf_detour(ftype: i32, riid: *const GUID, opts: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    let hr = (ORIG_D2DCF.unwrap())(ftype, riid, opts, out);
+    if hr.is_ok() && !out.is_null() && !(*out).is_null() {
+        let vtbl = *(*out as *mut *mut usize);
+        // ID2D1Factory: CreateHwndRenderTarget = slot 14, CreateDCRenderTarget = slot 16
+        if ORIG_HWNDRT.is_none() {
+            if let Some(o) = patch_slot(vtbl.add(14), create_hwnd_detour as usize) { ORIG_HWNDRT = Some(std::mem::transmute(o)); }
+        }
+        if ORIG_DCRT.is_none() {
+            if let Some(o) = patch_slot(vtbl.add(16), create_dc_detour as usize) { ORIG_DCRT = Some(std::mem::transmute(o)); }
+        }
+        log("hook installed on D2D1Factory render-target creation");
+    }
+    hr
+}
+
+unsafe extern "system" fn create_dc_detour(this: *mut c_void, props: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    let hr = (ORIG_DCRT.unwrap())(this, props, out);
+    if hr.is_ok() && !out.is_null() && !(*out).is_null() { patch_rt_dgr(*out); }
+    hr
+}
+unsafe extern "system" fn create_hwnd_detour(this: *mut c_void, p1: *const c_void, p2: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    let hr = (ORIG_HWNDRT.unwrap())(this, p1, p2, out);
+    if hr.is_ok() && !out.is_null() && !(*out).is_null() { patch_rt_dgr(*out); }
+    hr
+}
+
+unsafe fn patch_rt_dgr(rt: *mut c_void) {
+    let vtbl = *(rt as *mut *mut usize);
+    let vptr = vtbl as usize;
+    let Ok(mut m) = D2D_DGR_ORIG.lock() else { return };
+    let map = m.get_or_insert_with(HashMap::new);
+    if map.contains_key(&vptr) { return; }
+    if let Some(old) = patch_slot(vtbl.add(29), d2d_dgr_detour as usize) {
+        map.insert(vptr, old);
+        log("hook installed on D2D DrawGlyphRun");
+    }
+}
+
+unsafe extern "system" fn d2d_dgr_detour(this: *mut c_void, baseline: Vector2, run: *const DWRITE_GLYPH_RUN, brush: *mut c_void, measuring: i32) {
+    if !run.is_null() && d2d_substitute(this, baseline, &*run).is_some() {
+        return;
+    }
+    let vptr = *(this as *const usize); // this's vtable pointer
+    let orig = D2D_DGR_ORIG.lock().ok().and_then(|m| m.as_ref().and_then(|map| map.get(&vptr).copied()));
+    if let Some(o) = orig {
+        let f: FnD2DDrawGlyphRun = std::mem::transmute(o);
+        f(this, baseline, run, brush, measuring);
+    }
+}
+
+unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_RUN) -> Option<()> {
+    let ft = FT.as_ref()?;
+    let tables = TABLES.as_ref()?;
+    let profile = PROFILE.as_ref()?;
+    let mut cache = RENDER_LOCK.lock().ok()?;
+    let (bytes, index) = dwrite_font_bytes(r)?;
+    let key = format!("d2d:{index}:{}", bytes.len());
+    if cache.as_deref() != Some(key.as_str()) {
+        ft.reface_memory_index(&bytes, index as i64).ok()?;
+        *cache = Some(key);
+    }
+    let px = r.fontEmSize.round() as i32;
+    let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
+    let adv: f32 = if r.glyphAdvances.is_null() { 0.0 }
+        else { std::slice::from_raw_parts(r.glyphAdvances, r.glyphCount as usize).iter().sum() };
+
+    let rt = ID2D1RenderTarget::from_raw_borrowed(&this)?;
+    let gi: ID2D1GdiInteropRenderTarget = rt.cast().ok()?;
+    let hdc = gi.GetDC(D2D1_DC_INITIALIZE_MODE_COPY).ok()?;
+
+    // region around the text baseline
+    let bx = baseline.X.round() as i32;
+    let by = baseline.Y.round() as i32;
+    let rw = (adv.ceil() as i32 + px).clamp(1, 8192);
+    let rh = (px * 2).clamp(1, 8192);
+    let rx = bx;
+    let ry = by - px - px / 4;
+
+    let memdc = CreateCompatibleDC(Some(hdc));
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: rw, biHeight: -rh, biPlanes: 1, biBitCount: 32, biCompression: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let hbmp = CreateDIBSection(Some(memdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    let old = SelectObject(memdc, hbmp.into());
+    let _ = BitBlt(memdc, 0, 0, rw, rh, Some(hdc), rx, ry, SRCCOPY);
+    let dib = std::slice::from_raw_parts_mut(bits as *mut u8, (rw * rh * 4) as usize);
+    let mut canvas = Canvas::from_bgra_topdown(rw as usize, rh as usize, dib);
+    draw_glyphs_onto(&mut canvas, ft, tables, profile, Ink::default(), glyphs, px, (bx - rx, by - ry), None);
+    canvas.blit_to_bgra_topdown(dib);
+    let _ = BitBlt(hdc, rx, ry, rw, rh, Some(memdc), 0, 0, SRCCOPY);
+    SelectObject(memdc, old);
+    let _ = DeleteObject(hbmp.into());
+    let _ = DeleteDC(memdc);
+    let _ = gi.ReleaseDC(None);
+    Some(())
+}
+
+/// Hook d2d1!D2D1CreateFactory so we can patch render-target DrawGlyphRun.
+unsafe fn setup_d2d_hook() {
+    let d2d1 = match GetModuleHandleW(w!("d2d1.dll")) {
+        Ok(h) if !h.is_invalid() => h,
+        _ => match windows::Win32::System::LibraryLoader::LoadLibraryW(w!("d2d1.dll")) {
+            Ok(h) => h.into(),
+            Err(_) => { log("d2d1.dll not available"); return; }
+        },
+    };
+    let Some(target) = GetProcAddress(d2d1, s!("D2D1CreateFactory")) else { return };
+    match minhook::MinHook::create_hook(target as *mut c_void, d2dcf_detour as *mut c_void) {
+        Ok(tramp) => {
+            ORIG_D2DCF = Some(std::mem::transmute::<*mut c_void, FnD2DCreateFactory>(tramp));
+            if minhook::MinHook::enable_all_hooks().is_ok() { log("hook installed on D2D1CreateFactory"); }
+        }
+        Err(e) => log(&format!("D2D1CreateFactory hook failed: {e:?}")),
+    }
+}
+
 /// Runs off the loader lock: init render-core and install the hook.
 unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     let pid = GetCurrentProcessId();
@@ -524,6 +668,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
         Err(e) => log(&format!("create_hook failed: {e:?}")),
     }
     setup_dwrite_hook();
+    setup_d2d_hook();
     0
 }
 
@@ -543,6 +688,15 @@ pub extern "system" fn DllMain(_hinst: HINSTANCE, reason: u32, _reserved: *mut c
                 if VirtualProtect(DGR_SLOT as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_ok() {
                     *DGR_SLOT = orig as usize;
                     let _ = VirtualProtect(DGR_SLOT as *const c_void, 8, oldp, &mut oldp);
+                }
+            }
+            // Restore every patched Direct2D DrawGlyphRun slot (keyed by vtable).
+            if let Ok(m) = D2D_DGR_ORIG.lock() {
+                if let Some(map) = m.as_ref() {
+                    for (&vptr, &orig) in map {
+                        let slot = (vptr as *mut usize).add(29);
+                        let _ = patch_slot(slot, orig);
+                    }
                 }
             }
         }
