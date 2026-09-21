@@ -28,7 +28,7 @@ const ID_EXIT: usize = 2;
 const ID_PROFILE_BASE: usize = 100;
 const ID_SYSFONT_DEFAULT: usize = 200;
 const ID_SYSFONT_BASE: usize = 201;
-const DLL_NAME: &str = "MacType64.Core.dll";
+const DLL_NAME: &str = "RenderCore64.dll";
 /// Icon resources embedded via app.rc. Black-metallic reads on a light
 /// taskbar, silver on a dark one.
 const IDI_TRAY_LIGHT: usize = 1; // black metallic, for light taskbar
