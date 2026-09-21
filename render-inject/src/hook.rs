@@ -129,10 +129,10 @@ pub(crate) unsafe fn install_hook(target: *const (), detour: *const (), publish:
 /// value before the write, for the same reason as in `install_hook`.
 ///
 /// # Safety
-/// `slot` must point at a live, 8-byte-aligned vtable entry, and `newv` at a
+/// `slot` must point at a live, pointer-aligned vtable entry, and `newv` at a
 /// function with the ABI and signature that entry's callers expect.
-pub(crate) unsafe fn patch_slot(slot: *mut usize, newv: usize, publish: impl FnOnce(usize)) -> bool {
-    let bytes = core::mem::size_of::<usize>();
+pub(crate) unsafe fn patch_slot(slot: *mut *const (), newv: *const (), publish: impl FnOnce(*const ())) -> bool {
+    let bytes = core::mem::size_of::<*const ()>();
     let mut oldp = PAGE_PROTECTION_FLAGS(0);
     // SAFETY: the caller guarantees `slot` is a live vtable entry; the page
     // is made writable for exactly this write and restored afterwards.
