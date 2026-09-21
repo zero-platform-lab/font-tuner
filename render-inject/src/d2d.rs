@@ -314,6 +314,9 @@ unsafe fn d2d_brush_ink(brush: *mut c_void) -> Ink {
 }
 
 unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_RUN, brush: *mut c_void) -> Option<()> {
+    // Nothing to do without a render state or a font face; decide that
+    // before the GetDC round trip below, which flushes and copies the target.
+    if r.fontFace.deref().is_none() || RENDER.lock().ok()?.is_none() { return None; }
     // Can this target lend a GDI DC at all? Ask first: on DXGI-surface
     // device contexts (most Direct2D 1.1 apps) it cannot, and that answer
     // must not cost a font-file read or the render lock.
@@ -327,15 +330,17 @@ unsafe fn d2d_substitute(this: *mut c_void, baseline: Vector2, r: &DWRITE_GLYPH_
 
 unsafe fn d2d_substitute_on_dc(hdc: HDC, baseline: Vector2, r: &DWRITE_GLYPH_RUN, brush: *mut c_void) -> Option<()> {
     let mut guard = RENDER.lock().ok()?;
-    let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
-    // Key on the font-face identity like the DirectWrite path; the file is
-    // read and refaced only on a miss.
+    let RenderState { ft, tables, profile, font_key, font_face } = guard.as_mut()?;
+    // Key on the font-face address like the DirectWrite path; the file is
+    // read and refaced only on a miss, and the clone in `font_face` keeps
+    // the address from being recycled for another font.
     let face = r.fontFace.deref().as_ref()?;
     let key = format!("d2d:{:x}:{}", face.as_raw() as usize, face.GetIndex());
     if font_key.as_deref() != Some(key.as_str()) {
         let (bytes, index) = dwrite_font_bytes(r)?;
         ft.reface_memory_index(&bytes, index as i64).ok()?;
         *font_key = Some(key);
+        *font_face = Some(face.clone());
     }
     let px = r.fontEmSize.round() as i32;
     let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);

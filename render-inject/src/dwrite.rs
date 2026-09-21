@@ -177,20 +177,22 @@ unsafe extern "system" fn dgr_detour(
 
 unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, color: u32) -> Option<()> {
     let mut guard = RENDER.lock().ok()?; // serialises every draw
-    let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
+    let RenderState { ft, tables, profile, font_key, font_face } = guard.as_mut()?;
     let brt = IDWriteBitmapRenderTarget::from_raw_borrowed(&this)?;
     let hdc = brt.GetMemoryDC();
     let size = brt.GetSize().ok()?;
     let (w, h) = (size.cx, size.cy);
     if w <= 0 || h <= 0 { return None; }
 
-    // key on the font-face identity; only re-extract on a miss.
+    // Key on the font-face address; only re-extract on a miss. The clone in
+    // `font_face` keeps that address from being recycled for another font.
     let face = r.fontFace.deref().as_ref()?;
     let key = format!("dw:{:x}:{}", face.as_raw() as usize, face.GetIndex());
     if font_key.as_deref() != Some(key.as_str()) {
         let (bytes, index) = dwrite_font_bytes(r)?;
         ft.reface_memory_index(&bytes, index as i64).ok()?;
         *font_key = Some(key);
+        *font_face = Some(face.clone());
     }
     let px = r.fontEmSize.round() as i32;
     let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
@@ -358,7 +360,7 @@ unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Op
     let (w, h) = ((b.right - b.left) as usize, (b.bottom - b.top) as usize);
     if w == 0 || h == 0 || w * h * 3 != size as usize { return None; }
     let mut guard = RENDER.lock().ok()?;
-    let RenderState { ft, profile, font_key, .. } = guard.as_mut()?;
+    let RenderState { ft, profile, font_key, font_face, .. } = guard.as_mut()?;
     let m = ANALYSES.lock().ok()?;
     let info = m.as_ref()?.get(&(this as usize))?;
     // Key on the font identity (face index + file length), not the analysis
@@ -368,6 +370,7 @@ unsafe fn cat_fill(this: *mut c_void, b: &RECT, alpha: *mut u8, size: u32) -> Op
     if font_key.as_deref() != Some(key.as_str()) {
         ft.reface_memory_index(&info.bytes, info.index as i64).ok()?;
         *font_key = Some(key);
+        *font_face = None;
     }
     // force LCD subpixel for the CLEARTYPE_3x1 texture, keep the profile's hinting
     let lcd = Profile { aa: Aa::LcdRgb, ..*profile };

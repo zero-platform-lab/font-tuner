@@ -150,10 +150,11 @@ unsafe fn render_into_dc(hdc_i: isize, x: i32, y: i32, options: u32,
         return None;
     }
     let mut guard = RENDER.lock().ok()?; // serialises every draw
-    let RenderState { ft, tables, profile, font_key } = guard.as_mut()?;
+    let RenderState { ft, tables, profile, font_key, font_face } = guard.as_mut()?;
     let hdc = HDC(hdc_i as *mut c_void);
 
     let px = resolve_font(hdc, ft, font_key)?;
+    *font_face = None; // a GDI key does not name a DirectWrite face
 
     // colour, metrics, baseline
     let color = GetTextColor(hdc).0;
@@ -290,7 +291,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     let (path, p) = load_profile();
     log(&format!("profile {}: {p:?}", path.as_deref().unwrap_or("(default)")));
     if let Ok(mut guard) = RENDER.lock() {
-        *guard = Some(RenderState { ft, tables: tables_for(&p), profile: p, font_key: None });
+        *guard = Some(RenderState { ft, tables: tables_for(&p), profile: p, font_key: None, font_face: None });
     }
     dwrite::refresh_dw_rendering(&p);
     RELOAD_MSG.store(RegisterWindowMessageW(RELOAD_MSG_NAME), Ordering::Relaxed);

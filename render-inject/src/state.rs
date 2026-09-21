@@ -3,6 +3,8 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 
+use windows::Win32::Graphics::DirectWrite::IDWriteFontFace;
+
 use render_core::{Ft, Profile, Tables};
 
 /// Everything a draw needs, behind one lock.
@@ -20,6 +22,10 @@ pub(crate) struct RenderState {
     /// Identity of the face currently loaded into `ft`, so a draw only
     /// re-extracts and re-faces when the font actually changes.
     pub(crate) font_key: Option<String>,
+    /// When `font_key` names an `IDWriteFontFace` by address, this clone
+    /// keeps that object alive, so the address cannot be recycled for a
+    /// different font while the key still matches it. `None` for GDI keys.
+    pub(crate) font_face: Option<IDWriteFontFace>,
 }
 
 // SAFETY: `Ft` owns raw FreeType handles, which are not thread-safe on their
