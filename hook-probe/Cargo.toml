@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 minhook = "0.5"
+render-core = { path = "../render-core" }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dependencies.windows]
 version = "0.62"
