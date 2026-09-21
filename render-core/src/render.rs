@@ -233,3 +233,151 @@ fn blend_lcd(c: &mut Canvas, t: &Tables, ink: Ink, g: &ft::Glyph, pen_x: i32, ba
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Aa;
+    use crate::filter::Tables;
+
+    #[test]
+    fn canvas_buffer_ops_are_pure() {
+        // new / filled / fill_rect (in- and out-of-bounds clamp) / clip toggles.
+        let mut c = Canvas::new(4, 3);
+        assert_eq!(c.rgb, vec![255u8; 4 * 3 * 3]);
+        let mut c2 = Canvas::filled(4, 3, [1, 2, 3]);
+        assert_eq!(&c2.rgb[0..3], &[1, 2, 3]);
+        c2.fill_rect((-2, -2, 100, 100), [9, 9, 9]); // clamps to the canvas
+        assert!(c2.rgb.iter().all(|&v| v == 9));
+        c.set_clip(Some((1, 1, 3, 3)));
+        assert!(c.in_bounds(1, 1));
+        assert!(!c.in_bounds(0, 0)); // outside clip
+        assert!(!c.in_bounds(3, 3)); // clip is exclusive on r/b
+        c.set_clip(None);
+        assert!(c.in_bounds(0, 0));
+        assert!(!c.in_bounds(-1, 0)); // x < 0
+        assert!(!c.in_bounds(4, 0)); // x >= w
+        assert!(!c.in_bounds(0, -1)); // y < 0
+        assert!(!c.in_bounds(0, 3)); // y >= h
+
+        // BGRA round-trip: from_bgra_topdown then blit_to_bgra_topdown is identity.
+        let bgra: Vec<u8> = (0..4 * 3 * 4).map(|i| i as u8).collect();
+        let cv = Canvas::from_bgra_topdown(4, 3, &bgra);
+        let mut out = vec![0u8; 4 * 3 * 4];
+        cv.blit_to_bgra_topdown(&mut out);
+        for i in 0..4 * 3 {
+            assert_eq!(out[i * 4], bgra[i * 4]); // B
+            assert_eq!(out[i * 4 + 1], bgra[i * 4 + 1]); // G
+            assert_eq!(out[i * 4 + 2], bgra[i * 4 + 2]); // R
+            assert_eq!(out[i * 4 + 3], 255); // A forced opaque
+        }
+    }
+
+    #[test]
+    fn is_bgr_matches_lcd_order() {
+        assert!(ft::is_bgr(Aa::LcdBgr));
+        assert!(ft::is_bgr(Aa::LightLcdBgr));
+        assert!(!ft::is_bgr(Aa::LcdRgb));
+        assert!(!ft::is_bgr(Aa::Grey));
+    }
+
+    // A single FreeType-backed test: one process-global `Ft`, run sequentially,
+    // exercising every hinting/AA/LCD-order/clip/empty-glyph/dx branch in ft.rs
+    // and render.rs. Skips cleanly if the system font is unavailable.
+    #[test]
+    fn freetype_render_paths() {
+        const FONT: &str = r"C:\Windows\Fonts\meiryo.ttc";
+        let Ok(bytes) = std::fs::read(FONT) else { eprintln!("skip: no {FONT}"); return; };
+        let Ok(ft) = Ft::open(FONT, 0) else { eprintln!("skip: FT open failed"); return; };
+
+        // reface: memory-by-index Ok, memory-by-family Ok, and the Err arm.
+        assert!(ft.reface_memory_index(&bytes, 0).is_ok());
+        let _ = ft.reface_memory(&bytes, "Meiryo"); // family match may vary; just drive it
+        assert!(ft.reface_memory(&[0u8, 1, 2, 3], "Nope").is_err()); // reface_memory Err arm
+        assert!(ft.reface_memory_index(&[0u8, 1, 2, 3], 9).is_err());
+        assert!(ft.reface_memory_index(&bytes, 0).is_ok()); // restore a valid face
+
+        // Greyscale path: hinting 0 (native), draw_text_onto + blend_gray, and
+        // an out-of-bounds pen so in_bounds' reject branch fires.
+        let grey = Profile::clean_greyscale(); // hinting 0, Grey
+        let tg = Tables::build(grey.gamma, grey.weight, grey.contrast, grey.gamma_mode);
+        let cv = render_text(&ft, &tg, &grey, Ink::default(), [255, 255, 255],
+                             "Ag.", 20, (2, 18), (60, 24));
+        assert!(cv.rgb.iter().any(|&v| v < 255), "greyscale drew ink");
+        // draw partly off-canvas, with a negative pen, so in_bounds rejects
+        // pixels on every side (x<0, x>=w, y<0, y>=h).
+        let mut small = Canvas::filled(6, 6, [255, 255, 255]);
+        draw_text_onto(&mut small, &ft, &tg, &grey, Ink::default(), "Wg", 20, (-4, 3), None);
+
+        // hinting 1 (no hinting) via clean_sharp, and hinting 2 (autohint) via
+        // accurate — both LCD; RGB order then forced BGR to hit blend_lcd's
+        // bgr branch. Also drives prepare()'s LCD-filter branch.
+        for (p, label) in [(Profile::clean_sharp(), "sharp/h1"),
+                           (Profile::accurate(), "accurate/h2")] {
+            let t = Tables::build(p.gamma, p.weight, p.contrast, p.gamma_mode);
+            let cv = render_text(&ft, &t, &p, Ink { fg: [10, 20, 30] }, [250, 250, 250],
+                                 "Ag水0", p.gamma as i32 + 18, (3, 20), (120, 28));
+            assert!(cv.rgb.iter().any(|&v| v != 250), "{label} drew ink");
+            // same run, BGR subpixel order
+            let bgr = Profile { aa: Aa::LcdBgr, ..p };
+            let _ = render_text(&ft, &t, &bgr, Ink::default(), [255, 255, 255],
+                                "Ag", 22, (2, 20), (80, 28));
+        }
+
+        // Clip-restricted transparent draw (in_bounds Some(clip) branch).
+        let sharp = Profile::clean_sharp();
+        let ts = Tables::build(sharp.gamma, sharp.weight, sharp.contrast, sharp.gamma_mode);
+        let mut clipped = Canvas::filled(120, 28, [255, 255, 255]);
+        clipped.set_clip(Some((10, 4, 60, 24)));
+        draw_text_onto(&mut clipped, &ft, &ts, &sharp, Ink::default(), "Clip", 20, (2, 20),
+                       Some(&[14, 14, 14, 14])); // dx path (advance_of Some)
+
+        // Glyph-index paths: render_glyphs, draw_glyphs_onto, and the raw LCD
+        // coverage used by the CreateAlphaTexture hook. Indices include .notdef
+        // (0) and a spread that yields both drawn and empty glyphs.
+        let glyphs: Vec<u16> = vec![0, 1, 2, 3, 4, 5, 36, 68];
+        let cvg = render_glyphs(&ft, &ts, &sharp, Ink::default(), [255, 255, 255],
+                                &glyphs, 22, (4, 20), (160, 28));
+        assert_eq!(cvg.w, 160);
+        // coverage with a negative pen so the bounds test rejects x<0 / y<0 too.
+        let cov = glyph_run_coverage_lcd(&ft, &sharp, &glyphs, 22, (-6, 4), 40, 28);
+        assert_eq!(cov.len(), 40 * 28 * 3);
+
+        // empty glyph (space) exercises blit_glyph's rows==0 early return, in both
+        // the greyscale and LCD dispatch arms.
+        let mut c2 = Canvas::filled(40, 24, [255, 255, 255]);
+        draw_text_onto(&mut c2, &ft, &tg, &grey, Ink::default(), " ", 20, (2, 18), None);
+        draw_text_onto(&mut c2, &ft, &ts, &sharp, Ink::default(), " ", 20, (2, 18), None);
+
+        // Tiny clip in the middle of a big glyph: pixels fall on every side of
+        // the clip, so both the y>=t and y<b rejects fire.
+        let mut vclip = Canvas::filled(80, 40, [255, 255, 255]);
+        vclip.set_clip(Some((30, 18, 36, 22)));
+        draw_text_onto(&mut vclip, &ft, &ts, &sharp, Ink::default(), "Ag", 30, (4, 34), None);
+
+        // Zero-size render: FreeType produces no bitmap, so emit's error/empty
+        // return fires (r != 0 or rows == 0) and blit_glyph's rows==0 early-out
+        // and coverage_lcd's non-LCD/empty guard are all exercised.
+        let _ = ft.render('A', 0, &grey);
+        let mut z = Canvas::filled(20, 20, [255, 255, 255]);
+        draw_text_onto(&mut z, &ft, &tg, &grey, Ink::default(), "A", 0, (2, 10), None);
+        draw_glyphs_onto(&mut z, &ft, &ts, &sharp, Ink::default(), &[3, 4], 0, (2, 10), None);
+        let empty_cov = glyph_run_coverage_lcd(&ft, &sharp, &[3, 4], 0, (2, 10), 20, 20);
+        assert_eq!(empty_cov.len(), 20 * 20 * 3);
+
+        // Coverage with a pen that pushes glyphs past the bottom edge (y >= h).
+        let _ = glyph_run_coverage_lcd(&ft, &sharp, &glyphs, 22, (2, 40), 60, 20);
+
+        // Canvas::save round-trips to disk then is removed.
+        let png = std::env::temp_dir().join(format!("rc-cov-{}.png", std::process::id()));
+        cv_save_ok(&cvg, &png);
+        std::fs::remove_file(&png).ok();
+
+        // Ft::open error arm: shim_open on a missing path returns non-zero.
+        assert!(Ft::open(r"C:\__no_such_font__.ttf", 0).is_err());
+    }
+
+    fn cv_save_ok(c: &Canvas, path: &std::path::Path) {
+        c.save(path.to_str().unwrap()).expect("save png");
+    }
+}

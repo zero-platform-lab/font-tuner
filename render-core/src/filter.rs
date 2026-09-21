@@ -119,4 +119,38 @@ mod tests {
             assert_eq!(t.blend(255, 0, cov), expect, "cov={cov}");
         }
     }
+
+    /// Exercise every GammaMode branch of `build`'s tbl1 construction
+    /// (mode<0 linear, mode==1 sRGB, mode==2 sRGB/linear avg, else plain gamma),
+    /// including both sides of the sRGB `i <= 10` toe. Endpoints must hold for
+    /// all modes: full opaque black over white is 0, zero coverage keeps bg.
+    #[test]
+    fn all_gamma_modes_build_and_blend() {
+        for &mode in &[-1i32, 0, 1, 2, 5] {
+            let t = Tables::build(1.20, 1.0, 1.0, mode);
+            assert_eq!(t.blend(255, 0, 255), 0, "mode={mode} full coverage");
+            assert_eq!(t.blend(255, 0, 0), 255, "mode={mode} zero coverage keeps bg");
+            // monotone non-increasing across coverage for black-on-white
+            let mut prev = 256i32;
+            for c in 0..=255u8 {
+                let v = t.blend(255, 0, c) as i32;
+                assert!(v <= prev, "mode={mode} non-monotone at cov={c}");
+                prev = v;
+            }
+        }
+    }
+
+    /// Non-identity weight and contrast drive the `alphatbl` S-curve
+    /// (both `temp < 0.5` and the upper half), covering `build`'s coverage
+    /// branch and the `blend` `a == 0` early-out at zero coverage.
+    #[test]
+    fn weight_and_contrast_curve() {
+        let t = Tables::build(1.25, 1.6, 0.7, 0);
+        assert_eq!(t.blend(200, 10, 0), 200, "a==0 returns bg unchanged");
+        assert_eq!(t.blend(255, 0, 255), 0);
+        // mid coverage lands strictly between the endpoints
+        let mid = t.blend(255, 0, 128);
+        assert!(mid > 0, "mid={mid}");
+        assert!(mid < 255, "mid={mid}");
+    }
 }

@@ -146,4 +146,76 @@ Contrast=0.0
         assert_eq!(p.hinting, 0);
         assert!((p.gamma - 1.25).abs() < 1e-6);
     }
+
+    #[test]
+    fn aa_mode_and_is_lcd_all_variants() {
+        assert_eq!(Aa::Grey.mode(), 0);
+        assert_eq!(Aa::LcdRgb.mode(), 2);
+        assert_eq!(Aa::LcdBgr.mode(), 3);
+        assert_eq!(Aa::LightLcdRgb.mode(), 4);
+        assert_eq!(Aa::LightLcdBgr.mode(), 5);
+        assert!(!Aa::Grey.is_lcd());
+        for aa in [Aa::LcdRgb, Aa::LcdBgr, Aa::LightLcdRgb, Aa::LightLcdBgr] {
+            assert!(aa.is_lcd());
+        }
+    }
+
+    #[test]
+    fn all_presets_construct() {
+        assert_eq!(Profile::clean_greyscale().aa, Aa::Grey);
+        assert_eq!(Profile::clean_sharp().aa, Aa::LcdRgb);
+        assert_eq!(Profile::accurate().aa, Aa::LightLcdRgb);
+        assert_eq!(Profile::clean_dark_greyscale().aa, Aa::Grey);
+        assert_eq!(Profile::clean_sharp_dark().aa, Aa::LcdRgb);
+        assert_eq!(Profile::accurate().lcd_filter, 2);
+        assert!((Profile::clean_dark_greyscale().contrast - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn antialias_mode_bgr_and_light_bgr_and_invalid() {
+        assert_eq!(Profile::from_ini_str("AntiAliasMode=3\n").aa, Aa::LcdBgr);
+        assert_eq!(Profile::from_ini_str("AntiAliasMode=5\n").aa, Aa::LightLcdBgr);
+        // unknown value keeps the default (Grey) via the `_ => p.aa` arm
+        assert_eq!(Profile::from_ini_str("AntiAliasMode=9\n").aa, Aa::Grey);
+    }
+
+    #[test]
+    fn contrast_weight_normalweight_and_comments() {
+        let p = Profile::from_ini_str(
+            "; a comment line\nContrast=0.8\nRenderWeight=1.4\nNormalWeight=32\n",
+        );
+        assert!((p.contrast - 0.8).abs() < 1e-6);
+        assert!((p.weight - 1.4).abs() < 1e-6);
+        assert_eq!(p.embolden, 32);
+    }
+
+    #[test]
+    fn malformed_values_keep_defaults() {
+        // parse failures hit the `if let Ok(..)` else path for every key
+        let base = Profile::clean_greyscale();
+        let p = Profile::from_ini_str(
+            "HintingMode=x\nAntiAliasMode=y\nGammaValue=z\nContrast=q\n\
+             RenderWeight=w\nLcdFilter=n\nNormalWeight=m\nNoEquectionHere\nUnknownKey=1\n",
+        );
+        assert_eq!(p.hinting, base.hinting);
+        assert_eq!(p.aa, base.aa);
+        assert!((p.gamma - base.gamma).abs() < 1e-6);
+        assert!((p.contrast - base.contrast).abs() < 1e-6);
+        assert!((p.weight - base.weight).abs() < 1e-6);
+        assert_eq!(p.lcd_filter, base.lcd_filter);
+        assert_eq!(p.embolden, base.embolden);
+    }
+
+    #[test]
+    fn from_ini_reads_file_and_missing_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ft-profile-test-{}.ini", std::process::id()));
+        std::fs::write(&path, "AntiAliasMode=2\nHintingMode=1\nGammaValue=1.2\n").unwrap();
+        let p = Profile::from_ini(path.to_str().unwrap()).expect("file parses");
+        assert_eq!(p.aa, Aa::LcdRgb);
+        assert_eq!(p.hinting, 1);
+        std::fs::remove_file(&path).ok();
+        // missing file -> None (the `?` on read_to_string)
+        assert!(Profile::from_ini(path.to_str().unwrap()).is_none());
+    }
 }
