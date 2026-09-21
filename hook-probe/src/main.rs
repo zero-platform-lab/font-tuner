@@ -5,26 +5,27 @@
 //!   * `render-core.png` — our ExtTextOutW hook renders with render-core and
 //!                         blits the result into the DIB, skipping GDI.
 //!
-//! Stage 3b/3c: the font is resolved from the DC — pixel size from the selected
-//! LOGFONT and the actual font bytes via GetFontData ('ttcf' tag for TTCs,
-//! matching the family for the right sub-face). Both the string path and the
-//! ETO_GLYPH_INDEX path (how real apps draw) are handled. Text is black on
-//! white; colour/opacity, clipping, alignment and dx spacing are later stages.
+//! Stage 3b/3c/3d: the font is resolved from the DC (pixel size from the
+//! LOGFONT; bytes via GetFontData, 'ttcf' tag for TTCs, matching the family).
+//! Both the string and ETO_GLYPH_INDEX paths are handled. The DC's text colour
+//! (GetTextColor) and baseline (GetTextMetrics ascent + GetTextAlign) are
+//! honoured, and text is composited over the existing surface. Opaque bg fill,
+//! clipping rect and dx spacing are later stages.
 
 use core::ffi::c_void;
 use std::ptr::null_mut;
 
 use minhook::MinHook;
-use render_core::render::{render_glyphs, render_text, Ink};
+use render_core::render::{draw_glyphs_onto, draw_text_onto, Canvas, Ink};
 use render_core::{tables_for, Ft, Profile, Tables};
 use windows::core::{s, w, PCWSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, ExtTextOutW,
-    GetCurrentObject, GetFontData, GetGlyphIndicesW, GetObjectW, GetTextMetricsW, SelectObject,
-    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, ETO_OPTIONS,
-    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC,
-    LOGFONTW, OBJ_FONT, TEXTMETRICW, TRANSPARENT,
+    GetCurrentObject, GetFontData, GetGlyphIndicesW, GetObjectW, GetTextAlign, GetTextColor,
+    GetTextMetricsW, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER,
+    DIB_RGB_COLORS, ETO_OPTIONS, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
+    FONT_QUALITY, HDC, LOGFONTW, OBJ_FONT, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -45,7 +46,6 @@ static mut FT: Option<Ft> = None;
 static mut TABLES: Option<Tables> = None;
 static mut PROFILE: Option<Profile> = None;
 static mut DIB: *mut u8 = null_mut();
-static mut ASCENT: i32 = 0;
 
 /// Detour: render the string with render-core and blit into our DIB, then
 /// return without calling GDI.
@@ -94,29 +94,31 @@ unsafe extern "system" fn detour(
         return (ORIG.unwrap())(_hdc, x, y, _options, _rect, str_ptr, count, _dx);
     }
 
-    // Render the whole DIB-sized canvas with the text at the draw origin;
-    // baseline = y + ascent so the text cell top lands at y. When the draw uses
-    // ETO_GLYPH_INDEX the buffer holds glyph indices, not characters.
+    // Honour the DC's text colour and baseline. TA_BASELINE means y is already
+    // the baseline; otherwise y is the cell top, so baseline = y + ascent.
+    let color = GetTextColor(hdc).0;
+    let ink = Ink { fg: [(color & 0xFF) as u8, ((color >> 8) & 0xFF) as u8, ((color >> 16) & 0xFF) as u8] };
+    let mut tm = TEXTMETRICW::default();
+    let _ = GetTextMetricsW(hdc, &mut tm);
+    const TA_BASELINE: u32 = 24;
+    let align = GetTextAlign(hdc).0;
+    let base_y = if align & TA_BASELINE == TA_BASELINE { y } else { y + tm.tmAscent };
+
+    // Composite over the *existing* DIB content (transparent draw), so text sits
+    // on whatever is already there rather than a fresh white fill.
     const ETO_GLYPH_INDEX: u32 = 0x0010;
-    let canvas = if _options & ETO_GLYPH_INDEX != 0 {
-        let glyphs = std::slice::from_raw_parts(str_ptr, count as usize);
-        render_glyphs(ft, tables, profile, Ink::default(), [255, 255, 255],
-                      glyphs, px, (x, y + ASCENT), (W as usize, H as usize))
-    } else {
-        render_text(ft, tables, profile, Ink::default(), [255, 255, 255],
-                    &text, px, (x, y + ASCENT), (W as usize, H as usize))
-    };
-    // Copy canvas (RGB, top-down) into the DIB (BGRA, top-down).
     let dib = std::slice::from_raw_parts_mut(DIB, (W * H * 4) as usize);
-    for i in 0..(W * H) as usize {
-        dib[i * 4] = canvas.rgb[i * 3 + 2]; // B
-        dib[i * 4 + 1] = canvas.rgb[i * 3 + 1]; // G
-        dib[i * 4 + 2] = canvas.rgb[i * 3]; // R
-        dib[i * 4 + 3] = 255; // A
+    let mut canvas = Canvas::from_bgra_topdown(W as usize, H as usize, dib);
+    if _options & ETO_GLYPH_INDEX != 0 {
+        let glyphs = std::slice::from_raw_parts(str_ptr, count as usize);
+        draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px, (x, base_y));
+    } else {
+        draw_text_onto(&mut canvas, ft, tables, profile, ink, &text, px, (x, base_y));
     }
+    canvas.blit_to_bgra_topdown(dib);
+
     let mode = if _options & ETO_GLYPH_INDEX != 0 { "glyph-index" } else { "string" };
-    println!("[writeback] {mode} count={count} font={face:?} px={px} at ({x},{y}) via render-core");
-    let _ = &text;
+    println!("[writeback] {mode} count={count} font={face:?} px={px} color={color:#08x} at ({x},{base_y})");
     1 // skip GDI
 }
 
@@ -134,9 +136,12 @@ unsafe fn save_dib(path: &str) {
     println!("wrote {path}");
 }
 
-unsafe fn fill_white() {
+/// Fill the DIB with a solid colour (BGRA).
+unsafe fn fill_color(rgb: [u8; 3]) {
     let dib = std::slice::from_raw_parts_mut(DIB, (W * H * 4) as usize);
-    dib.fill(0xFF);
+    for px in dib.chunks_exact_mut(4) {
+        px[0] = rgb[2]; px[1] = rgb[1]; px[2] = rgb[0]; px[3] = 0xFF;
+    }
 }
 
 fn main() {
@@ -161,7 +166,7 @@ fn main() {
             .expect("CreateDIBSection");
         SelectObject(memdc, hbmp.into());
         DIB = bits as *mut u8;
-        fill_white();
+        fill_color([250, 245, 220]); // pale
 
         // Use a font OTHER than the old hardcoded Meiryo so that correct
         // resolution from the DC is visible. Yu Gothic UI at PX, grayscale AA.
@@ -177,11 +182,7 @@ fn main() {
         );
         SelectObject(memdc, font.into());
         SetBkMode(memdc, TRANSPARENT);
-        let _ = SetTextColor(memdc, windows::Win32::Foundation::COLORREF(0x000000));
-
-        let mut tm = TEXTMETRICW::default();
-        GetTextMetricsW(memdc, &mut tm);
-        ASCENT = tm.tmAscent;
+        let _ = SetTextColor(memdc, windows::Win32::Foundation::COLORREF(0x00C8_5A1E)); // RGB(30,90,200) blue
 
         let sample = "水面に映る Rust 0123";
         let wtext: Vec<u16> = sample.encode_utf16().collect();
@@ -194,8 +195,8 @@ fn main() {
         draw(memdc);
         save_dib("gdi.png");
 
-        // --- hooked: render-core writeback ---
-        fill_white();
+        // --- hooked: render-core writeback (composited over the pale bg) ---
+        fill_color([250, 245, 220]);
         FT = Some(Ft::open(FONT, 0).expect("open font"));
         let p = Profile::clean_greyscale();
         TABLES = Some(tables_for(&p));
@@ -211,7 +212,7 @@ fn main() {
         save_dib("render-core.png");
 
         // --- hooked, glyph-index path (as real apps draw) ---
-        fill_white();
+        fill_color([250, 245, 220]);
         let mut gi = vec![0u16; wtext.len()];
         GetGlyphIndicesW(memdc, PCWSTR(wtext.as_ptr()), wtext.len() as i32,
                          gi.as_mut_ptr(), 0);
