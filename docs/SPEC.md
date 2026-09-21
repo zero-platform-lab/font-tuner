@@ -69,11 +69,13 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64
 * **Re-entrancy** is guarded per-thread (`thread_local`), so one thread
   rendering never forces another thread's draw down the untuned GDI path.
 * **Hook-install guards in the tray** (`Hook::install`, `src/stale.rs`) —
-  before `SetWindowsHookExW` the tray checks (a) that the core it loaded has
-  `GetMsgProc` at RVA `0x1000`, and (b) that no running process holds the
+  before even `LoadLibraryW` (loading the core would pin it in the tray and
+  hook the tray itself) the tray checks (a) from the file on disk that the
+  core has `GetMsgProc` at RVA `0x1000`, and (b) that no running process holds the
   core *from the same path* with `GetMsgProc` anywhere else (Toolhelp module
   walk + `ReadProcessMemory` of that image's export table; a process that has
-  the module but whose image cannot be read counts as stale). A copy loaded
+  the module but whose image cannot be read counts as stale, unless it has
+  exited meanwhile). A copy loaded
   from another directory (the `loader` harness) is not a problem: Windows
   resolves the hook DLL by path and maps the installed one as a separate
   image, and the attach-once mutex keeps the second one inert. Either failure

@@ -9,7 +9,7 @@ use core::ffi::c_void;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use render_core::render::{draw_glyphs_onto, glyph_run_coverage_lcd, Canvas, Ink};
@@ -44,9 +44,13 @@ type FnCreateAlphaTexture = unsafe extern "system" fn(
     *mut c_void, i32, *const RECT, *mut u8, u32,
 ) -> HRESULT;
 static ORIG_CGRA: OnceLock<FnCreateGlyphRunAnalysis> = OnceLock::new();
-/// Also the "CreateAlphaTexture is patched" flag: it is published before the
-/// vtable write, and the detour can only run once that write has happened.
+/// Published before the vtable write, so `cat_detour` (which can only run
+/// once that write has happened) always finds it.
 static ORIG_CAT: OnceLock<FnCreateAlphaTexture> = OnceLock::new();
+/// Set *after* the vtable write. `patch_cat_vtable`'s lock-free fast path
+/// keys off this, not `ORIG_CAT`: between the two stores another thread
+/// would otherwise see "patched", skip, and get an untuned texture.
+static CAT_PATCHED: AtomicBool = AtomicBool::new(false);
 static ANALYSES: Mutex<Option<HashMap<usize, RunInfo>>> = Mutex::new(None);
 
 struct RunInfo {
@@ -208,9 +212,9 @@ unsafe extern "system" fn cgra_detour(
 }
 
 unsafe fn patch_cat_vtable(analysis: *mut c_void) {
-    if ORIG_CAT.get().is_some() { return; } // fast path, no lock once patched
+    if CAT_PATCHED.load(Ordering::Acquire) { return; } // fast path, no lock once patched
     let _guard = VTABLE_PATCH_LOCK.lock();
-    if ORIG_CAT.get().is_some() { return; } // re-check under the lock
+    if CAT_PATCHED.load(Ordering::Acquire) { return; } // re-check under the lock
     let vtbl = *(analysis as *mut *mut usize);
     let slot = vtbl.add(4);
     let mut oldp = PAGE_PROTECTION_FLAGS(0);
@@ -220,6 +224,7 @@ unsafe fn patch_cat_vtable(analysis: *mut c_void) {
     let _ = ORIG_CAT.set(std::mem::transmute::<usize, FnCreateAlphaTexture>(*slot));
     *slot = cat_detour as *const () as usize;
     let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
+    CAT_PATCHED.store(true, Ordering::Release);
     log("hook installed on CreateAlphaTexture");
 }
 

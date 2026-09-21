@@ -141,16 +141,24 @@ enum HookError {
 impl Hook {
     fn install(dir: &Path) -> Result<Hook, HookError> {
         let dll = dir.join(DLL_NAME);
+        // Both refusals are decided from the file and from other processes
+        // *before* LoadLibraryW: loading the core runs its DllMain, which pins
+        // it and hooks this process too, so a core we are about to reject
+        // must never be mapped here in the first place.
+        if stale::file_export_rva(&dll, "GetMsgProc") != Some(HOOK_PROC_RVA) {
+            return Err(HookError::Layout);
+        }
+        let stale = stale::holders_of_stale_core(&dll, HOOK_PROC_RVA);
+        if !stale.is_empty() {
+            return Err(HookError::Stale(stale));
+        }
         let path = wide(dll.to_str().ok_or(HookError::Install)?);
         unsafe {
             let hmod = LoadLibraryW(PCWSTR(path.as_ptr())).map_err(|_| HookError::Install)?;
             let proc_ = GetProcAddress(hmod, PCSTR(b"GetMsgProc\0".as_ptr())).ok_or(HookError::Install)?;
+            // The mapped image must agree with the file we just inspected.
             if proc_ as usize - hmod.0 as usize != HOOK_PROC_RVA {
                 return Err(HookError::Layout);
-            }
-            let stale = stale::holders_of_stale_core(&dll, HOOK_PROC_RVA);
-            if !stale.is_empty() {
-                return Err(HookError::Stale(stale));
             }
             let hookproc: HOOKPROC = Some(std::mem::transmute(proc_));
             let hhook = SetWindowsHookExW(WH_GETMESSAGE, hookproc, Some(HINSTANCE(hmod.0)), 0)

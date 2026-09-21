@@ -10,11 +10,11 @@
 
 use std::path::Path;
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_BAD_LENGTH, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_BAD_LENGTH, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    GetCurrentProcessId, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
 
 /// Exe names of processes holding the core at `dll_path` whose `GetMsgProc`
@@ -33,9 +33,11 @@ pub fn holders_of_stale_core(dll_path: &Path, expected: usize) -> Vec<String> {
             continue;
         }
         let Some(base) = module_base(pid, dll_path) else { continue };
-        // The module is there: from here on anything we cannot read is stale.
-        let rva = Remote::open(pid).and_then(|p| export_rva(&p, base, "GetMsgProc"));
-        if rva != Some(expected) {
+        // The module is there: from here on anything we cannot read is stale —
+        // unless the process simply exited between the snapshot and the read.
+        let p = Remote::open(pid);
+        let rva = p.as_ref().and_then(|p| export_rva(p, base, "GetMsgProc"));
+        if rva != Some(expected) && !p.as_ref().is_some_and(Remote::exited) {
             out.push(exe);
         }
     }
@@ -110,6 +112,9 @@ impl Remote {
     fn open(pid: u32) -> Option<Remote> {
         unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok().map(Remote) }
     }
+    fn exited(&self) -> bool {
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
     fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; len];
         let mut got = 0usize;
@@ -165,6 +170,47 @@ fn export_rva(p: &Remote, base: usize, name: &str) -> Option<usize> {
     None
 }
 
+/// RVA of the named export read from the PE *file* at `path` (no mapping,
+/// so the tray can inspect a core before it loads — and self-hooks — it).
+/// Same walk as `export_rva`, translating RVAs through the section table.
+pub fn file_export_rva(path: &Path, name: &str) -> Option<usize> {
+    let d = std::fs::read(path).ok()?;
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let u16_at = |o: usize| d.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    let pe = u32_at(0x3c)?;
+    if u32_at(pe)? != 0x4550 {
+        return None;
+    }
+    let nsec = u16_at(pe + 6)?;
+    let optsz = u16_at(pe + 20)?;
+    let sec0 = pe + 24 + optsz;
+    let to_off = |rva: usize| -> Option<usize> {
+        (0..nsec).find_map(|i| {
+            let s = sec0 + 40 * i;
+            let (vs, va, raw) = (u32_at(s + 8)?, u32_at(s + 12)?, u32_at(s + 20)?);
+            (va <= rva && rva < va + vs).then(|| raw + rva - va)
+        })
+    };
+    let exp = u32_at(pe + 24 + 112)?;
+    if exp == 0 {
+        return None;
+    }
+    let dir = to_off(exp)?;
+    let n_names = u32_at(dir + 24)?;
+    let funcs = to_off(u32_at(dir + 28)?)?;
+    let names = to_off(u32_at(dir + 32)?)?;
+    let ords = to_off(u32_at(dir + 36)?)?;
+    for i in 0..n_names.min(4096) {
+        let n = to_off(u32_at(names + 4 * i)?)?;
+        let s = d.get(n..n + name.len() + 1)?;
+        if &s[..name.len()] == name.as_bytes() && s[name.len()] == 0 {
+            let ord = u16_at(ords + 2 * i)?;
+            return u32_at(funcs + 4 * ord);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     /// Prints what the check sees on this machine (`cargo test -- --nocapture`);
@@ -174,5 +220,16 @@ mod tests {
         let dll = std::path::Path::new(r"C:\Program Files\Font-tuner\RenderCore64.dll");
         let v = super::holders_of_stale_core(dll, 0x1000);
         eprintln!("stale holders: {v:?}");
+    }
+
+    /// The file walk agrees with check-export-rva.ps1 on the built core.
+    #[test]
+    fn file_export_rva_of_built_core() {
+        let dll = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("render-inject/target/release/RenderCore64.dll");
+        if !dll.exists() {
+            return;
+        }
+        assert_eq!(super::file_export_rva(&dll, "GetMsgProc"), Some(0x1000));
+        assert_eq!(super::file_export_rva(&dll, "NoSuchExport"), None);
     }
 }
