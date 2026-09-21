@@ -62,4 +62,15 @@ impl Profile {
         Profile { gamma: 1.30, weight: 1.0, contrast: 1.0, gamma_mode: 0,
                   aa: Aa::LightLcdRgb, hinting: 2, lcd_filter: 2, embolden: 0 }
     }
+    /// Clean Dark Greyscale: greyscale tuned for dark backgrounds
+    /// (gamma 1.1, contrast 0.9, slightly heavier weight).
+    pub fn clean_dark_greyscale() -> Profile {
+        Profile { gamma: 1.10, weight: 1.05, contrast: 0.9, gamma_mode: 0,
+                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0 }
+    }
+    /// Clean Sharp Dark: LCD subpixel tuned for dark backgrounds.
+    pub fn clean_sharp_dark() -> Profile {
+        Profile { gamma: 1.10, weight: 1.05, contrast: 0.9, gamma_mode: 0,
+                  aa: Aa::LcdRgb, hinting: 0, lcd_filter: 0, embolden: 0 }
+    }
 }

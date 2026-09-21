@@ -15,7 +15,15 @@ pub struct Canvas {
 
 impl Canvas {
     pub fn new(w: usize, h: usize) -> Canvas {
-        Canvas { w, h, rgb: vec![255u8; w * h * 3] } // white
+        Canvas::filled(w, h, [255, 255, 255])
+    }
+    /// A canvas filled with a solid background colour.
+    pub fn filled(w: usize, h: usize, bg: [u8; 3]) -> Canvas {
+        let mut rgb = vec![0u8; w * h * 3];
+        for px in rgb.chunks_exact_mut(3) {
+            px.copy_from_slice(&bg);
+        }
+        Canvas { w, h, rgb }
     }
     #[inline]
     fn in_bounds(&self, x: i32, y: i32) -> bool {
@@ -41,11 +49,11 @@ impl Default for Ink {
 }
 
 /// Render `text` at `px` pixels onto a fresh canvas using `profile`.
-/// `pen` is the baseline origin (x, y).
-pub fn render_text(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink,
+/// `pen` is the baseline origin (x, y); `bg` is the background colour.
+pub fn render_text(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: [u8; 3],
                    text: &str, px: i32, pen: (i32, i32), size: (usize, usize)) -> Canvas {
     ft.prepare(profile);
-    let mut canvas = Canvas::new(size.0, size.1);
+    let mut canvas = Canvas::filled(size.0, size.1, bg);
     let (mut pen_x, base_y) = pen;
     let lcd = profile.aa.is_lcd();
     let bgr = ft::is_bgr(profile.aa);
