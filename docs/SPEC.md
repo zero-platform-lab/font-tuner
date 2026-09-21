@@ -39,7 +39,27 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64
   `LoadLibraryW` the core from a background thread. It uses `CreateThread` from
   `DllMain` (never `LoadLibrary` under loader lock) to stay deadlock-free.
 
-### 1.2 What it cannot reach
+### 1.2 Hooking & concurrency
+
+* **Mechanism** — GDI `ExtTextOutW` is hooked with an inline detour via
+  **retour** (pure Rust; the iced-x86 disassembler). DirectWrite/Direct2D entry
+  points are patched directly in their COM vtables. No MinHook/Detours.
+* **Thread-safe patching** — retour does not stop other threads while it
+  rewrites the target's first bytes, so `install_hook` freezes every other
+  thread in the process (`CreateToolhelp32Snapshot` + `SuspendThread`) around
+  the patch and resumes them after — the window MinHook closes internally.
+* **Attach-once** — a WH_GETMESSAGE map plus another load can make the DLL two
+  module instances in one process; a per-process named mutex
+  (`Local\FontTuner.Attached.<pid>`) ensures only the first attach hooks, so a
+  second attach cannot detour over our own jump and corrupt the trampoline.
+* **One-time vtable patches** (CreateAlphaTexture, D2D factory RT creation) are
+  serialised by a mutex and re-checked under it; otherwise two racing threads
+  both capture the "original" from an already-patched slot and the detour calls
+  itself → infinite recursion.
+* **Re-entrancy** is guarded per-thread (`thread_local`), so one thread
+  rendering never forces another thread's draw down the untuned GDI path.
+
+### 1.3 What it cannot reach
 
 * **Chrome/Edge renderer & GPU processes** — blocked by
   `MITIGATION_FORCE_MS_SIGNED_BINS` (Microsoft-signed binaries only). The
@@ -63,6 +83,15 @@ Profiles live in `profiles/ini/*.ini`. The active one is chosen by
 `font-tuner.ini` `[General] AlternativeFile=ini\<name>.ini`; it applies to
 newly created processes. The tray "profile" submenu writes this key when you
 pick an entry (via `WritePrivateProfileString`).
+
+The injected core reads the key **once at attach**, so a switch shows up in
+processes started afterwards. To update already-running processes, the tray's
+**"Reload profile"** item broadcasts a registered window message
+(`FontTuner.ReloadProfile`); each injected core sees it in its `GetMsgProc`
+(already on that process's UI thread) and re-reads `font-tuner.ini` under the
+render lock — no watcher thread, nothing that can run after the DLL is gone.
+The tray's **"Version"** item opens an About box with the version, licence
+(GPL-3.0-only), source URL, and the required FreeType credit.
 
 ### 2.1 The five profiles
 
@@ -137,20 +166,36 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
 * **Toolflags** — `.cargo/config.toml` sets `+crt-static` for the MSVC target,
   removing the `VCRUNTIME140.dll` dependency (and its DLL-search-order hijack
   surface). Release profile: `opt-level="s"`, LTO, `panic="abort"`, stripped.
-* **`build-core.ps1`** — builds `RenderCore64.dll` from `vendor/` (IniParser,
-  the snowie2000 FreeType fork, Detours) via MSBuild/vswhere.
-* **`build-msi.ps1`** — builds the core, `cargo build --release --workspace`,
-  stages exe + DLLs + `font-tuner.ini` + `ini\*.ini` into `build\pkg`, then
-  `wix build` → `dist\font-tuner-<ver>-x64.msi`.
+* **`build-core.ps1`** — builds only the one native dependency the shipped DLL
+  needs: the snowie2000 FreeType fork (`freetype64.lib`) via MSBuild/vswhere.
+  The C++ MacType core, Detours and IniParser are no longer built — the render
+  core is Rust (`RenderCore64.dll`) and hooking uses `retour`.
+* **`build-msi.ps1`** — runs `build-core.ps1`, `cargo build --release`
+  (workspace + `render-inject`), stages exe + DLLs + `font-tuner.ini` +
+  `ini\*.ini` into `build\pkg`, then `wix build` →
+  `dist\font-tuner-<ver>-x64.msi`.
 
 ---
 
 ## 6. Installer (MSI, WiX v6)
 
-* **Scope** perMachine, installs to `C:\Program Files\Font-tuner`.
+* **Scope** perMachine, installs to `C:\Program Files\Font-tuner`; adds a Start
+  menu shortcut so the tray can be relaunched after "Exit".
 * **Run at logon** — writes `HKLM\...\CurrentVersion\Run\Font-tuner`.
 * **On install** — stops a running `font-tuner.exe`, then launches
   Font-tuner.
+* **Restart Manager disabled** (`MSIRESTARTMANAGERCONTROL=Disable`,
+  `REBOOT=ReallySuppress`): `RenderCore64.dll` is mapped into every GUI process,
+  so the Restart Manager would otherwise close them all (it has killed the
+  user's shell). Only the tray is closed.
+* **In-use core swap** — because the core is mapped (and self-pinned) in every
+  running process, its file is never free to overwrite. A deferred custom
+  action (`RenameOldCore`, scheduled right after `InstallInitialize`, before
+  `RemoveExistingProducts`) renames the in-use `RenderCore64.dll` aside so
+  `InstallFiles` can place the new one immediately; the freshly launched tray
+  then hooks with the new core. Renamed-aside copies are queued for deletion at
+  next reboot (`MoveFileEx DELAY_UNTIL_REBOOT`). No reboot is needed for the
+  upgrade to take effect on newly started processes.
 * **`font-tuner.ini`** is marked `NeverOverwrite` — a user's selected profile
   (the `AlternativeFile` value) survives upgrades.
 * **Uninstall** — standard Add/Remove Programs entry, or
@@ -159,7 +204,7 @@ Icon art is CC0 (public-domain gear) with a rendered letter "A".
 * **Signing** — the MSI and its payload are **unsigned**, so install shows a UAC
   "unknown publisher" prompt (and possibly SmartScreen). It is not blocked.
   Signing is intentionally omitted to keep the release unattributable; it would
-  not help reach the browser renderer/GPU processes anyway (see §1.2).
+  not help reach the browser renderer/GPU processes anyway (see §1.3).
 
 ---
 
