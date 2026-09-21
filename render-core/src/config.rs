@@ -73,4 +73,36 @@ impl Profile {
         Profile { gamma: 1.10, weight: 1.05, contrast: 0.9, gamma_mode: 0,
                   aa: Aa::LcdRgb, hinting: 0, lcd_filter: 0, embolden: 0 }
     }
+
+    /// Parse a MacType profile `.ini` into a `Profile`. Reads the first value of
+    /// each key (the `[General]`/`[FreeType]` section, not the `[DirectWrite]`
+    /// overrides). Unknown/missing keys keep sensible defaults.
+    pub fn from_ini(path: &str) -> Option<Profile> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let mut p = Profile::clean_greyscale();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with(';') || line.starts_with('[') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let (k, v) = (k.trim(), v.trim());
+            if !seen.insert(k) { continue; } // first occurrence wins
+            match k {
+                "HintingMode" => if let Ok(n) = v.parse() { p.hinting = n; },
+                "AntiAliasMode" => if let Ok(n) = v.parse::<i32>() {
+                    p.aa = match n { 0 => Aa::Grey, 2 => Aa::LcdRgb, 3 => Aa::LcdBgr,
+                                     4 => Aa::LightLcdRgb, 5 => Aa::LightLcdBgr, _ => p.aa };
+                },
+                "GammaValue" => if let Ok(f) = v.parse() { p.gamma = f; },
+                "Contrast" => if let Ok(f) = v.parse() { p.contrast = f; },
+                "RenderWeight" => if let Ok(f) = v.parse() { p.weight = f; },
+                "LcdFilter" => if let Ok(n) = v.parse() { p.lcd_filter = n; },
+                "NormalWeight" => if let Ok(n) = v.parse() { p.embolden = n; },
+                _ => {}
+            }
+        }
+        Some(p)
+    }
 }

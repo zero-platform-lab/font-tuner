@@ -311,7 +311,12 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
         return 1;
     };
     FT = Some(ft);
-    let p = Profile::clean_greyscale();
+    // Use the active font-tuner profile if present, else the default.
+    let p = std::env::var_os("LOCALAPPDATA")
+        .map(|b| PathBuf::from(b).join("font-tuner").join("profile.ini"))
+        .and_then(|path| Profile::from_ini(&path.to_string_lossy()))
+        .unwrap_or_else(Profile::clean_greyscale);
+    log(&format!("profile: {p:?}"));
     TABLES = Some(tables_for(&p));
     PROFILE = Some(p);
 
