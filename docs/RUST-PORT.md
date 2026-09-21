@@ -79,7 +79,7 @@ by a mutex so two threads cannot both capture the "original" and recurse.
 ## Port scope = MacType's full hook coverage
 
 This is a **port**: the target is everything the C++ MacType intercepts
-(`vendor/mactype/hooklist.h`, `directwrite.cpp`), not a narrowed subset. Text
+([`hooklist.h`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/hooklist.h), [`directwrite.cpp`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/directwrite.cpp), upstream commit `05052e8`), not a narrowed subset. Text
 paths MacType hooks, and where we stand:
 
 | path | MacType hooks | ours |
@@ -93,7 +93,7 @@ paths MacType hooks, and where we stand:
 | Direct2D `DrawGlyphRun1` (vtbl 82) / `ID2D1DeviceContext` | yes | **done** (`D2D1CreateDevice`, `D2D1CreateDeviceContext`, `ID2D1Factory1..7::CreateDevice`, `ID2D1Device..6::CreateDeviceContext`); render-core where the target lends a GDI DC, else upstream's rendering-params route |
 | Direct2D `SetTextAntialiasMode` (34) / `SetTextRenderingParams` (36) forced to the profile | yes | **done** |
 | `DWriteCreateFactory` / `GetGdiInterop` | yes | not needed: upstream uses them only to reach the shared vtables, which we patch directly from our own factory |
-| `CreateTextFormat` / `CreateFontFace` (upstream's ForceFont font substitution) | yes | todo — a separate feature (font replacement), not render tuning; no `font-tuner.ini` key yet |
+| `CreateTextFormat` / `CreateFontFace` (upstream's `[FontSubstitutes]` font replacement) | yes | **not ported, by decision**: Font-tuner replaces fonts through the tray's system-font switcher instead; every shipped profile has `FontSubstitutes=0` |
 
 Do not treat any path MacType covers as out of scope: the remaining rows are
 not-yet-ported, not deliberately dropped.

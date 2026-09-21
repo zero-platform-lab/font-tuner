@@ -1,7 +1,7 @@
 # render-core (experimental)
 
 An offline Rust port of the **MacType glyph-rendering core** — the
-gamma/contrast/LCD tuning and linear-space blend in `vendor/mactype/ft.cpp` that
+gamma/contrast/LCD tuning and linear-space blend in upstream [`ft.cpp`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/ft.cpp) that
 sit on top of FreeType. Given *a character + a rendering profile* it produces
 pixels exactly as MacType would.
 

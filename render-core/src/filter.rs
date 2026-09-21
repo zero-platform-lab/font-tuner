@@ -1,7 +1,7 @@
 //! Gamma / contrast / coverage lookup tables and the linear-space alpha blend.
 //!
 //! Direct port of MacType's `CAlphaBlend::init` and `CAlphaBlendColorOne::doAB`
-//! (vendor/mactype/ft.cpp). Verified bit-for-bit against the C++ original — see
+//! (upstream MacType ft.cpp, commit 05052e8). Verified bit-for-bit against the C++ original — see
 //! `verify/` — across all 256 coverage values and several profiles.
 
 /// Fixed-point scale (`ft.cpp` `CAlphaBlend::BASE = 0x4000`).

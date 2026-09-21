@@ -1,6 +1,3 @@
-[submodule "vendor/mactype"]
-	path = vendor/mactype
-	url = https://github.com/snowie2000/mactype.git
 [submodule "vendor/freetype"]
 	path = vendor/freetype
 	url = https://github.com/snowie2000/freetype.git

@@ -39,7 +39,7 @@ font-tuner のドキュメント（`README.md`・`NOTICE.md`・`docs/*.md`・各
 - ASCII 図はコードブロックに入れ、折り返さない幅に収める
 
 ## 6. 裏取り
-- 上流の挙動は `vendor/mactype` の実コードで確認し、推測で書かない
+- 上流の挙動は [MacType の実コード](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7) (移植元コミット `05052e8`) で確認し、推測で書かない
 - Windows API の挙動は一次資料（Microsoft Learn）で確認し、似た API からの外挿で断定しない
 - 実機で確かめた事実と、未確認の仮説を書き分ける
 - 注入 DLL の変更は単一プロセス（`loader` + 対象アプリ）で検証してから書く。「動くはず」を根拠にしない
