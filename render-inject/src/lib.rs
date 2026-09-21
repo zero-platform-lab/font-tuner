@@ -1,23 +1,29 @@
 #![allow(non_snake_case)] // crate/DLL name RenderCore64 mirrors MacType64.Core
-//! render-inject — the DLL injected into each process. Stage 4b: on load it
-//! installs a hook on gdi32!ExtTextOutW and, for each text draw, resolves the
-//! DC's font, renders the run with `render-core`, and blits the result back
-//! into the target DC — replacing Windows' own text rendering, inside whatever
-//! process this DLL was injected into.
+//! render-inject — the DLL injected into each process. On load it hooks the
+//! text-drawing entry points and renders with `render-core`, replacing Windows'
+//! own text rendering inside whatever process this DLL was injected into:
+//!   * GDI: gdi32!ExtTextOutW (string + ETO_GLYPH_INDEX) — Stage 4b.
+//!   * DirectWrite: IDWriteBitmapRenderTarget::DrawGlyphRun, via a shared-vtable
+//!     patch so every render target in the process routes through us — Stage 5c.
 //!
-//! Scope: GDI text (string + ETO_GLYPH_INDEX), grayscale/LCD per the profile,
-//! transparent composite over the DC's current content. DirectWrite is not
-//! hooked; opaque-fill / clip / dx are not yet carried over from hook-probe.
+//! Both resolve the font, render the run, and blit the result over the target
+//! DC's current content. Not yet covered: Direct2D/GPU DirectWrite, opaque-fill
+//! / clip / dx, DPI transforms, and multi-thread hardening.
 
 use core::ffi::c_void;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use render_core::render::{draw_glyphs_onto, draw_text_onto, Canvas, Ink};
 use render_core::{tables_for, Ft, Profile, Tables};
-use windows::core::{s, w, BOOL};
-use windows::Win32::Foundation::HINSTANCE;
+use windows::core::{s, w, Interface, BOOL, HRESULT};
+use windows::Win32::Foundation::{HINSTANCE, RECT};
+use windows::Win32::Graphics::DirectWrite::{
+    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFontFile,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_GLYPH_RUN,
+};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetCurrentObject,
     GetFontData, GetObjectW, GetTextAlign, GetTextColor, GetTextExtentPoint32W, GetTextExtentPointI,
@@ -25,6 +31,7 @@ use windows::Win32::Graphics::Gdi::{
     OBJ_FONT, SRCCOPY, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS};
 use windows::Win32::System::Threading::{
     CreateThread, GetCurrentProcessId, THREAD_CREATION_FLAGS,
 };
@@ -41,6 +48,11 @@ static mut TABLES: Option<Tables> = None;
 static mut PROFILE: Option<Profile> = None;
 static IN_DETOUR: AtomicBool = AtomicBool::new(false);
 static CAPTURED: AtomicBool = AtomicBool::new(false);
+
+type FnDrawGlyphRun = unsafe extern "system" fn(
+    *mut c_void, f32, f32, i32, *const DWRITE_GLYPH_RUN, *mut c_void, u32, *mut RECT,
+) -> HRESULT;
+static mut ORIG_DGR: Option<FnDrawGlyphRun> = None;
 
 fn log(msg: &str) {
     if let Some(tmp) = std::env::var_os("TEMP") {
@@ -180,6 +192,109 @@ unsafe fn render_into_dc(hdc_i: isize, x: i32, y: i32, options: u32,
     Some(1) // handled; skip GDI
 }
 
+// ---- DirectWrite (IDWriteBitmapRenderTarget::DrawGlyphRun) ----
+
+/// Extract the font-file bytes + face index for a run's font face.
+unsafe fn dwrite_font_bytes(run: &DWRITE_GLYPH_RUN) -> Option<(Vec<u8>, u32)> {
+    let face = run.fontFace.deref().as_ref()?;
+    let mut n = 0u32;
+    face.GetFiles(&mut n, None).ok()?;
+    let mut files: Vec<Option<IDWriteFontFile>> = vec![None; n as usize];
+    face.GetFiles(&mut n, Some(files.as_mut_ptr())).ok()?;
+    let file = files.into_iter().next()??;
+    let mut key: *mut c_void = std::ptr::null_mut();
+    let mut keysz = 0u32;
+    file.GetReferenceKey(&mut key, &mut keysz).ok()?;
+    let loader = file.GetLoader().ok()?;
+    let stream = loader.CreateStreamFromKey(key as *const c_void, keysz).ok()?;
+    let size = stream.GetFileSize().ok()?;
+    let mut frag: *mut c_void = std::ptr::null_mut();
+    let mut ctx: *mut c_void = std::ptr::null_mut();
+    stream.ReadFileFragment(&mut frag, 0, size, &mut ctx).ok()?;
+    let bytes = std::slice::from_raw_parts(frag as *const u8, size as usize).to_vec();
+    stream.ReleaseFileFragment(ctx);
+    Some((bytes, face.GetIndex()))
+}
+
+unsafe extern "system" fn dgr_detour(
+    this: *mut c_void, bx: f32, by: f32, mm: i32,
+    run: *const DWRITE_GLYPH_RUN, rp: *mut c_void, color: u32, bbox: *mut RECT,
+) -> HRESULT {
+    if !run.is_null() && dgr_render(this, &*run, bx, by, color).is_some() {
+        return HRESULT(0); // S_OK
+    }
+    (ORIG_DGR.unwrap())(this, bx, by, mm, run, rp, color, bbox)
+}
+
+unsafe fn dgr_render(this: *mut c_void, r: &DWRITE_GLYPH_RUN, bx: f32, by: f32, color: u32) -> Option<()> {
+    let ft = FT.as_ref()?;
+    let tables = TABLES.as_ref()?;
+    let profile = PROFILE.as_ref()?;
+    let brt = IDWriteBitmapRenderTarget::from_raw_borrowed(&this)?;
+    let hdc = brt.GetMemoryDC();
+    let size = brt.GetSize().ok()?;
+    let (w, h) = (size.cx, size.cy);
+    if w <= 0 || h <= 0 { return None; }
+
+    let (bytes, index) = dwrite_font_bytes(r)?;
+    ft.reface_memory_index(&bytes, index as i64).ok()?;
+    let px = r.fontEmSize.round() as i32;
+    let glyphs = std::slice::from_raw_parts(r.glyphIndices, r.glyphCount as usize);
+    let ink = Ink { fg: [(color & 0xFF) as u8, ((color >> 8) & 0xFF) as u8, ((color >> 16) & 0xFF) as u8] };
+
+    let memdc = CreateCompatibleDC(Some(hdc));
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let hbmp = CreateDIBSection(Some(memdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    let old = SelectObject(memdc, hbmp.into());
+    let _ = BitBlt(memdc, 0, 0, w, h, Some(hdc), 0, 0, SRCCOPY);
+    let dib = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+    let mut canvas = Canvas::from_bgra_topdown(w as usize, h as usize, dib);
+    draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, glyphs, px,
+                     (bx.round() as i32, by.round() as i32), None);
+    canvas.blit_to_bgra_topdown(dib);
+    if !CAPTURED.swap(true, Ordering::SeqCst) {
+        if let Some(tmp) = std::env::var_os("TEMP") {
+            let p = PathBuf::from(tmp).join("render-inject-dwrite.png");
+            let _ = canvas.save(&p.to_string_lossy());
+            log(&format!("captured DirectWrite render to {}", p.display()));
+        }
+    }
+    let _ = BitBlt(hdc, 0, 0, w, h, Some(memdc), 0, 0, SRCCOPY);
+    SelectObject(memdc, old);
+    let _ = DeleteObject(hbmp.into());
+    let _ = DeleteDC(memdc);
+    Some(())
+}
+
+/// Patch DrawGlyphRun in the shared IDWriteBitmapRenderTarget vtable (slot 3),
+/// so every render target in this process routes through us.
+unsafe fn setup_dwrite_hook() {
+    let Ok(factory) = DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) else {
+        log("dwrite factory failed"); return;
+    };
+    let Ok(gdi) = factory.GetGdiInterop() else { return };
+    let Ok(brt) = gdi.CreateBitmapRenderTarget(None, 8, 8) else { return };
+    let obj = brt.as_raw() as *mut *mut usize;
+    let vtbl = *obj;
+    let slot = vtbl.add(3);
+    let mut oldp = PAGE_PROTECTION_FLAGS(0);
+    if VirtualProtect(slot as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut oldp).is_err() {
+        return;
+    }
+    ORIG_DGR = Some(std::mem::transmute::<usize, FnDrawGlyphRun>(*slot));
+    *slot = dgr_detour as usize;
+    let _ = VirtualProtect(slot as *const c_void, 8, oldp, &mut oldp);
+    log("hook installed on DrawGlyphRun");
+}
+
 /// Runs off the loader lock: init render-core and install the hook.
 unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     let pid = GetCurrentProcessId();
@@ -210,6 +325,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
         }
         Err(e) => log(&format!("create_hook failed: {e:?}")),
     }
+    setup_dwrite_hook();
     0
 }
 

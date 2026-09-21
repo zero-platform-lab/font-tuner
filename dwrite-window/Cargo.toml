@@ -1,0 +1,20 @@
+[package]
+name = "dwrite-window"
+version = "0.1.0"
+edition = "2021"
+description = "A Win32 window that draws text via DirectWrite (IDWriteBitmapRenderTarget) — injection target"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "dwrite-window"
+path = "src/main.rs"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_DirectWrite",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_LibraryLoader",
+]
