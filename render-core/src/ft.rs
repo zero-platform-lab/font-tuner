@@ -156,11 +156,25 @@ mod sys {
         pub fn FT_Outline_EmboldenXY(outline: *mut FT_Outline, xstrength: c_long, ystrength: c_long) -> c_int;
         pub fn FT_Render_Glyph(slot: FT_GlyphSlot, render_mode: c_uint) -> c_int;
         pub fn FT_Library_SetLcdFilter(library: FT_Library, filter: c_uint) -> c_int;
+        pub fn FT_Get_Sfnt_Name_Count(face: FT_Face) -> c_uint;
+        pub fn FT_Get_Sfnt_Name(face: FT_Face, idx: c_uint, aname: *mut FT_SfntName) -> c_int;
+    }
+
+    /// `FT_SfntName` (ftsnames.h): one entry of the OpenType `name` table.
+    #[repr(C)]
+    pub struct FT_SfntName {
+        pub platform_id: c_ushort,
+        pub encoding_id: c_ushort,
+        pub language_id: c_ushort,
+        pub name_id: c_ushort,
+        pub string: *mut c_uchar, // NOT NUL-terminated
+        pub string_len: c_uint,   // bytes
     }
 }
 
 use sys::{
-    FT_Done_Face, FT_Done_FreeType, FT_Face, FT_Get_Char_Index, FT_Init_FreeType, FT_Library, FT_Library_SetLcdFilter,
+    FT_Done_Face, FT_Done_FreeType, FT_Face, FT_Get_Char_Index, FT_Get_Sfnt_Name, FT_Get_Sfnt_Name_Count, FT_Init_FreeType, FT_Library,
+    FT_Library_SetLcdFilter, FT_SfntName,
     FT_Load_Glyph, FT_New_Face, FT_New_Memory_Face, FT_Outline_EmboldenXY, FT_Render_Glyph, FT_Select_Charmap,
     FT_Set_Pixel_Sizes, FT_ENCODING_UNICODE, FT_GLYPH_FORMAT_OUTLINE,
 };
@@ -190,6 +204,44 @@ pub struct Glyph<'a> {
     pub top: i32,
     pub advance_px: i32, // integer pixels (26.6 >> 6)
     pub buffer: &'a [u8],
+}
+
+/// Does `face` carry `want` as a family name? Checks FreeType's ASCII
+/// `family_name` and then every Windows-platform (3) `name` table entry with
+/// a family name id: 1 (family), 16 (typographic family), 21 (WWS family).
+/// Those are UTF-16BE, which is how GDI's localized face names are stored.
+/// Case-insensitive via Unicode simple lowercase.
+///
+/// # Safety
+/// `face` must be a live `FT_Face`.
+unsafe fn face_has_family(face: FT_Face, want: &str) -> bool {
+    let want_lc: String = want.chars().flat_map(char::to_lowercase).collect();
+    // SAFETY: caller guarantees a live face; `family_name` is null or NUL-terminated.
+    let ascii = unsafe { (*face).family_name };
+    if !ascii.is_null() {
+        // SAFETY: as above.
+        let bytes = unsafe { CStr::from_ptr(ascii) }.to_bytes();
+        if bytes.eq_ignore_ascii_case(want.as_bytes()) {
+            return true;
+        }
+    }
+    // SAFETY: live face.
+    let count = unsafe { FT_Get_Sfnt_Name_Count(face) };
+    for idx in 0..count {
+        let mut entry = FT_SfntName { platform_id: 0, encoding_id: 0, language_id: 0, name_id: 0, string: std::ptr::null_mut(), string_len: 0 };
+        // SAFETY: `entry` is an out-param; FreeType fills it on 0.
+        if unsafe { FT_Get_Sfnt_Name(face, idx, &raw mut entry) } != 0 { continue; }
+        if entry.platform_id != 3 || !matches!(entry.name_id, 1 | 16 | 21) || entry.string.is_null() { continue; }
+        // SAFETY: `string` points at `string_len` bytes owned by the face,
+        // valid until the face is closed.
+        let raw = unsafe { std::slice::from_raw_parts(entry.string, entry.string_len as usize) };
+        let units: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|b| u16::from_be_bytes(*b)).collect();
+        let name_lc: String = char::decode_utf16(units.iter().copied()).filter_map(Result::ok).flat_map(char::to_lowercase).collect();
+        if name_lc == want_lc {
+            return true;
+        }
+    }
+    false
 }
 
 /// Owned FreeType library + one active face. `&self` methods mutate FreeType
@@ -259,7 +311,9 @@ impl Ft {
 
     /// Swap the active face to an in-memory font file (e.g. GDI `GetFontData`
     /// bytes), keeping the FreeType library. For a TTC, `want_family` picks the
-    /// matching face by family name (case-insensitive); falls back to face 0.
+    /// matching face by family name (case-insensitive), checking every `name`
+    /// table family entry so a localized GDI face name ("BIZ UDPゴシック",
+    /// "游ゴシック") finds its face too; falls back to face 0.
     pub fn reface_memory(&self, data: &[u8], want_family: &str) -> Result<(), i32> {
         let (base, len) = self.stage_memory(data);
         let mut chosen: c_long = 0;
@@ -279,11 +333,8 @@ impl Ft {
                 let mut f: FT_Face = std::ptr::null_mut();
                 // SAFETY: as for the probe; `f` is set only on a 0 return.
                 if unsafe { FT_New_Memory_Face(self.lib, base, len, i, &raw mut f) } != 0 { continue; }
-                // SAFETY: `f` is a live face; `family_name` may be null.
-                let name = unsafe { (*f).family_name };
-                let matched = !name.is_null()
-                    // SAFETY: `name` is non-null and NUL-terminated per FreeType.
-                    && unsafe { CStr::from_ptr(name) }.to_bytes().eq_ignore_ascii_case(want_family.as_bytes());
+                // SAFETY: `f` is a live face for the duration of the check.
+                let matched = unsafe { face_has_family(f, want_family) };
                 // SAFETY: closing the face we opened for the name compare.
                 unsafe { FT_Done_Face(f); }
                 if matched { chosen = i; break; }
@@ -398,6 +449,37 @@ impl Drop for Ft {
 /// Convenience: does this profile need BGR subpixel order?
 pub fn is_bgr(aa: Aa) -> bool {
     matches!(aa, Aa::LcdBgr | Aa::LightLcdBgr)
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    /// A TTC face must be found by its localized (Japanese) GDI face name,
+    /// not only the ASCII family name; otherwise GDI's "BIZ UDPゴシック"
+    /// (proportional) fell back to face 0 = BIZ UDGothic (monospace), which
+    /// is what made menu text look evenly-spaced and off. Skips without the
+    /// font.
+    #[test]
+    fn ttc_face_by_localized_name() {
+        const FONT: &str = r"C:\Windows\Fonts\BIZ-UDGothicR.ttc";
+        let Ok(bytes) = std::fs::read(FONT) else { eprintln!("skip: no {FONT}"); return; };
+        let Ok(ft) = Ft::new() else { eprintln!("skip: FT init failed"); return; };
+        let p = Profile::clean_greyscale();
+        let adv = |ft: &Ft, ch: char| ft.render(ch, 24, &p).map_or(0, |g| g.advance_px);
+
+        assert!(ft.reface_memory(&bytes, "BIZ UDPゴシック").is_ok());
+        let (i_p, m_p) = (adv(&ft, 'i'), adv(&ft, 'm'));
+        assert!(i_p < m_p, "proportional face expected: i={i_p} m={m_p}");
+
+        assert!(ft.reface_memory(&bytes, "BIZ UDGothic").is_ok());
+        let (i_m, m_m) = (adv(&ft, 'i'), adv(&ft, 'm'));
+        assert_eq!(i_m, m_m, "monospace face expected: i={i_m} m={m_m}");
+
+        // ASCII name still works, case-insensitively.
+        assert!(ft.reface_memory(&bytes, "biz udpgothic").is_ok());
+        assert!(adv(&ft, 'i') < adv(&ft, 'm'));
+    }
 }
 
 #[cfg(test)]
