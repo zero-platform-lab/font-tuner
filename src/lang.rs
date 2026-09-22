@@ -11,6 +11,7 @@ pub struct Strings {
     pub sysfont: &'static str,
     pub sysfont_default: &'static str,
     pub exit: &'static str,
+    pub restart: &'static str,
     pub tip_on: &'static str,
     pub tip_off: &'static str,
     pub err_no_dll: &'static str,
@@ -49,6 +50,8 @@ pub struct Strings {
     pub custom_sample: &'static str,
     pub custom_err_appdata: &'static str,
     pub custom_err_select: &'static str,
+    /// Shown in the dialog for greyscale + FreeType auto-hinter.
+    pub custom_warn_grey_autohint: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -59,6 +62,7 @@ const EN: Strings = Strings {
     sysfont: "System font",
     sysfont_default: "Default (restore)",
     exit: "Exit",
+    restart: "Restart Font-tuner",
     tip_on: "Font-tuner - on",
     tip_off: "Font-tuner - off",
     err_no_dll: "RenderCore64.dll not found. Put font-tuner.exe in the Font-tuner folder.",
@@ -96,6 +100,7 @@ const EN: Strings = Strings {
     custom_sample: "The quick brown fox 0123456789 水面に映る文字 あいう アイウ 亜細亜",
     custom_err_appdata: "APPDATA is not set; cannot save the custom profile.",
     custom_err_select: "could not write AlternativeFile=",
+    custom_warn_grey_autohint: "Greyscale + auto-hinter: capital heights come out uneven at small sizes (C/3 taller, Z shorter). Prefer the font's own hinting, or use LightLCD with the auto-hinter.",
 };
 
 const JA: Strings = Strings {
@@ -106,6 +111,7 @@ const JA: Strings = Strings {
     sysfont: "システムフォント",
     sysfont_default: "既定に戻す",
     exit: "終了",
+    restart: "Font-tuner を再起動",
     tip_on: "Font-tuner - 有効",
     tip_off: "Font-tuner - 無効",
     err_no_dll: "RenderCore64.dll が見つからない。font-tuner.exe を Font-tuner のフォルダに置く。",
@@ -143,6 +149,7 @@ const JA: Strings = Strings {
     custom_sample: "水面に映る文字 あいう アイウ 亜細亜 The quick fox 0123",
     custom_err_appdata: "APPDATA が未設定のためカスタムプロファイルを保存できない。",
     custom_err_select: "AlternativeFile= を書き込めなかった",
+    custom_warn_grey_autohint: "グレースケール × オートヒントは小さいサイズで大文字の高さが揃わない (C や 3 が大きく、Z が小さい)。フォント内蔵にするか、オートヒントは LightLCD と組み合わせる",
 };
 
 pub fn current() -> Strings {

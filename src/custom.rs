@@ -10,16 +10,16 @@
 //! in-memory face. The font picker is the stock `ChooseFont` dialog.
 
 use core::ffi::c_void;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
 use render_core::{tables_for, Aa, Canvas, Ft, Ink, Profile};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateFontIndirectW, DeleteDC, DeleteObject, EndPaint, FrameRect, GetFontData,
-    GetStockObject, InvalidateRect, SelectObject, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, GRAY_BRUSH, HBRUSH, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT,
+    GetStockObject, GetSysColorBrush, InvalidateRect, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, COLOR_BTNFACE, DIB_RGB_COLORS, GRAY_BRUSH, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WindowsProgramming::WritePrivateProfileStringW;
@@ -30,8 +30,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, LoadIconW, PostMessageW, RegisterClassW,
     RegisterWindowMessageW, SendMessageW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow,
     BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CS_HREDRAW, CS_VREDRAW, ES_READONLY,
-    HMENU, HWND_BROADCAST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_HSCROLL, WM_PAINT, WM_SETFONT,
+    HMENU, HWND_BROADCAST, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_HSCROLL, WM_PAINT, WM_SETFONT,
     WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE,
 };
@@ -129,6 +129,8 @@ struct Dlg {
     hwnd: HWND,
     dpi: u32,
     font: HFONT,
+    /// Smaller font for the warning line.
+    warn_font: HFONT,
     hinting: HWND,
     aa: HWND,
     lcd_filter: HWND,
@@ -138,6 +140,8 @@ struct Dlg {
     weight: (HWND, HWND),
     embolden: (HWND, HWND),
     font_name: HWND,
+    /// Warning under the previews; visible only for greyscale + auto-hinter.
+    warn: HWND,
     /// Top-left of the light and dark preview panels (client coordinates).
     preview: [(i32, i32); 2],
     profile: Profile,
@@ -152,6 +156,11 @@ struct Dlg {
 
 thread_local! {
     static DLG: RefCell<Option<Dlg>> = const { RefCell::new(None) };
+    /// The warning static's HWND, kept outside `DLG` because WM_CTLCOLORSTATIC
+    /// arrives *during* ShowWindow/SetWindowText calls made while `DLG` is
+    /// borrowed (read_controls -> show_values); a nested `with_dlg` there
+    /// would panic on the live borrow and take the tray down.
+    static WARN_HWND: Cell<isize> = const { Cell::new(0) };
 }
 
 fn with_dlg<R>(f: impl FnOnce(&mut Dlg) -> R) -> Option<R> {
@@ -210,10 +219,14 @@ pub(crate) fn open(ini: PathBuf, current: Option<PathBuf>, s: &lang::Strings) {
         let dpi = GetDpiForWindow(hwnd);
         let lf = message_font(dpi);
         let font = CreateFontIndirectW(&raw const lf);
+        // Warning text: the message font one step smaller (9pt -> 8pt).
+        let warn_lf = LOGFONTW { lfHeight: lf.lfHeight * 8 / 9, ..lf };
+        let warn_font = CreateFontIndirectW(&raw const warn_lf);
         let mut d = Dlg {
             hwnd,
             dpi,
             font,
+            warn_font,
             hinting: HWND::default(),
             aa: HWND::default(),
             lcd_filter: HWND::default(),
@@ -223,6 +236,7 @@ pub(crate) fn open(ini: PathBuf, current: Option<PathBuf>, s: &lang::Strings) {
             weight: (HWND::default(), HWND::default()),
             embolden: (HWND::default(), HWND::default()),
             font_name: HWND::default(),
+            warn: HWND::default(),
             preview: [(0, 0); 2],
             profile,
             ft: Ft::new().ok(),
@@ -303,7 +317,13 @@ impl Dlg {
         self.preview[0] = (MARGIN, y);
         y += PREVIEW_H + 6;
         self.preview[1] = (MARGIN, y);
-        y += PREVIEW_H + 10;
+        y += PREVIEW_H + 8;
+        // Warning row (two lines), hidden unless the combination calls for it.
+        self.warn = self.child(hinst, w!("STATIC"), s.custom_warn_grey_autohint, 0, 0, MARGIN, y, PREVIEW_W, 34);
+        SendMessageW(self.warn, WM_SETFONT, Some(WPARAM(self.warn_font.0 as usize)), Some(LPARAM(1)));
+        let _ = ShowWindow(self.warn, SW_HIDE);
+        WARN_HWND.with(|w| w.set(self.warn.0 as isize));
+        y += 34 + 4;
         // Buttons.
         let bw = 130;
         self.button(hinst, s.custom_copy, ID_COPY, MARGIN, y, bw + 30);
@@ -433,6 +453,13 @@ impl Dlg {
         set(self.contrast, format!("{:.2}", self.profile.contrast));
         set(self.weight, format!("{:.2}", self.profile.weight));
         set(self.embolden, format!("{}", self.profile.embolden));
+        // Greyscale + FT_LOAD_FORCE_AUTOHINT snaps capital heights unevenly at
+        // small sizes (verified by rendering; LCD targets do not) - say so.
+        let warn = self.profile.aa == Aa::Grey && self.profile.hinting == 2;
+        // SAFETY: `warn` is a live static of ours.
+        unsafe {
+            let _ = ShowWindow(self.warn, if warn { SW_SHOW } else { SW_HIDE });
+        }
         let name_len = self.lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(0);
         let face = String::from_utf16_lossy(&self.lf.lfFaceName[..name_len]);
         let t = wide(&format!("{face}  {}px", self.lf.lfHeight.unsigned_abs()));
@@ -620,6 +647,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 with_dlg(Dlg::read_controls);
                 LRESULT(0)
             }
+            // Red text for the warning static; everything else is default.
+            WM_CTLCOLORSTATIC if lparam.0 != 0 && WARN_HWND.with(Cell::get) == lparam.0 => {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                SetTextColor(hdc, COLORREF(0x0000_00C0)); // BGR: dark red
+                SetBkMode(hdc, TRANSPARENT);
+                LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
+            }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
                 let code = (wparam.0 >> 16) & 0xFFFF;
@@ -658,7 +692,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_DESTROY => {
                 if let Some(d) = DLG.with(|d| d.borrow_mut().take()) {
                     let _ = DeleteObject(HGDIOBJ(d.font.0));
+                    let _ = DeleteObject(HGDIOBJ(d.warn_font.0));
                 }
+                WARN_HWND.with(|w| w.set(0));
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),

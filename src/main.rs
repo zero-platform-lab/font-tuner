@@ -15,7 +15,7 @@ mod sysfont;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::Threading::{CreateMutexW};
@@ -31,6 +31,7 @@ const ID_RELOAD: usize = 3;
 const ID_VERSION: usize = 4;
 const ID_CUSTOM: usize = 5;
 const ID_CUSTOM_EDIT: usize = 6;
+const ID_RESTART: usize = 7;
 const ID_PROFILE_BASE: usize = 100;
 const ID_SYSFONT_DEFAULT: usize = 200;
 const ID_SYSFONT_BASE: usize = 201;
@@ -402,6 +403,8 @@ impl App {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let tv = wide(&format!("{} {}", self.s.version, env!("CARGO_PKG_VERSION")));
             let _ = AppendMenuW(menu, MF_STRING, ID_VERSION, PCWSTR(tv.as_ptr()));
+            let trs = wide(self.s.restart);
+            let _ = AppendMenuW(menu, MF_STRING, ID_RESTART, PCWSTR(trs.as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, PCWSTR(t3.as_ptr()));
             menu
         }
@@ -410,6 +413,8 @@ impl App {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// Set by "Restart": relaunch after the message loop ends.
+    static RESTART: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
@@ -491,6 +496,13 @@ fn handle_command(hwnd: HWND, cmd: usize) {
         ID_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
         },
+        // Same as Exit, then `main` relaunches this exe once the hook is off
+        // and the single-instance mutex is released (see the end of `main`).
+        // SAFETY: destroying our own window.
+        ID_RESTART => unsafe {
+            RESTART.with(|r| r.set(true));
+            let _ = DestroyWindow(hwnd);
+        },
         // Ask every injected process to re-read font-tuner.ini. The core's
         // GetMsgProc handles this message on each process's own UI thread.
         // SAFETY: a static message name; broadcasting a registered message.
@@ -550,7 +562,7 @@ fn main() {
     // ours, and `msg` is our own MSG.
     unsafe {
         let name = wide("Local\\font-tuner");
-        let _mutex = CreateMutexW(None, false, PCWSTR(name.as_ptr()));
+        let mutex = CreateMutexW(None, false, PCWSTR(name.as_ptr()));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             msgbox(s.err_already);
             return;
@@ -618,5 +630,17 @@ fn main() {
             DispatchMessageW(&raw const msg);
         }
         APP.with(|a| *a.borrow_mut() = None);
+        // "Restart": the hook is already off (WM_DESTROY) and the tray icon
+        // gone. Release the single-instance mutex before spawning, or the
+        // child would see ERROR_ALREADY_EXISTS and quit. Nothing else of ours
+        // runs at this point, so the child hooks afresh like a manual start.
+        if RESTART.with(std::cell::Cell::get) {
+            if let Ok(h) = mutex {
+                let _ = CloseHandle(h);
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).spawn();
+            }
+        }
     }
 }
