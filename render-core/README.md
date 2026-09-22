@@ -1,57 +1,54 @@
-# render-core (experimental)
+# render-core（実験的）
 
-An offline Rust port of the **MacType glyph-rendering core** — the
-gamma/contrast/LCD tuning and linear-space blend in upstream [`ft.cpp`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/ft.cpp) that
-sit on top of FreeType. Given *a character + a rendering profile* it produces
-pixels exactly as MacType would.
+**MacType のグリフ描画コア**をオフラインで Rust に移植したもの。FreeType の
+上に乗るガンマ/コントラスト/LCD 調整と線形空間ブレンド（上流
+[`ft.cpp`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/ft.cpp)）を移植している。*文字 + 描画プロファイル*を与えると、MacType と同じ計算式で
+ピクセルを生成する。
 
-**What this is not:** it does not hook or inject anything. The system-wide half
-of MacType (GDI / DirectWrite interception, DLL injection, writing pixels back
-into each process) is out of scope and stays in the C++ core.
+**これでないもの:** フックや注入をしない。MacType のシステム全体側（GDI /
+DirectWrite の横取り、DLL 注入、各プロセスへのピクセル書き戻し）は対象外で、
+`render-inject` 側にある。
 
-## Relationship to FreeType
+## FreeType との関係
 
-FreeType is the rasteriser (outline → coverage bitmap); MacType is the tuning +
-hooking layer on top. This crate **reuses the same FreeType fork unchanged**
-(`build/lib/freetype64.lib`, via the small C shim in `shim.c`), so glyph
-rasterisation is identical — only MacType's tuning/blend is reimplemented in
-Rust.
+FreeType がラスタライザ（アウトライン → カバレッジビットマップ）で、MacType は
+その上の調整 + フック層。このクレートは**同じ FreeType フォークを変更せず再利用**
+する（`build/lib/freetype64.lib`）。グリフのラスタライズは同一で、MacType の
+調整・ブレンドだけを Rust で書き直している。
 
-## Layout
+## 構成
 
-| file | role |
+| ファイル | 役割 |
 |---|---|
-| `src/filter.rs` | gamma/contrast LUTs + linear-space blend (`CAlphaBlend::init` / `doAB`) |
-| `src/ft.rs` | safe wrapper over the FreeType shim; load-flag / render-mode selection |
-| `src/config.rs` | `Profile` (subset of MacType.ini) + presets |
-| `src/render.rs` | glyph layout + greyscale / LCD compositing onto an RGB canvas |
-| `src/main.rs` | demo CLI (renders the sample string per profile) |
+| `src/filter.rs` | ガンマ/コントラスト LUT + 線形空間ブレンド（`CAlphaBlend::init` / `doAB`） |
+| `src/ft.rs` | FreeType への直接 FFI。ロードフラグ / レンダーモードの選択 |
+| `src/config.rs` | `Profile`（MacType.ini の一部）+ プリセット |
+| `src/render.rs` | グリフ配置 + グレースケール / LCD を RGB キャンバスへ合成 |
+| `src/main.rs` | デモ CLI（プロファイルごとにサンプル文字列を描く） |
 
-## Verification
+## 検証
 
-The blend formula is the specification — see **docs/SPEC.md §2.3** for the
-gamma encode, coverage curve and linear-space blend this crate implements.
-Correctness is "implements that formula," so it is checked by `cargo test`
-(`src/filter.rs`): endpoints, monotonicity, every `GammaMode` branch, and a
-greyscale regression at gamma 1.25. `cargo test` needs no font (the blend
-tests are pure); the FreeType path test skips cleanly if the system font is
-absent.
+ブレンドの計算式が仕様。実装するガンマ符号化・カバレッジ曲線・線形空間ブレンド
+は **docs/SPEC.md §2.3** を参照。正しさは「その計算式を実装しているか」なので、
+`cargo test`（`src/filter.rs`）で検証する: 端点、単調性、全 `GammaMode` 分岐、
+gamma 1.25 のグレースケール回帰。ブレンドテストは純粋なのでフォント不要。
+FreeType 経路のテストはシステムフォントが無ければ綺麗にスキップする。
 
-## Build
+## ビルド
 
-Requires `build/lib/freetype64.lib` first — run `build-core.ps1` at the repo
-root once. Then:
+先に `build/lib/freetype64.lib` が要る。リポジトリ直下で `build-core.ps1` を
+一度実行する。その後:
 
 ```powershell
-cargo build --release        # from render-core/
-cargo run --release          # renders clean-greyscale / clean-sharp / accurate PNGs
+cargo build --release        # render-core/ から
+cargo run --release          # clean-greyscale / clean-sharp / accurate の PNG を描く
 ```
 
-This crate is excluded from the repo workspace (it links a build artifact and is
-not part of the shipped product).
+このクレートはリポジトリのワークスペースから除外している（ビルド生成物をリンク
+し、出荷物には含まれないため）。
 
-## Status / not yet done
+## 状態・未着手
 
-- Colour text beyond black, shadow, mono, BGRA/emoji paths
-- Outline embolden variants (BolderMode 1/2, synthetic bold), italic slant
-- The hook / injection / DirectWrite layer (the hard, system-wide part)
+- 黒以外の色テキスト、影、モノクロ、BGRA/絵文字の経路
+- アウトラインの太字化バリエーション（BolderMode 1/2、合成ボールド）、斜体
+- フック / 注入 / DirectWrite 層（難しいシステム全体側）
