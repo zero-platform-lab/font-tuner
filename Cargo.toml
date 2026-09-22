@@ -5,9 +5,16 @@ members = ["bootstrap"]
 # not part of the shipped product. Build it on its own from render-core/.
 exclude = ["render-core", "render-inject", "loader"]
 
+# Single source of truth for the shipped version: the exe and both DLLs embed
+# it as a VERSIONINFO resource (build.rs), and build-msi.ps1 reads it for the
+# MSI. Bump it for every release - Windows Installer replaces a versioned file
+# only when the new version is higher.
+[workspace.package]
+version = "0.1.0"
+
 [package]
 name = "font-tuner"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Font rendering tuner for Windows (tray + RenderCore64 injector)"

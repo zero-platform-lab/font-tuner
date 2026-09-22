@@ -1,16 +1,12 @@
-// Embed the tray/app icons + manifest (app.rc) and the version resource into
-// the executable.
+// Embed the version resource into RenderBootstrap64.dll.
 fn main() {
-    embed_resource::compile("app.rc", embed_resource::NONE).manifest_optional().unwrap();
-    println!("cargo:rerun-if-changed=app.rc");
-    println!("cargo:rerun-if-changed=app.manifest");
-    version_rc(env!("CARGO_PKG_VERSION"), "font-tuner.exe", "font-tuner tray", 1, false);
+    version_rc(env!("CARGO_PKG_VERSION"), "RenderBootstrap64.dll", "font-tuner bootstrap", 2, true);
 }
 
 /// Emit a VERSIONINFO resource for `file` and hand it to embed-resource.
 /// Windows Installer replaces an existing file only if the new one carries a
 /// higher version; an unversioned file that looks "modified" (mtime != ctime)
-/// is left alone, which silently kept an old font-tuner.exe in place on upgrade.
+/// is left alone, which silently kept an old RenderBootstrap64.dll in place on upgrade.
 fn version_rc(version: &str, file: &str, description: &str, filetype: u32, cdylib: bool) {
     let out = std::env::var("OUT_DIR").unwrap();
     let mut n = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));

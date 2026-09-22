@@ -170,7 +170,7 @@ out = g⁻¹( g(bg)·(1 - a(cov)) + g(fg)·a(cov) )
 
 * **ツールフラグ** — `.cargo/config.toml` が MSVC ターゲットに `+crt-static` を設定し、`VCRUNTIME140.dll` 依存（と DLL 探索順ハイジャックの面）を消す。Releaseプロファイル: `opt-level="s"`、LTO、`panic="abort"`、strip 済み。
 * **`build-core.ps1`** — 出荷 DLL に必要な唯一のネイティブ依存だけをビルドする:snowie2000 の FreeType フォーク（`freetype64.lib`）を MSBuild/vswhere で。C++ のMacType コア・Detours・IniParser はもうビルドしない。描画コアは Rust（`RenderCore64.dll`）で、フックは `retour` を使う。
-* **`build-msi.ps1`** — `build-core.ps1`、`cargo build --release`（ワークスペース + `render-inject`）を走らせる。`check-export-rva.ps1` でコアが `GetMsgProc` を RVA`0x1000` に export しているか確認する（違えば中止、1.1 参照）。次に exe + DLL 群 +`font-tuner.ini` + `ini\*.ini` を `build\pkg` に集める。最後に `wix build` で `dist\font-tuner-<ver>-x64.msi`。
+* **`build-msi.ps1`** — `build-core.ps1`、`cargo build --release`（ワークスペース + `render-inject`）を走らせる。`check-export-rva.ps1` でコアが `GetMsgProc` を RVA`0x1000` に export しているか確認する（違えば中止、1.1 参照）。exe と 2 つの DLL のファイルバージョンが `Cargo.toml` の版と一致するかも確認する（違えば中止、§6 参照）。次に exe + DLL 群 +`font-tuner.ini` + `ini\*.ini` を `build\pkg` に集める。最後に `wix build` で `dist\font-tuner-<ver>-x64.msi`。
 
 ---
 
@@ -181,6 +181,7 @@ out = g⁻¹( g(bg)·(1 - a(cov)) + g(fg)·a(cov) )
 * **インストール時** — 動作中の `font-tuner.exe` を止め、Font-tuner を起動する。
 * **Restart Manager 無効化**（`MSIRESTARTMANAGERCONTROL=Disable`、`REBOOT=ReallySuppress`）: `RenderCore64.dll` は全 GUI プロセスにマップされている。無効化しないと Restart Manager がそれらを全部閉じる（ユーザーのシェルを落としたことがある）。閉じるのはトレイだけにする。
 * **使用中コアの入れ替え** — コアが全動作中プロセスにマップ（かつ常駐固定）されているため、そのファイルは決して上書きできない。遅延カスタムアクション（`RenameOldCore`、`InstallInitialize` の直後、`RemoveExistingProducts` の前にスケジュール）が使用中の `RenderCore64.dll` を脇へリネームし、`InstallFiles` が新しいものをすぐ置ける。起動し直したトレイが新コアでフックする。脇へリネームしたコピーは次の再起動時の削除に予約する（`MoveFileEx DELAY_UNTIL_REBOOT`）。以降に起動するプロセスへ更新を効かせるのに再起動は要らない。脇へリネームしたイメージは元のパスのまま全動作中プロセスにマップされ続ける。だから新コアで`GetMsgProc` の RVA を同じに保つ必要がある（1.1）。コアが食い違う動作中プロセスをトレイが見つけたら、フックせずサインアウトを促す（1.2）。
+* **バージョン資源** — 版は root `Cargo.toml` の `[workspace.package] version` が唯一の出所。exe と両 DLL は各 `build.rs` が生成する `VERSIONINFO` でそれを埋め込む。`render-inject` はワークスペース外なので、その `build.rs` は root `Cargo.toml` を読む。Windows Installer は版付きのファイルを「新しい版が高いときだけ」置き換える。版なしのファイルは、更新日時が作成日時と違うと「利用者が改変した」とみなして置き換えない（[File Versioning Rules](https://learn.microsoft.com/en-us/windows/win32/msi/file-versioning-rules)）。版なしだった頃は更新で `font-tuner.exe` が古いまま残った（ログに `Existing file is unversioned but modified`）。だからリリースごとに版を上げる。同じ版で入れ直すときは `REINSTALL=ALL REINSTALLMODE=amus` を付けるか、アンインストールしてから入れる。
 * **`font-tuner.ini`** は `NeverOverwrite` を付ける。ユーザーが選んだプロファイル（`AlternativeFile` の値）が更新をまたいで残る。
 * **アンインストール** — 標準の「プログラムの追加と削除」項目、または`msiexec /x {ProductCode}`。ファイル・Run レジストリ値を消し、プロセスを止める。
 * **署名** — MSI とそのペイロードは**未署名**なので、インストール時に UAC が「発行元不明」と出す（SmartScreen も出うる）。ブロックはされない。署名はリリースを帰属不能に保つためあえて省く。どのみちブラウザのレンダラー/GPU プロセスへ到達する助けにならない（§1.3）。

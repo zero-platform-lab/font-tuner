@@ -6,6 +6,8 @@
 #   5. wix build
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+# The shipped version lives in [workspace.package] of the root Cargo.toml; the
+# exe and both DLLs embed it as a VERSIONINFO resource (see each build.rs).
 $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 
 & .\build-core.ps1
@@ -35,6 +37,14 @@ $core = 'render-inject\target\release\RenderCore64.dll'
 $rva = & .\check-export-rva.ps1 $core GetMsgProc
 if ($rva -ne 0x1000) { throw "GetMsgProc is at RVA 0x$('{0:X}' -f $rva), expected 0x1000 - see render-inject\build.rs" }
 Copy-Item $core $stage -Force
+# Every binary must carry $ver as its file version. Windows Installer replaces
+# a file only when the new version is higher, and leaves an *unversioned* file
+# alone whenever it looks modified - which once kept an old exe in place on
+# upgrade. So refuse to ship a binary whose version resource is missing or off.
+foreach ($f in 'font-tuner.exe', 'RenderBootstrap64.dll', 'RenderCore64.dll') {
+    $fv = (Get-Item "$stage\$f").VersionInfo.FileVersion
+    if ($fv -ne $ver) { throw "$f has file version '$fv', expected '$ver' - see build.rs" }
+}
 Copy-Item profiles\font-tuner.ini $stage -Force
 Copy-Item profiles\ini\*.ini "$stage\ini" -Force
 
