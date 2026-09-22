@@ -18,7 +18,7 @@
 
     <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallExecute" DowngradeErrorMessage="新しい版の Font-tuner がすでに入っている。" />
 
-    <!-- RenderCore64.dll (and RenderBootstrap64.dll) is injected into every process on the machine, so it
+    <!-- RenderCore64.dll is injected into every process on the machine, so it
          is always "in use" by the user's terminal, shell, editor, etc.  With the
          Restart Manager enabled, msiexec would close ALL of those to replace the
          DLL - it has killed the user's PowerShell / Claude Code session more
@@ -52,15 +52,6 @@
       </Component>
       <Component Id="CoreDll">
         <File Id="RenderCore64.dll" Source="$(var.StageDir)\RenderCore64.dll" />
-      </Component>
-      <Component Id="BootstrapDll">
-        <!-- Child-process loader stub the core injects into every process it
-             spawns (expfunc.cpp GdippInjectDLL). Rust replacement for the
-             closed-source upstream bootstrap. Reaches ordinary child processes
-             (e.g. Chrome's crashpad-handler / utility processes); it does NOT
-             reach Chrome/Edge renderer & GPU processes, which block unsigned
-             DLLs via MITIGATION_FORCE_MS_SIGNED_BINS. -->
-        <File Id="RenderBootstrap64.dll" Source="$(var.StageDir)\RenderBootstrap64.dll" />
       </Component>
       <Component Id="MainIni" NeverOverwrite="yes" Permanent="no">
         <!-- User-edited; never clobbered on upgrade. -->

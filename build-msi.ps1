@@ -1,7 +1,7 @@
 # Build everything and wrap it in an MSI with WiX v6:
 #   1. native static libs incl. the FreeType fork (build-core.ps1)
 #   2. RenderCore64.dll = the Rust render-inject core (links render-core)
-#   3. font-tuner.exe + RenderBootstrap64.dll (release, workspace)
+#   3. font-tuner.exe (release, workspace)
 #   4. build/pkg = exe + DLLs + font-tuner.ini + ini\*.ini
 #   5. wix build
 $ErrorActionPreference = 'Stop'
@@ -28,7 +28,6 @@ $stage = "$PSScriptRoot\build\pkg"
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage, "$stage\ini", dist | Out-Null
 Copy-Item target\release\font-tuner.exe $stage -Force
-Copy-Item target\release\RenderBootstrap64.dll $stage -Force
 # GetMsgProc must stay at RVA 0x1000 (render-inject\build.rs pins it with
 # /ORDER). Running processes keep the previous core mapped, and the new tray's
 # hook is resolved as old_base + this RVA inside them — if it moved, every one
@@ -41,7 +40,7 @@ Copy-Item $core $stage -Force
 # a file only when the new version is higher, and leaves an *unversioned* file
 # alone whenever it looks modified - which once kept an old exe in place on
 # upgrade. So refuse to ship a binary whose version resource is missing or off.
-foreach ($f in 'font-tuner.exe', 'RenderBootstrap64.dll', 'RenderCore64.dll') {
+foreach ($f in 'font-tuner.exe', 'RenderCore64.dll') {
     $fv = (Get-Item "$stage\$f").VersionInfo.FileVersion
     if ($fv -ne $ver) { throw "$f has file version '$fv', expected '$ver' - see build.rs" }
 }

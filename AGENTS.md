@@ -3,7 +3,7 @@
 font-tuner の repo 固有ルール。一般的な文章術やエージェントの振る舞いは書かない。
 
 ## 名称・ライセンス
-- 製品の名称は `font-tuner` / `RenderCore64.dll` / `RenderBootstrap64.dll` / `font-tuner.ini` を使う
+- 製品の名称は `font-tuner` / `RenderCore64.dll` / `font-tuner.ini` を使う
 - 製品のファイル名・設定キー・UI 文言に上流プロジェクト名を使わない（GPL の帰属を示す表記としてのみ残す）
 - ライセンスは GPL-3.0-only と書く（`-or-later` にしない。上流が「or later」を許諾していない）
 
