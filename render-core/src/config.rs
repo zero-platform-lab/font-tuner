@@ -180,6 +180,7 @@ impl Profile {
                                      4 => Aa::LightLcdRgb, 5 => Aa::LightLcdBgr, _ => p.aa };
                 },
                 "GammaValue" => if let Ok(f) = v.parse() { p.gamma = f; },
+                "GammaMode" => if let Ok(n) = v.parse() { p.gamma_mode = n; },
                 "Contrast" => if let Ok(f) = v.parse() { p.contrast = f; },
                 "RenderWeight" => if let Ok(f) = v.parse() { p.weight = f; },
                 "LcdFilter" => if let Ok(n) = v.parse() { p.lcd_filter = n; },
@@ -233,6 +234,22 @@ Contrast=0.0
         assert!((p.dw.contrast - 0.0625).abs() < 1e-6);
         assert!((p.dw.cleartype_level - 1.0).abs() < 1e-6, "absent key keeps the upstream default");
         assert_eq!(p.dw.rendering_mode, 5);
+    }
+
+    #[test]
+    fn from_ini_parses_gamma_mode() {
+        let p = Profile::from_ini_str("[General]
+GammaMode=1
+NormalWeight=8
+");
+        assert_eq!(p.gamma_mode, 1);
+        assert_eq!(p.embolden, 8);
+        // Shipped profiles say GammaMode=0 (plain power gamma), the default.
+        assert_eq!(Profile::from_ini_str("[General]
+GammaMode=0
+").gamma_mode, 0);
+        assert_eq!(Profile::from_ini_str("[General]
+").gamma_mode, 0);
     }
 
     #[test]

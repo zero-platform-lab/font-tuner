@@ -52,13 +52,13 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 | プロファイル | ヒンティング | アンチエイリアス | 性格 |
 |---|---|---|---|
-| **Clean Greyscale** *(既定)* | 0（なし） | 0 グレースケール | 中庸で柔らかく、色にじみなし。出荷時の既定。 |
-| **Clean Dark Greyscale** | 0（なし） | 0 グレースケール | 暗い背景向けに調整したグレースケール（低め gamma 1.1、contrast 0.9、やや太め）。 |
-| **Accurate** | 2（TrueType バイトコード） | 4 LightLCD | フォント自身のヒント命令で最も強くグリッドフィット。小さい/UI サイズで最も鮮鋭、形が最もピクセル整列。 |
-| **Clean Sharp** | 1（FreeType light） | 2 LCD | サブピクセル（カラー）LCD、中程度のヒンティング。横方向の細部が高く鮮鋭。（旧「Clean」） |
-| **Clean Sharp Dark** | 0（なし） | 2 LCD | 暗い背景向けに調整した LCD サブピクセル。（旧「Clean Dark」） |
+| **Clean Greyscale** *(既定)* | 0（フォント内蔵） | 0 グレースケール | 中庸で柔らかく、色にじみなし。出荷時の既定。 |
+| **Clean Dark Greyscale** | 0（フォント内蔵） | 0 グレースケール | 暗い背景向けに調整したグレースケール（低め gamma 1.1、contrast 0.9、やや太め）。 |
+| **Accurate** | 2（FreeType オートヒント） | 4 LightLCD | FreeType のオートヒンタで最も強くグリッドフィット。小さい/UI サイズで最も鮮鋭、形が最もピクセル整列。 |
+| **Clean Sharp** | 1（なし） | 2 LCD | サブピクセル（カラー）LCD、ヒンティングなし。横方向の細部が高く鮮鋭。（旧「Clean」） |
+| **Clean Sharp Dark** | 0（フォント内蔵） | 2 LCD | 暗い背景向けに調整した LCD サブピクセル。（旧「Clean Dark」） |
 
-ヒンティングモード: **0** = なし（アウトラインのまま、最も柔らかく最も忠実な形）。**1** = FreeType の light オートヒント（縦ステムをグリッドフィット、バランス型）。**2** = TrueType バイトコード（フォント自身のヒント、最も強く小サイズで最も鮮鋭、形が少し歪みうる）。全プロファイルが DirectWrite `RenderingMode=2`（GDI_CLASSIC）を使い、GDI と DirectWrite のテキストを一致させる。
+ヒンティングモード（上流 `ft.cpp` の `FreeTypePrepare` と同じ対応。`render-core/src/ft.rs` の `flags`）: **0** = フラグなし＝FreeType の既定。フォント内蔵の TrueType バイトコードがあればそれでヒントする。**1** = `FT_LOAD_NO_HINTING`（アウトラインのまま、最も柔らかく最も忠実な形）。**2** = `FT_LOAD_FORCE_AUTOHINT`（FreeType のオートヒンタ、最も強く小サイズで最も鮮鋭、形が少し歪みうる）。全プロファイルが DirectWrite `RenderingMode=2`（GDI_CLASSIC）を使い、GDI と DirectWrite のテキストを一致させる。
 
 `[DirectWrite]` 節（`GammaValue`・`Contrast`・`ClearTypeLevel`・`RenderingMode`）は、自前でラスタライズできないテキストに対して Direct2D へ指定する値（1.2）。既定は上流に従う: gamma は一般の gamma から導出（`g² > 1.3 ? g²/2 : 0.7`）、contrast 1.0、ClearType level 1.0、mode 5。`GammaValue` が 0（グレースケール系プロファイルの出荷値）のときは「上書きしない」の意味で、導出 gamma にフォールバックする（DirectWrite は gamma > 0 を要求するため）。
 
@@ -66,7 +66,37 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 ### 2.2 メニュー順
 
-トレイはプロファイルを固定の優先順（`src/main.rs` の `ORDER`）で並べ、アルファベット順にはしない: グレースケールの 2 つ → Accurate → LCD の「Clean Sharp」系。一覧にないプロファイルはその後にアルファベット順で入るので、`.ini` を足せばコード変更なしで表示される。
+トレイはプロファイルを固定の優先順（`src/main.rs` の `ORDER`）で並べ、アルファベット順にはしない: グレースケールの 2 つ → Accurate → LCD の「Clean Sharp」系。一覧にないプロファイルはその後にアルファベット順で入るので、`.ini` を足せばコード変更なしで表示される。その下に区切りを挟んで「カスタム」（2.3）と「カスタムを調整...」が並ぶ。
+
+### 2.3 カスタムプロファイル
+
+「カスタムを調整...」（`src/custom.rs`）は、コアが読む 8 つのキーをコンボ / スライダーで変えるダイアログを開く。
+
+| キー | 選択肢 / 範囲 |
+|---|---|
+| `HintingMode` | 0 フォント内蔵 / 1 なし / 2 オートヒント |
+| `AntiAliasMode` | 0 グレースケール / 2 LCD RGB / 3 LCD BGR / 4 LightLCD RGB / 5 LightLCD BGR |
+| `LcdFilter` | 0 なし / 1 標準 / 2 ライト / 3 レガシー |
+| `GammaMode` | 0 べき乗 / 1 sRGB / 2 平均 / -1 線形 |
+| `GammaValue` | 0.50〜3.00 |
+| `Contrast` | 0.50〜2.50 |
+| `RenderWeight` | 0.50〜2.50 |
+| `NormalWeight` | -16〜48（26.6 固定小数） |
+
+スライダーの範囲は非常識な値（潰れる / 消える）にならない幅で切ってある。`--custom` 引数で起動すると同じダイアログを直接開く。
+
+プレビューはトレイ自身が `render-core` をリンクして描く（注入なし）。フォントは `GetFontData` で GDI から取り出して FreeType にメモリ面として渡す。注入したコアが各 DC でやっているのと同じ経路なので、プレビューと実描画は同じラスタライザ・同じフォントデータを通る。プレビュー用のフォントは「フォント...」（`ChooseFont`）で替えられ、既定はシステムのメッセージフォント。トレイの exe はマニフェストで PerMonitorV2 の DPI 対応を宣言しているので、プレビューはビットマップ拡大されず 1:1 で出る。
+
+「適用」は `%APPDATA%\Font-tuner\Custom.ini` を書き、`font-tuner.ini` の `AlternativeFile=` にその**絶対パス**を入れ、「プロファイルを再読み込み」と同じブロードキャストを送り、全ウィンドウを無効化して再描画させる。コアの `profile.rs` は `AlternativeFile` を `dir.join(rel)` で解決していて、Rust の `Path::join` は右辺が絶対パスならそれをそのまま返す。だからこの機能で `RenderCore64.dll` は変わらない。
+
+結果として起きること:
+
+* ファイルを書くのはトレイだけ。コアは読むだけ（従来どおり）。
+* `Custom.ini` が読めないプロセス（ファイルを消した、別ユーザーの `%APPDATA%` を指している）は、従来と同じく組み込みの Clean Greyscale に落ちる。落ちる（クラッシュする）経路はない。
+* `font-tuner.ini` は全ユーザー共通なので、あるユーザーがカスタムを選ぶと、別ユーザーのプロセスは他人の `%APPDATA%` を読めず既定に落ちる。共有 PC ではそのユーザーが自分のプロファイルを選び直す。
+* メニューの「カスタム」は `Custom.ini` があるときだけ選べる（無ければグレー）。
+
+`GammaMode` はこの機能に合わせてコアの ini パーサが読むようになった（`config.rs`）。出荷プロファイルはすべて `GammaMode=0`（べき乗）なので既存の挙動は変わらない。
 
 ```
 1. Clean Greyscale

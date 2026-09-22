@@ -3,3 +3,7 @@
 // 2 = silver (dark taskbar). Both are CC0 gear art with an "A" (font tool).
 1 ICON "assets/tray-light.ico"
 2 ICON "assets/tray-dark.ico"
+
+// Application manifest: Common Controls 6 (themed dialog controls) and
+// per-monitor DPI awareness for the custom-profile dialog.
+1 24 "app.manifest"

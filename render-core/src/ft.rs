@@ -203,13 +203,19 @@ pub struct Ft {
 }
 
 impl Ft {
-    /// Initialise FreeType and open a face from a font file.
-    pub fn open(path: &str, face_index: i64) -> Result<Ft, i32> {
+    /// Initialise FreeType with no face yet; `reface_memory` / `reopen` set one.
+    pub fn new() -> Result<Ft, i32> {
         let mut lib: FT_Library = std::ptr::null_mut();
         // SAFETY: `lib` is an out-param FreeType fills; checked before use.
         let r = unsafe { FT_Init_FreeType(&raw mut lib) };
         if r != 0 { return Err(r); }
-        let ft = Ft { lib, face: Cell::new(std::ptr::null_mut()), membuf: UnsafeCell::new(Vec::new()) };
+        Ok(Ft { lib, face: Cell::new(std::ptr::null_mut()), membuf: UnsafeCell::new(Vec::new()) })
+    }
+
+    /// Initialise FreeType and open a face from a font file.
+    pub fn open(path: &str, face_index: i64) -> Result<Ft, i32> {
+        let ft = Ft::new()?;
+        let lib = ft.lib;
         let c = CString::new(path).map_err(|_| -1)?;
         let mut face: FT_Face = std::ptr::null_mut();
         // SAFETY: `lib` is live, `c` is a NUL-terminated path, `face` is an
