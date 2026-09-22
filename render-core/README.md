@@ -26,24 +26,27 @@ Rust.
 | `src/config.rs` | `Profile` (subset of MacType.ini) + presets |
 | `src/render.rs` | glyph layout + greyscale / LCD compositing onto an RGB canvas |
 | `src/main.rs` | demo CLI + `verify` curve dumps |
-| `shim.c` | FreeType C shim (uses the fork headers, links `freetype64.lib`) |
 
-## Verification (bit-exact)
+## Verification (matches the formula within 1 level)
 
-The blend math is proven identical to the C++ original, not just "close":
+The blend is the same formula as the C++ original, computed in f32 rather than
+upstream's fixed-point integers, so it agrees to within one 8-bit level (float
+rounding vs the fixed-point `>>16` truncation — imperceptible, and the float
+result is the more accurate of the two):
 
-- **Greyscale**: all 256 coverage values × 6 profiles — bit-for-bit equal.
-- **LCD**: 1296 vectors (AAMode 2/3 × backgrounds × coverage triples) — equal.
+- **Greyscale**: all 256 coverage values × 6 profiles — max diff 1.
+- **LCD**: 1296 vectors (AAMode 2/3 × backgrounds × coverage triples) — max diff 1.
 
-`verify/oracle.cpp` is the exact `ft.cpp` math compiled standalone (MSVC);
-`verify/compare.py` diffs it against this crate's dumps.
+`verify/oracle.cpp` is the exact `ft.cpp` fixed-point math compiled standalone
+(MSVC); `verify/compare.py` diffs it against this crate's dumps and passes when
+the max difference is ≤ 1.
 
 ```powershell
 # from render-core/
 cargo run --release -- verify           # writes rust-*.txt, lcd-rust.txt
 cl /nologo /O2 /EHsc verify\oracle.cpp /Fe:oracle.exe   # in a VS x64 prompt
 .\oracle.exe                            # writes cpp-*.txt, lcd-cpp.txt
-python verify\compare.py                # -> ALL BIT-EXACT
+python verify\compare.py                # -> max diff 1, WITHIN ±1
 ```
 
 ## Build
