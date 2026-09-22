@@ -119,7 +119,7 @@ TrueType インタープリタは FreeType の既定（v40）。上流は `INFIN
 
 TTC の中のフェイスは GDI の顔名（`LOGFONTW.lfFaceName`）で選ぶ（`Ft::reface_memory`）。FreeType の ASCII の `family_name` に加えて、`name` テーブルの Windows プラットフォーム項目（ID 1 / 16 / 21、UTF-16BE）も比べる。GDI が渡す顔名は日本語（「BIZ UDPゴシック」「游ゴシック」）なので、ASCII 名だけだと一致せずフェイス 0 に落ちる。BIZ UD では 0 が等幅の BIZ UDGothic で、欧文が等幅に並んでいた（実機で確認、修正済み。テストで日本語名 → プロポーショナル、ASCII 名 → 等幅を固定）。どの名前にも一致しなければフェイス 0。
 
-ピクセルサイズは `lfHeight` の絶対値。上流は `tmHeight - tmInternalLeading` を使う。`lfHeight` が正（セル高さ）のフォントでは差が出るが、未確認。
+ピクセルサイズ（em）は上流と同じく `GetTextMetricsW` の `tmHeight - tmInternalLeading`（`gdi.rs` の `em_px`）。`LOGFONTW.lfHeight` は負なら em、正ならセル高さ（em + 内部レディング）なので絶対値は使えない。0.1.1 までは絶対値を使っていて、`CreateFont(16, ...)` のような正の高さのフォントが内部レディングの分（Yu Gothic UI で 16 → 本来 12px のところ 16px）大きく描かれていた。フック経由で正負両方の高さを描いて修正を確認した。
 
 ### 2.4 ブレンド計算式
 
