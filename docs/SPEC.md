@@ -61,8 +61,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | DirectWrite（`dwrite.rs`） | `IDWriteBitmapRenderTarget::DrawGlyphRun`、`IDWriteFactory{,2,3}::CreateGlyphRunAnalysis` の vtable スロット | `windows` クレートの vtable 定義とスロット番号が一致すること（照合済み） | 一度きりのパッチはミューテックスで直列化。`IDWriteFontFace` の bytes + index で面を開き、その COM オブジェクトを `RenderState` が clone で保持してアドレスの再利用を防ぐ |
 | Direct2D（`d2d.rs`） | `D2D1CreateFactory` / `D2D1CreateDevice` / `D2D1CreateDeviceContext` と各ターゲットの vtable スロット 12 / 29 / 82 / 34 / 36 | 同上 | (vtable, slot) → 元関数のマップ `SLOT_ORIG` を 1 つのミューテックスで管理。`GetDC` を貸せないターゲットは OS に描かせる |
 | 自己常駐固定 | `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN)` | — | `DllMain(DLL_PROCESS_ATTACH)` で最初に行う。以降 `FreeLibrary` は no-op |
-| ログ | `%TEMP%
-ender-inject.log` に追記 | — | ロック付き。初回の描画結果を `render-inject-capture.png` に保存する（検証用） |
+| ログ | `%TEMP%\render-inject.log` に追記 | — | ロック付き。初回の描画結果を `render-inject-capture.png` に保存する（検証用） |
 
 `DllMain` では常駐固定・ミューテックス取得・スレッド起動だけを行い、フックの設置と FreeType の初期化は別スレッド（`on_attach`）で行う。ローダーロックの下で detour を張らない。
 

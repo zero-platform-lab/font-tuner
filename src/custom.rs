@@ -18,8 +18,8 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateFontIndirectW, DeleteDC, DeleteObject, EndPaint, FrameRect, GetFontData,
-    GetStockObject, InvalidateRect, SelectObject, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, GRAY_BRUSH, HBRUSH, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT,
+    GetStockObject, GetTextMetricsW, InvalidateRect, SelectObject, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS, GRAY_BRUSH, HBRUSH, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WindowsProgramming::WritePrivateProfileStringW;
@@ -143,6 +143,12 @@ struct Dlg {
     profile: Profile,
     ft: Option<Ft>,
     lf: LOGFONTW,
+    /// Em size in pixels for `lf`, taken from the DC's text metrics in
+    /// `load_font`. `lfHeight` is the em size when negative but the *cell*
+    /// height (em + internal leading) when positive, so its absolute value is
+    /// not the em size. The injected core derives it the same way
+    /// (`render-inject/src/gdi.rs::em_px`).
+    em_px: i32,
     /// Install dir's font-tuner.ini and the profile the tray had selected,
     /// used by "copy current".
     ini: PathBuf,
@@ -227,6 +233,7 @@ pub(crate) fn open(ini: PathBuf, current: Option<PathBuf>, s: &lang::Strings) {
             profile,
             ft: Ft::new().ok(),
             lf,
+            em_px: 12,
             ini,
             current,
             s: *s,
@@ -435,7 +442,7 @@ impl Dlg {
         set(self.embolden, format!("{}", self.profile.embolden));
         let name_len = self.lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(0);
         let face = String::from_utf16_lossy(&self.lf.lfFaceName[..name_len]);
-        let t = wide(&format!("{face}  {}px", self.lf.lfHeight.unsigned_abs()));
+        let t = wide(&format!("{face}  {}px", self.em_px));
         // SAFETY: as above.
         unsafe {
             let _ = SetWindowTextW(self.font_name, PCWSTR(t.as_ptr()));
@@ -465,6 +472,12 @@ impl Dlg {
             let hfont = CreateFontIndirectW(&raw const self.lf);
             let hdc = CreateCompatibleDC(None);
             let old = SelectObject(hdc, HGDIOBJ(hfont.0));
+            // Em size, as the injected core computes it for a DC.
+            let mut tm = TEXTMETRICW::default();
+            if GetTextMetricsW(hdc, &raw mut tm).as_bool() {
+                let em = tm.tmHeight - tm.tmInternalLeading;
+                self.em_px = if em > 0 { em } else { 12 };
+            }
             let (table, size) = match GetFontData(hdc, TTCF, 0, None, 0) {
                 0 | u32::MAX => (0, GetFontData(hdc, 0, 0, None, 0)),
                 n => (TTCF, n),
@@ -548,7 +561,7 @@ impl Dlg {
         let Some(ft) = self.ft.as_ref() else { return canvas };
         let p = &self.profile;
         let tables = tables_for(p);
-        let px = i32::try_from(self.lf.lfHeight.unsigned_abs()).unwrap_or(12).max(6);
+        let px = self.em_px.max(6);
         let big = px * 3 / 2;
         let pad = self.px(6);
         render_core::render::draw_text_onto(&mut canvas, ft, &tables, p, ink, self.s.custom_sample, px, (pad, pad + px), None);
