@@ -2,11 +2,10 @@
 //! *rendering* core (upstream MacType ft.cpp, commit 05052e8) — the gamma/contrast/LCD tuning and
 //! linear-space blend that sit on top of FreeType.
 //!
-//! Scope: it turns "a character + a profile" into pixels the way MacType does.
-//! The LUT + blend math is the formula in docs/SPEC.md 2.3, computed in f32
-//! instead of upstream's fixed-point integers (agreeing within one 8-bit
-//! level, this side more accurate). It does **not** hook or inject
-//! anything — the system-wide part of
+//! Scope: it turns "a character + a profile" into pixels, exactly as MacType
+//! would (the LUT + blend math is the formula in docs/SPEC.md 2.3, computed in
+//! upstream's fixed-point integers, so the bytes match the C++ code). It does
+//! **not** hook or inject anything — the system-wide part of
 //! MacType (GDI/DirectWrite interception, DLL injection) is out of scope here.
 //!
 //! FreeType itself is reused unchanged (the fork's `freetype64.lib`), so glyph

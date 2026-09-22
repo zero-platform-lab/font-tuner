@@ -13,7 +13,7 @@ FreeType 自体はフォークの `freetype64.lib` を変更せず再利用す�
 
 | クレート | 種別 | 役割 |
 |---|---|---|
-| `render-core` | lib | 描画エンジン: ガンマ/コントラスト/LCD の LUT + ブレンド（ft.cpp から移植、計算式に対して 1 階調以内で一致）、FreeType への直接 FFI（C シムなし）、`Profile`（`from_ini` 含む）、グリフ/文字列の合成 |
+| `render-core` | lib | 描画エンジン: ガンマ/コントラスト/LCD の LUT + ブレンド（ft.cpp から移植、上流と同じ固定小数点でバイト一致）、FreeType への直接 FFI（C シムなし）、`Profile`（`from_ini` 含む）、グリフ/文字列の合成 |
 | `render-inject` | cdylib `RenderCore64.dll` | 各プロセスに注入され、GDI + DirectWrite/Direct2D のテキストをフックして render-core で描く。自動注入用に `GetMsgProc` を export。自己を常駐固定し、動作中プロセスから決してアンマップされない |
 | `loader` | bin | RenderCore64.dll を使う WH_GETMESSAGE フックを 1 プロセスだけに張る。単一アプリでコアを試すテストハーネス |
 
@@ -55,8 +55,8 @@ retour はパッチ中に他スレッドを止めないので、`install_hook` �
 ## 動くもの
 
 - **render-core**: グレースケール + LCD、ガンマモード、weight/embolden — ブレンド
-  計算式（docs/SPEC.md §2.3）を f32 で実装（上流の固定小数点の整数ではない。上流と
-  1 階調以内で一致し、こちらの方が正確）。
+  計算式（docs/SPEC.md §2.3）を上流と同じ固定小数点の整数で実装（出力バイトは
+  上流と一致。f32 版は 1 階調の差で縁がでこぼこに見えたため戻した）。
 - **GDI** テキストを注入下で置換（文字列 + `ETO_GLYPH_INDEX`）。DC のフォント/色/
   ベースラインで、既存の内容の上に描く。
 - **DirectWrite**（`IDWriteBitmapRenderTarget::DrawGlyphRun`）を共有 vtable の
