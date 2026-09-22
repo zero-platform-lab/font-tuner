@@ -25,29 +25,17 @@ Rust.
 | `src/ft.rs` | safe wrapper over the FreeType shim; load-flag / render-mode selection |
 | `src/config.rs` | `Profile` (subset of MacType.ini) + presets |
 | `src/render.rs` | glyph layout + greyscale / LCD compositing onto an RGB canvas |
-| `src/main.rs` | demo CLI + `verify` curve dumps |
+| `src/main.rs` | demo CLI (renders the sample string per profile) |
 
-## Verification (matches the formula within 1 level)
+## Verification
 
-The blend is the same formula as the C++ original, computed in f32 rather than
-upstream's fixed-point integers, so it agrees to within one 8-bit level (float
-rounding vs the fixed-point `>>16` truncation — imperceptible, and the float
-result is the more accurate of the two):
-
-- **Greyscale**: all 256 coverage values × 6 profiles — max diff 1.
-- **LCD**: 1296 vectors (AAMode 2/3 × backgrounds × coverage triples) — max diff 1.
-
-`verify/oracle.cpp` is the exact `ft.cpp` fixed-point math compiled standalone
-(MSVC); `verify/compare.py` diffs it against this crate's dumps and passes when
-the max difference is ≤ 1.
-
-```powershell
-# from render-core/
-cargo run --release -- verify           # writes rust-*.txt, lcd-rust.txt
-cl /nologo /O2 /EHsc verify\oracle.cpp /Fe:oracle.exe   # in a VS x64 prompt
-.\oracle.exe                            # writes cpp-*.txt, lcd-cpp.txt
-python verify\compare.py                # -> max diff 1, WITHIN ±1
-```
+The blend formula is the specification — see **docs/SPEC.md §2.3** for the
+gamma encode, coverage curve and linear-space blend this crate implements.
+Correctness is "implements that formula," so it is checked by `cargo test`
+(`src/filter.rs`): endpoints, monotonicity, every `GammaMode` branch, and a
+greyscale regression at gamma 1.25. `cargo test` needs no font (the blend
+tests are pure); the FreeType path test skips cleanly if the system font is
+absent.
 
 ## Build
 

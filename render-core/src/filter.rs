@@ -5,11 +5,10 @@
 //! light, interpolate by the coverage alpha, decode back. Upstream does it in
 //! fixed-point integers (a 2000s speed trick, no faster on modern CPUs); this
 //! port computes the same formula in `f32`, rounding to the nearest byte where
-//! upstream truncates. The formula is the specification, so this is correct by
-//! construction; `verify/` cross-checks it against the C++ fixed-point and it
-//! agrees to within one 8-bit level (this side being the more accurate).
-//! A draw is two table lookups, a lerp and a short binary search — the tables
-//! absorb the `powf`.
+//! upstream truncates. The formula (SPEC.md 2.3) is the specification, so this
+//! is correct by construction and agrees with upstream to within one 8-bit
+//! level (this side being the more accurate). A draw is two table lookups, a
+//! lerp and a short binary search — the tables absorb the `powf`.
 
 /// Gamma-encode LUT (byte → linear light) and the coverage → alpha curve.
 pub struct Tables {
@@ -63,8 +62,8 @@ impl Tables {
     /// value is nearest `linear` — the most accurate inverse of `encode`.
     /// Binary-searches the (monotonic increasing) table, so it inverts every
     /// `GammaMode`, including the sRGB/linear average that has no closed form.
-    /// (Upstream truncates here instead; that is the ≤1-level difference
-    /// `verify/` allows, and this side is the more accurate.)
+    /// (Upstream truncates here instead; that is the ≤1-level difference from
+    /// its fixed-point output, and this side is the more accurate.)
     fn decode(&self, linear: f32) -> u8 {
         let hi = self.encode.partition_point(|&e| e < linear);
         if hi == 0 {
@@ -107,16 +106,16 @@ mod tests {
         }
     }
 
-    /// Black-on-white greyscale blend at gamma 1.25. The reference values come
-    /// from the C++ oracle (verify/), which computes the same formula in
-    /// fixed-point; the float port matches it within one level, which is what
-    /// this asserts (endpoints exact).
+    /// Black-on-white greyscale blend at gamma 1.25: known-good values from
+    /// the SPEC formula (SPEC.md 2.3), a regression guard against drift in the
+    /// LUTs or the blend. The tolerance absorbs the last-bit rounding freedom
+    /// in the decode; endpoints are exact.
     #[test]
     fn greyscale_regression_g125() {
         let t = Tables::build(1.25, 1.0, 1.0, 0);
         for &(cov, expect) in &[(0u8, 255u8), (32, 229), (64, 202), (128, 146), (192, 83), (255, 0)] {
             let got = i32::from(t.blend(255, 0, cov));
-            assert!((got - i32::from(expect)).abs() <= 1, "cov={cov}: got {got}, oracle {expect}");
+            assert!((got - i32::from(expect)).abs() <= 1, "cov={cov}: got {got}, want ~{expect}");
         }
     }
 

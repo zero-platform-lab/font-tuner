@@ -3,9 +3,9 @@
 //! linear-space blend that sit on top of FreeType.
 //!
 //! Scope: it turns "a character + a profile" into pixels the way MacType does.
-//! The LUT + blend math is the same formula as the C++ core, computed in f32
-//! instead of upstream's fixed-point integers, so it matches within one 8-bit
-//! level — `verify/` checks that bound. It does **not** hook or inject
+//! The LUT + blend math is the formula in docs/SPEC.md 2.3, computed in f32
+//! instead of upstream's fixed-point integers (agreeing within one 8-bit
+//! level, this side more accurate). It does **not** hook or inject
 //! anything — the system-wide part of
 //! MacType (GDI/DirectWrite interception, DLL injection) is out of scope here.
 //!

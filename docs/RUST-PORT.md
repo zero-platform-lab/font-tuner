@@ -54,9 +54,9 @@ by a mutex so two threads cannot both capture the "original" and recurse.
 
 ## What works
 
-- **render-core**: greyscale + LCD, gamma modes, weight/embolden — verified
-within **1 level** against the C++ original (`render-core/verify/`): the same
-  formula in f32, not upstream's fixed-point integers.
+- **render-core**: greyscale + LCD, gamma modes, weight/embolden — implements
+  the blend formula in docs/SPEC.md 2.3 (in f32, not upstream's fixed-point
+  integers; agrees with upstream within 1 level, this side more accurate).
 - **GDI** text replaced under injection (string + `ETO_GLYPH_INDEX`), with the
   DC's font/colour/baseline, over the existing content.
 - **DirectWrite** (`IDWriteBitmapRenderTarget::DrawGlyphRun`) replaced under
@@ -73,9 +73,9 @@ within **1 level** against the C++ original (`render-core/verify/`): the same
   `render-inject`.
 - **Performance**: the font file is extracted + re-faced only when the font
   actually changes (cached), not per draw.
-- **Tests**: `render-core` has `cargo test` units for the blend (a regression
-  guard against the C++ oracle values) and `Profile::from_ini`, plus the
-  golden harness in `verify/` (agreement within 1 level).
+- **Tests**: `render-core` has `cargo test` units for the blend (endpoints,
+  monotonicity, every GammaMode, a gamma-1.25 regression) and
+  `Profile::from_ini`; the formula they check is docs/SPEC.md 2.3.
 
 ## Port scope = MacType's full hook coverage
 
