@@ -52,7 +52,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 | プロファイル | ヒンティング | アンチエイリアス | 性格 |
 |---|---|---|---|
-| **Clean Greyscale** *(既定)* | 0（フォント内蔵） | 0 グレースケール | 中庸で柔らかく、色にじみなし。出荷時の既定。 |
+| **Clean Greyscale** *(既定)* | 2（FreeType オートヒント） | 0 グレースケール | 中庸で柔らかく、色にじみなし。出荷時の既定。 |
 | **Clean Dark Greyscale** | 0（フォント内蔵） | 0 グレースケール | 暗い背景向けに調整したグレースケール（低め gamma 1.1、contrast 0.9、やや太め）。 |
 | **Accurate** | 2（FreeType オートヒント） | 4 LightLCD | FreeType のオートヒンタで最も強くグリッドフィット。小さい/UI サイズで最も鮮鋭、形が最もピクセル整列。 |
 | **Clean Sharp** | 1（なし） | 2 LCD | サブピクセル（カラー）LCD、ヒンティングなし。横方向の細部が高く鮮鋭。（旧「Clean」） |
@@ -60,7 +60,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 ヒンティングモード（上流 `ft.cpp` の `FreeTypePrepare` と同じ対応。`render-core/src/ft.rs` の `flags`）: **0** = フラグなし＝FreeType の既定。フォント内蔵の TrueType バイトコードがあればそれでヒントする。**1** = `FT_LOAD_NO_HINTING`（アウトラインのまま、最も柔らかく最も忠実な形）。**2** = `FT_LOAD_FORCE_AUTOHINT`（FreeType のオートヒンタ、最も強く小サイズで最も鮮鋭、形が少し歪みうる）。
 
-アンチエイリアスモードもロードターゲットを決める（同じく `FreeTypePrepare`）: **0** グレースケール = `FT_LOAD_TARGET_NORMAL`。**2/3** LCD = `FT_LOAD_TARGET_LCD`。**4/5** LightLCD = `FT_LOAD_TARGET_LIGHT`（縦方向だけスナップする軽いオートヒント）で描画は LCD。オートヒント（HintingMode 2）は 12px 前後の日本語フォントの欧文で大文字の高さが字ごとにずれる（C や 3 が大きく、Z が小さく見える）。これは FreeType のオートヒンタの挙動で、ブレンドの計算とは無関係（`render-core` を直接呼んで HintingMode 0/1/2 を並べて確認した）。
+アンチエイリアスモードもロードターゲットを決める（同じく `FreeTypePrepare`）: **0** グレースケール = `FT_LOAD_TARGET_NORMAL`。**2/3** LCD = `FT_LOAD_TARGET_LCD`。**4/5** LightLCD = `FT_LOAD_TARGET_LIGHT`（縦方向だけスナップする軽いオートヒント）で描画は LCD。ヒンティングの見え方はフォント次第（`render-core` を直接呼んで HintingMode 0/1/2 を並べて確認した）。自前の TrueType ヒントを持つフォント（Yu Gothic）では、グレースケール × オートヒント（HintingMode 2）で 12px 前後の欧文の大文字の高さが字ごとにずれる（C や 3 が大きく、Z が小さい）。逆に欧文にヒントを持たないフォント（BIZ UDPゴシック。インタープリタ v35 と v40 で出力が同一）では、フォント内蔵（0）は事実上ヒントなしで、Z の上端が半ピクセルにかかって灰色の行になり、オートヒントなら揃う。既定の Clean Greyscale はオートヒント。Yu Gothic を嫌う人はシステムフォントをトレイで替えるので、替えた先のフォントで揃う方を既定にした。
 
 全プロファイルが DirectWrite `RenderingMode=2`（GDI_CLASSIC）を使い、GDI と DirectWrite のテキストを一致させる。
 
@@ -87,7 +87,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | `RenderWeight` | 0.50〜2.50 |
 | `NormalWeight` | -16〜48（26.6 固定小数） |
 
-スライダーの範囲は非常識な値（潰れる / 消える）にならない幅で切ってある。「グレースケール × FreeType オートヒント」を選ぶとプレビューの下に注意文を出す（2.1 の観察どおり大文字の高さが揃わないため。選べなくはしない）。`--custom` 引数で起動すると同じダイアログを直接開く。
+スライダーの範囲は非常識な値（潰れる / 消える）にならない幅で切ってある。`--custom` 引数で起動すると同じダイアログを直接開く。
 
 プレビューはトレイ自身が `render-core` をリンクして描く（注入なし）。フォントは `GetFontData` で GDI から取り出して FreeType にメモリ面として渡す。注入したコアが各 DC でやっているのと同じ経路なので、プレビューと実描画は同じラスタライザ・同じフォントデータを通る。プレビュー用のフォントは「フォント...」（`ChooseFont`）で替えられ、既定はシステムのメッセージフォント。トレイの exe はマニフェストで PerMonitorV2 の DPI 対応を宣言しているので、プレビューはビットマップ拡大されず 1:1 で出る。
 

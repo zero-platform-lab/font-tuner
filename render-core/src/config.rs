@@ -91,10 +91,10 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Clean Greyscale (shipped default): greyscale, no hinting bias, gamma 1.25.
+    /// Clean Greyscale (shipped default): greyscale, FreeType auto-hinter, gamma 1.25.
     pub fn clean_greyscale() -> Profile {
         Profile { gamma: 1.25, weight: 1.0, contrast: 1.0, gamma_mode: 0,
-                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.25), clipbox_fix: true }
+                  aa: Aa::Grey, hinting: 2, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.25), clipbox_fix: true }
     }
     /// Clean Sharp: LCD subpixel, no hinting, gamma 1.2, no LCD filter.
     pub fn clean_sharp() -> Profile {

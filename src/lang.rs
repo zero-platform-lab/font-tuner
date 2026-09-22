@@ -50,8 +50,6 @@ pub struct Strings {
     pub custom_sample: &'static str,
     pub custom_err_appdata: &'static str,
     pub custom_err_select: &'static str,
-    /// Shown in the dialog for greyscale + FreeType auto-hinter.
-    pub custom_warn_grey_autohint: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -100,7 +98,6 @@ const EN: Strings = Strings {
     custom_sample: "The quick brown fox 0123456789 水面に映る文字 あいう アイウ 亜細亜",
     custom_err_appdata: "APPDATA is not set; cannot save the custom profile.",
     custom_err_select: "could not write AlternativeFile=",
-    custom_warn_grey_autohint: "Greyscale + auto-hinter: capital heights come out uneven at small sizes (C/3 taller, Z shorter). Prefer the font's own hinting, or use LightLCD with the auto-hinter.",
 };
 
 const JA: Strings = Strings {
@@ -149,7 +146,6 @@ const JA: Strings = Strings {
     custom_sample: "水面に映る文字 あいう アイウ 亜細亜 The quick fox 0123",
     custom_err_appdata: "APPDATA が未設定のためカスタムプロファイルを保存できない。",
     custom_err_select: "AlternativeFile= を書き込めなかった",
-    custom_warn_grey_autohint: "グレースケール × オートヒントは小さいサイズで大文字の高さが揃わない (C や 3 が大きく、Z が小さい)。フォント内蔵にするか、オートヒントは LightLCD と組み合わせる",
 };
 
 pub fn current() -> Strings {
