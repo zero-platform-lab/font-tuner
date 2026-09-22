@@ -55,7 +55,7 @@ retour はパッチ中に他スレッドを止めないので、`install_hook` �
 ## 動くもの
 
 - **render-core**: グレースケール + LCD、ガンマモード、weight/embolden — ブレンド
-  計算式（docs/SPEC.md §2.3）を f32 で実装（上流の固定小数点の整数ではない。上流と
+  計算式（docs/SPEC.md §2.4）を f32 で実装（上流の固定小数点の整数ではない。上流と
   1 階調以内で一致し、こちらの方が正確）。
 - **GDI** テキストを注入下で置換（文字列 + `ETO_GLYPH_INDEX`）。DC のフォント/色/
   ベースラインで、既存の内容の上に描く。
@@ -74,7 +74,7 @@ retour はパッチ中に他スレッドを止めないので、`install_hook` �
   （キャッシュ）で、描画ごとではない。
 - **テスト**: `render-core` はブレンド（端点、単調性、全 GammaMode、gamma 1.25 の
   回帰）と `Profile::from_ini` の `cargo test` を持つ。テストが照合する計算式は
-  docs/SPEC.md §2.3。
+  docs/SPEC.md §2.4。
 
 ## 移植範囲 = MacType の全フック
 

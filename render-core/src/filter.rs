@@ -5,7 +5,7 @@
 //! light, interpolate by the coverage alpha, decode back. Upstream does it in
 //! fixed-point integers (a 2000s speed trick, no faster on modern CPUs); this
 //! port computes the same formula in `f32`, rounding to the nearest byte where
-//! upstream truncates. The formula (SPEC.md 2.3) is the specification, so this
+//! upstream truncates. The formula (SPEC.md 2.4) is the specification, so this
 //! is correct by construction and agrees with upstream to within one 8-bit
 //! level (this side being the more accurate). A draw is two table lookups, a
 //! lerp and a short binary search — the tables absorb the `powf`.
@@ -107,7 +107,7 @@ mod tests {
     }
 
     /// Black-on-white greyscale blend at gamma 1.25: known-good values from
-    /// the SPEC formula (SPEC.md 2.3), a regression guard against drift in the
+    /// the SPEC formula (SPEC.md 2.4), a regression guard against drift in the
     /// LUTs or the blend. The tolerance absorbs the last-bit rounding freedom
     /// in the decode; endpoints are exact.
     #[test]
