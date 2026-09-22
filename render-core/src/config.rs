@@ -36,8 +36,8 @@ impl Aa {
 /// borrowed). Same keys and defaults as upstream `settings.cpp`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DwParams {
-    /// `GammaValue`; when absent, upstream derives it from the general gamma:
-    /// `g*g > 1.3 ? g*g/2 : 0.7`.
+    /// `GammaValue`; when absent or 0 (the greyscale profiles ship 0), derived
+    /// from the general gamma: `g*g > 1.3 ? g*g/2 : 0.7`.
     pub gamma: f32,
     /// `Contrast` (enhanced contrast, also used as the greyscale contrast).
     pub contrast: f32,
@@ -189,7 +189,11 @@ impl Profile {
         }
         let d = DwParams::derived_from(p.gamma);
         p.dw = DwParams {
-            gamma: dw[0].unwrap_or(d.gamma).clamp(0.0, 20.0),
+            // A `[DirectWrite] GammaValue` of 0 (as the greyscale profiles ship)
+            // means "don't override" — DirectWrite needs gamma > 0 — so fall
+            // back to the derived gamma, not a literal 0 that fails
+            // CreateCustomRenderingParams.
+            gamma: dw[0].filter(|&g| g > 0.0).unwrap_or(d.gamma).clamp(0.0625, 20.0),
             contrast: dw[1].unwrap_or(d.contrast).clamp(0.0625, 10.0),
             cleartype_level: dw[2].unwrap_or(d.cleartype_level).clamp(0.0, 1.0),
             rendering_mode: dw_mode.unwrap_or(d.rendering_mode).clamp(0, 6),
@@ -271,6 +275,16 @@ GammaValue=1.3
         assert!((p.gamma - 1.3).abs() < 1e-6);
         assert!((p.dw.gamma - 0.9).abs() < 1e-6);
         assert_eq!(p.dw.rendering_mode, 2);
+
+        // [DirectWrite] GammaValue=0 (as the greyscale profiles ship) means
+        // "don't override": derive from the general gamma, never a literal 0
+        // (DirectWrite needs gamma > 0).
+        let p = Profile::from_ini_str("[General]
+GammaValue=1.25
+[DirectWrite]
+GammaValue=0.0
+");
+        assert!((p.dw.gamma - 1.5625 / 2.0).abs() < 1e-6, "gamma 0 -> derived, got {}", p.dw.gamma);
     }
 
     #[test]
