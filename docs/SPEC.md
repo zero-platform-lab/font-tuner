@@ -60,7 +60,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 ヒンティングモード（上流 `ft.cpp` の `FreeTypePrepare` と同じ対応。`render-core/src/ft.rs` の `flags`）: **0** = フラグなし＝FreeType の既定。フォント内蔵の TrueType バイトコードがあればそれでヒントする。**1** = `FT_LOAD_NO_HINTING`（アウトラインのまま、最も柔らかく最も忠実な形）。**2** = `FT_LOAD_FORCE_AUTOHINT`（FreeType のオートヒンタ、最も強く小サイズで最も鮮鋭、形が少し歪みうる）。
 
-アンチエイリアスモードもロードターゲットを決める（同じく `FreeTypePrepare`）: **0** グレースケール = `FT_LOAD_TARGET_NORMAL`。**2/3** LCD = `FT_LOAD_TARGET_LCD`。**4/5** LightLCD = `FT_LOAD_TARGET_LIGHT`（縦方向だけスナップする軽いオートヒント）で描画は LCD。ヒンティングの見え方はフォント次第（`render-core` を直接呼んで HintingMode 0/1/2 を並べて確認した）。自前の TrueType ヒントを持つフォント（Yu Gothic）では、グレースケール × オートヒント（HintingMode 2）で 12px 前後の欧文の大文字の高さが字ごとにずれる（C や 3 が大きく、Z が小さい）。逆に欧文にヒントを持たないフォント（BIZ UDPゴシック。インタープリタ v35 と v40 で出力が同一）では、フォント内蔵（0）は事実上ヒントなしで、Z の上端が半ピクセルにかかって灰色の行になり、オートヒントなら揃う。既定の Clean Greyscale はオートヒント。Yu Gothic を嫌う人はシステムフォントをトレイで替えるので、替えた先のフォントで揃う方を既定にした。
+アンチエイリアスモードもロードターゲットを決める（同じく `FreeTypePrepare`）: **0** グレースケール = `FT_LOAD_TARGET_NORMAL`。**2/3** LCD = `FT_LOAD_TARGET_LCD`。**4/5** LightLCD = `FT_LOAD_TARGET_LIGHT`（縦方向だけスナップする軽いオートヒント）で描画は LCD。ヒンティングの見え方はフォント次第（`render-core` を直接呼んで HintingMode 0/1/2 を並べて確認した）。自前の TrueType ヒントを持つフォント（Yu Gothic）では、グレースケール × オートヒント（HintingMode 2）で 12px 前後の欧文の大文字の高さが字ごとにずれる（C や 3 が大きく、Z が小さい）。逆に欧文のヒントを持たないフォント（BIZ UDPゴシック。インタープリタ v35 と v40 で出力が同一）では、フォント内蔵（0）は事実上ヒントなし。Z の上端が半ピクセルにかかって灰色の行になり、オートヒントなら揃う。既定の Clean Greyscale はオートヒント。Yu Gothic を嫌う人はシステムフォントをトレイで替えるので、替えた先のフォントで揃う方を既定にした。
 
 全プロファイルが DirectWrite `RenderingMode=2`（GDI_CLASSIC）を使い、GDI と DirectWrite のテキストを一致させる。
 
