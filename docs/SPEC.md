@@ -1,174 +1,72 @@
-# Font-tuner specification
+# Font-tuner 仕様
 
-A small, self-contained font-rendering tuner for Windows (tray + injected render core; upstream: https://github.com/snowie2000/mactype).
-It reproduces what the upstream closed-source tray does in "tray mode", ships the
-render core DLL built from source, bundles a set of rendering profiles, and
-adds a tray-menu system-font switcher. Windows 11, 64-bit only.
+Windows 向けの小さな自己完結型フォント描画チューナ（トレイ + 注入する描画コア）。上流は https://github.com/snowie2000/mactype にある。上流の非公開トレイが「トレイモード」でやることを再現し、ソースからビルドした描画コア DLL を同梱し、描画プロファイル一式を束ね、トレイメニューのシステムフォント切替を足す。Windows 11、64bit 専用。
 
 ---
 
-## 1. Architecture
+## 1. アーキテクチャ
 
-### 1.1 Injection flow
+### 1.1 注入の流れ
 
 ```
-font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, global)──▶ every 64-bit GUI process
-                                                          maps RenderCore64.dll
-                                                          (hook proc lives there)
-                          core DllMain hooks the font APIs (GDI / DirectWrite / Direct2D)
+font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶ 全 64bit GUI プロセス
+                                                          RenderCore64.dll をマップ
+                                                          （フックプロシージャがそこにある）
+                          コアの DllMain がフォント API をフック（GDI / DirectWrite / Direct2D）
                           │
-                          └─ on child-process spawn, core injects RenderBootstrap64.dll
-                             (GdippInjectDLL), which LoadLibraryW's the core in the child
+                          └─ 子プロセス生成時、コアが RenderBootstrap64.dll を注入
+                             （GdippInjectDLL）。子の中でコアを LoadLibraryW する
 ```
 
-* **font-tuner.exe** — the tray process. Installs one global `WH_GETMESSAGE` hook
-  whose procedure is exported by `RenderCore64.dll`. When any 64-bit GUI
-  process pulls a message, Windows maps the core DLL into it and the hook fires,
-  so the core's `DllMain` runs and patches the font-rendering APIs.
-* **RenderCore64.dll** — the render engine (Rust port of the upstream core). Does the
-  actual glyph rendering via the bundled FreeType fork. On attach it marks
-  itself non-unloadable for the life of the process
-  (`GetModuleHandleEx` + `GET_MODULE_HANDLE_EX_FLAG_PIN`): removing the hook
-  (tray off / exit / upgrade / uninstall) stops injection into *new* processes
-  but never unmaps the DLL from running ones, so there is no "code executes
-  after unmap" crash path. Profile switch, on/off and upgrade all take effect
-  for processes started afterwards.
-* **Fixed hook-procedure RVA** — `SetWindowsHookEx` stores only
-  `GetMsgProc - hmod`; in a target process Windows resolves the DLL by path,
-  finds the (self-pinned) image that process already holds, and calls
-  `that_base + RVA`. After an upgrade the running processes still hold the
-  *previous* build, so the RVA must be identical across builds or every one
-  of them executes random bytes on its next message and dies at once (this
-  happened once: a refactor moved `GetMsgProc` from `0x1100` to `0x8300`).
-  The core's `build.rs` pins `GetMsgProc` to RVA `0x1000` (first byte of
-  `.text`) with the linker's `/ORDER`; `build-msi.ps1` refuses to package a
-  core where it moved, and the tray refuses to hook one (see 1.2).
-* **RenderBootstrap64.dll** — a tiny Rust replacement (`bootstrap/`, crate
-  `render-bootstrap`, output name `RenderBootstrap64`) for the closed-source bootstrap.
-  The core injects it into freshly spawned child processes; its only job is to
-  `LoadLibraryW` the core from a background thread. It uses `CreateThread` from
-  `DllMain` (never `LoadLibrary` under loader lock) to stay deadlock-free.
+* **font-tuner.exe** — トレイプロセス。`RenderCore64.dll` が export するプロシージャを使うグローバルな `WH_GETMESSAGE` フックを 1 つ張る。64bit GUI プロセスがメッセージを取り出すと、Windows がコア DLL をそこにマップしてフックが発火し、コアの `DllMain` が走ってフォント描画 API をパッチする。
+* **RenderCore64.dll** — 描画エンジン（上流コアの Rust 移植）。同梱の FreeTypeフォークで実際にグリフを描画する。アタッチ時にプロセスの寿命の間だけ自己をアンロード不可にする（`GetModuleHandleEx` + `GET_MODULE_HANDLE_EX_FLAG_PIN`）。フックを外しても（トレイ OFF / 終了 / 更新 / アンインストール）*新規*プロセスへの注入が止まるだけで、動作中プロセスからは決してアンマップされない。だから「アンマップ後にコードが走る」クラッシュ経路がない。プロファイル切替・ON/OFF・更新はすべて以降に起動するプロセスで効く。
+* **フックプロシージャの RVA 固定** — `SetWindowsHookEx` は `GetMsgProc - hmod`しか記録しない。対象プロセスでは Windows が DLL をパスで解決し、そのプロセスが既に持つ（常駐固定された）イメージを見つけて `その base + RVA` を呼ぶ。更新後も動作中プロセスは*前*のビルドを保持するので、RVA がビルド間で同一でなければ、次のメッセージでそれらが一斉にランダムなバイトを実行して落ちる（一度実際に起きた: リファクタで `GetMsgProc` が `0x1100` から `0x8300` に動いた）。コアの`build.rs` はリンカの `/ORDER` で `GetMsgProc` を RVA `0x1000`（`.text` の先頭）に固定する。`build-msi.ps1` は動いたコアをパッケージせず、トレイは張らない（1.2）。
+* **RenderBootstrap64.dll** — 非公開ブートストラップの小さな Rust 代替（`bootstrap/`、クレート `render-bootstrap`、出力名 `RenderBootstrap64`）。コアが生成直後の子プロセスに注入する。役割はバックグラウンドスレッドからコアを`LoadLibraryW` することだけ。デッドロックを避けるため `DllMain` から`CreateThread` する（ローダーロックの下で `LoadLibrary` しない）。
 
-### 1.2 Hooking & concurrency
+### 1.2 フックと並行性
 
-* **Mechanism** — GDI `ExtTextOutW` is hooked with an inline detour via
-  **retour** (pure Rust; the iced-x86 disassembler). DirectWrite/Direct2D entry
-  points are patched directly in their COM vtables. No MinHook/Detours.
-* **Thread-safe patching** — retour does not stop other threads while it
-  rewrites the target's first bytes, so `install_hook` freezes every other
-  thread in the process (`CreateToolhelp32Snapshot` + `SuspendThread`) around
-  the patch and resumes them after — the window MinHook closes internally.
-* **Attach-once** — a WH_GETMESSAGE map plus another load can make the DLL two
-  module instances in one process; a per-process named mutex
-  (`Local\FontTuner.Attached.<pid>`) ensures only the first attach hooks, so a
-  second attach cannot detour over our own jump and corrupt the trampoline.
-* **One-time vtable patches** (CreateAlphaTexture, every Direct2D creation and
-  text slot) are serialised by a mutex and re-checked under it; otherwise two
-  racing threads both capture the "original" from an already-patched slot and
-  the detour calls itself → infinite recursion. Direct2D slots are keyed by
-  (vtable, slot) in one map, since each render-target class has its own vtable.
-* **Direct2D reach** — `render-inject/src/d2d.rs` walks upstream's creation
-  chain: `D2D1CreateFactory` → `CreateHwnd/DC/WicBitmapRenderTarget` and
-  `ID2D1Factory1..7::CreateDevice`; `D2D1CreateDevice` →
-  `ID2D1Device..6::CreateDeviceContext`; `D2D1CreateDeviceContext`. On every
-  target it patches `CreateCompatibleRenderTarget` (12, so offscreen bitmap
-  targets are hooked as they are made), `DrawGlyphRun` (29), the description
-  overload (82), `SetTextAntialiasMode` (34) and `SetTextRenderingParams`
-  (36). `GetDC` is probed before any font work, so targets that cannot lend
-  a DC cost nothing beyond the probe. Where the
-  target lends a GDI DC the run is drawn by render-core; where it does not
-  (DXGI surfaces: swap chains, composition) the OS draws with the profile's
-  `[DirectWrite]` `IDWriteRenderingParams`, the antialias mode derived from
-  `AntiAliasMode`, and the 1/65535 transform nudge upstream applies when
-  `HintingMode=1`. Slot numbers were checked against the `windows` crate's
-  vtable definitions.
-* **Re-entrancy** is guarded per-thread (`thread_local`), so one thread
-  rendering never forces another thread's draw down the untuned GDI path.
-* **Hook-install guards in the tray** (`Hook::install`, `src/stale.rs`) —
-  before even `LoadLibraryW` (loading the core would pin it in the tray and
-  hook the tray itself) the tray checks (a) from the file on disk that the
-  core has `GetMsgProc` at RVA `0x1000`, and (b) that no running process holds the
-  core *from the same path* with `GetMsgProc` anywhere else (Toolhelp module
-  walk + `ReadProcessMemory` of that image's export table; a process that has
-  the module but whose image cannot be read counts as stale, unless it has
-  exited meanwhile). A copy loaded
-  from another directory (the `loader` harness) is not a problem: Windows
-  resolves the hook DLL by path and maps the installed one as a separate
-  image, and the attach-once mutex keeps the second one inert. Either failure
-  shows an error and leaves the hook off; for (b) the message lists the
-  programs and tells the user to sign out and back in (or reboot) — that is
-  the only way the stale images go away, because the core is self-pinned.
-  Processes the tray cannot open (other users, higher integrity) are not
-  reached by its hook either, so skipping them is safe.
+* **仕組み** — GDI `ExtTextOutW` は **retour**（純 Rust、iced-x86 逆アセンブラ）のインライン detour でフックする。DirectWrite/Direct2D の入口は COM vtable を直接パッチする。MinHook/Detours は使わない。
+* **スレッド安全なパッチ** — retour は対象の先頭バイトを書き換える間、他スレッドを止めない。そこで `install_hook` はパッチの前後でプロセス内の他スレッドを全部凍結し（`CreateToolhelp32Snapshot` + `SuspendThread`）、後で再開する。MinHook が内部で閉じている窓と同じ。
+* **アタッチは一度だけ** — WH_GETMESSAGE のマップと別のロードで、DLL が 1 プロセス内に 2 つのモジュールインスタンスになりうる。プロセスごとの名前付きミューテックス（`Local\FontTuner.Attached.<pid>`）で最初のアタッチだけがフックするようにし、2 度目のアタッチが自分のジャンプの上に detour を張ってトランポリンを壊すのを防ぐ。
+* **一度きりの vtable パッチ**（CreateAlphaTexture、Direct2D の全生成スロットとテキストスロット）はミューテックスで直列化し、その下で再確認する。さもないと競合する 2 スレッドが両方ともパッチ済みスロットから「元の関数」を捕まえ、detourが自分自身を呼ぶ → 無限再帰。Direct2D のスロットは (vtable, slot) を鍵にした 1 つのマップで管理する。レンダーターゲットのクラスごとに vtable が違うため。
+* **Direct2D への到達** — `render-inject/src/d2d.rs` が上流の生成チェーンを辿る。入口は `D2D1CreateFactory`・`D2D1CreateDevice`・`D2D1CreateDeviceContext` の 3 つ。`D2D1CreateFactory` からは `CreateHwnd/DC/WicBitmapRenderTarget` と `ID2D1Factory1..7::CreateDevice` に至る。`D2D1CreateDevice` からは `ID2D1Device..6::CreateDeviceContext` に至る。各ターゲットで `CreateCompatibleRenderTarget`（12）・`DrawGlyphRun`（29）・記述付きの overload（82）・`SetTextAntialiasMode`（34）・`SetTextRenderingParams`（36）をパッチする。12 はオフスクリーンのビットマップターゲットを生成時にフックするため。フォント処理の前に `GetDC` を試すので、DC を貸せないターゲットは試行以上のコストがかからない。GDI DC を貸せるターゲットはランを render-core で描く。貸せないターゲット（DXGI サーフェス: スワップチェーン、コンポジション）は OS に描かせる。その際、プロファイルの `[DirectWrite]` `IDWriteRenderingParams` と、`AntiAliasMode` から導いたアンチエイリアスモードを渡す。`HintingMode=1` のときは上流と同じ 1/65535 の変換ずらしも加える。スロット番号は `windows` クレートの vtable 定義で照合した。
+* **再入**はスレッドごとに（`thread_local`）ガードする。あるスレッドの描画が、別スレッドの描画を未調整の GDI 経路に落とすことはない。
+* **トレイのフック設置ガード**（`Hook::install`、`src/stale.rs`）— `LoadLibraryW` の前に確認する。コアをロードするとトレイ自身に常駐固定とフックがかかるためだ。トレイは 2 点を見る。(a) ディスク上のファイルからコアの `GetMsgProc` が RVA `0x1000` にあること。(b) 同じパスのコアを `GetMsgProc` が別の場所にある状態で保持する動作中プロセスが無いこと。(b) の判定は Toolhelp のモジュール走査とそのイメージの export テーブルの `ReadProcessMemory` で行う。モジュールはあるがイメージを読めないプロセスは stale 扱いにする（その間に終了していれば除く）。別ディレクトリから読み込んだコピー（`loader` ハーネス）は問題ない。Windows はフック DLL をパスで解決し、インストール済みのものを別イメージとしてマップし、アタッチ一度きりミューテックスが 2 つ目を不活性にするからだ。どちらの確認が失敗してもエラーを出してフックを張らない。(b) ではメッセージが該当プログラムを列挙し、サインアウトして入り直す（または再起動する）よう促す。コアが常駐固定なので、それが stale なイメージを消す唯一の方法だからだ。トレイが開けないプロセス（別ユーザーやより高い整合性レベル）はトレイのフックも届かないので、飛ばしても安全。
 
-### 1.3 What it cannot reach
+### 1.3 届かないもの
 
-* **Chrome/Edge renderer & GPU processes** — blocked by
-  `MITIGATION_FORCE_MS_SIGNED_BINS` (Microsoft-signed binaries only). The
-  unsigned core/bootstrap DLLs are rejected at `LoadLibrary`. Ordinary child
-  processes (crashpad-handler, utility) are reached. This is a Windows security
-  boundary, not a bug; the only workarounds are Microsoft signing (not
-  obtainable for arbitrary DLLs) or disabling the mitigation per browser
-  (`RendererCodeIntegrityEnabled=0` policy — weakens the sandbox, not enabled by
-  this project).
-* **Processes without a message pump** (console apps, services) — `WH_GETMESSAGE`
-  never fires there.
-* **32-bit processes** — out of scope; this is a 64-bit-only build.
-* **Higher-integrity processes** — UIPI blocks hook messages from a
-  lower-integrity Font-tuner.
+* **Chrome/Edge のレンダラー・GPU プロセス** — `MITIGATION_FORCE_MS_SIGNED_BINS`（Microsoft 署名バイナリのみ）で阻まれる。未署名のコア/ブートストラップ DLL は`LoadLibrary` で拒否される。通常の子プロセス（crashpad-handler、utility）には届く。これは Windows のセキュリティ境界であってバグではない。回避策はMicrosoft 署名（任意の DLL には得られない）か、ブラウザごとに緩和を無効化すること（`RendererCodeIntegrityEnabled=0` ポリシー、サンドボックスを弱めるので本プロジェクトでは設定しない）だけ。
+* **メッセージポンプを持たないプロセス**（コンソールアプリ、サービス）—`WH_GETMESSAGE` が発火しない。
+* **32bit プロセス** — 対象外。64bit 専用ビルド。
+* **より高い整合性レベルのプロセス** — UIPI が低整合性の Font-tuner からのフックメッセージを遮る。
 
 ---
 
-## 2. Rendering profiles
+## 2. 描画プロファイル
 
-Profiles live in `profiles/ini/*.ini`. The active one is chosen by
-`font-tuner.ini` `[General] AlternativeFile=ini\<name>.ini`; it applies to
-newly created processes. The tray "profile" submenu writes this key when you
-pick an entry (via `WritePrivateProfileString`).
+プロファイルは `profiles/ini/*.ini` にある。有効なものは `font-tuner.ini` の`[General] AlternativeFile=ini\<名前>.ini` で選び、以降に生成されるプロセスへ適用される。トレイの「プロファイル」サブメニューで項目を選ぶと、このキーを書き込む（`WritePrivateProfileString`）。
 
-The injected core reads the key **once at attach**, so a switch shows up in
-processes started afterwards. To update already-running processes, the tray's
-**"Reload profile"** item broadcasts a registered window message
-(`FontTuner.ReloadProfile`); each injected core sees it in its `GetMsgProc`
-(already on that process's UI thread) and re-reads `font-tuner.ini` under the
-render lock — no watcher thread, nothing that can run after the DLL is gone.
-The tray's **"Version"** item opens an About box with the version, licence
-(GPL-3.0-only), source URL, and the required FreeType credit.
+注入されたコアはこのキーをアタッチ時に一度だけ読む。だから切替は以降に起動するプロセスで現れる。動作中プロセスを更新するには、トレイの「プロファイルを再読み込み」を使う。登録メッセージ（`FontTuner.ReloadProfile`）をブロードキャストする。各コアはそれを自分の `GetMsgProc` で受ける（すでにそのプロセスの UI スレッド上）。描画ロックの下で `font-tuner.ini` を読み直す。監視スレッドはなく、DLL が消えた後に走るものもない。トレイの「バージョン」は About を開く。バージョン・ライセンス（GPL-3.0-only）・ソース URL・必須の FreeType クレジットを載せる。
 
-### 2.1 The five profiles
+### 2.1 5 つのプロファイル
 
-| Profile | Hinting | Anti-alias | Character |
+| プロファイル | ヒンティング | アンチエイリアス | 性格 |
 |---|---|---|---|
-| **Clean Greyscale** *(default)* | 0 (none) | 0 greyscale | Neutral, soft, no colour fringing. The shipped default. |
-| **Clean Dark Greyscale** | 0 (none) | 0 greyscale | Greyscale tuned for dark backgrounds (lower gamma 1.1, contrast 0.9, slightly heavier weight). |
-| **Accurate** | 2 (TrueType bytecode) | 4 LightLCD | Strongest grid-fitting via the font's own hint instructions. Crispest at small/UI sizes; shapes are most pixel-aligned. |
-| **Clean Sharp** | 1 (FreeType light) | 2 LCD | Subpixel (colour) LCD, moderate hinting. Sharp with high horizontal detail. (Formerly "Clean".) |
-| **Clean Sharp Dark** | 0 (none) | 2 LCD | LCD subpixel tuned for dark backgrounds. (Formerly "Clean Dark".) |
+| **Clean Greyscale** *(既定)* | 0（なし） | 0 グレースケール | 中庸で柔らかく、色にじみなし。出荷時の既定。 |
+| **Clean Dark Greyscale** | 0（なし） | 0 グレースケール | 暗い背景向けに調整したグレースケール（低め gamma 1.1、contrast 0.9、やや太め）。 |
+| **Accurate** | 2（TrueType バイトコード） | 4 LightLCD | フォント自身のヒント命令で最も強くグリッドフィット。小さい/UI サイズで最も鮮鋭、形が最もピクセル整列。 |
+| **Clean Sharp** | 1（FreeType light） | 2 LCD | サブピクセル（カラー）LCD、中程度のヒンティング。横方向の細部が高く鮮鋭。（旧「Clean」） |
+| **Clean Sharp Dark** | 0（なし） | 2 LCD | 暗い背景向けに調整した LCD サブピクセル。（旧「Clean Dark」） |
 
-Hinting modes: **0** = none (outline as-is, softest, most faithful shape);
-**1** = FreeType light auto-hint (vertical stems grid-fit, balanced);
-**2** = TrueType bytecode (font's own hints, strongest, crispest at small sizes,
-can distort shape slightly). All profiles use DirectWrite `RenderingMode=2`
-(GDI_CLASSIC) so GDI and DirectWrite text match.
+ヒンティングモード: **0** = なし（アウトラインのまま、最も柔らかく最も忠実な形）。**1** = FreeType の light オートヒント（縦ステムをグリッドフィット、バランス型）。**2** = TrueType バイトコード（フォント自身のヒント、最も強く小サイズで最も鮮鋭、形が少し歪みうる）。全プロファイルが DirectWrite `RenderingMode=2`（GDI_CLASSIC）を使い、GDI と DirectWrite のテキストを一致させる。
 
-The `[DirectWrite]` section (`GammaValue`, `Contrast`, `ClearTypeLevel`,
-`RenderingMode`) is what Direct2D is told to use for text we cannot rasterise
-ourselves (1.2). Defaults follow upstream: gamma derived from the general one
-(`g² > 1.3 ? g²/2 : 0.7`), contrast 1.0, ClearType level 1.0, mode 5.
+`[DirectWrite]` 節（`GammaValue`・`Contrast`・`ClearTypeLevel`・`RenderingMode`）は、自前でラスタライズできないテキストに対して Direct2D へ指定する値（1.2）。既定は上流に従う: gamma は一般の gamma から導出（`g² > 1.3 ? g²/2 : 0.7`）、contrast 1.0、ClearType level 1.0、mode 5。`GammaValue` が 0（グレースケール系プロファイルの出荷値）のときは「上書きしない」の意味で、導出 gamma にフォールバックする（DirectWrite は gamma > 0 を要求するため）。
 
-`[Experimental] ClipBoxFix` (default 1) pads the metrics `GetGlyphOutline`
-reports for a metrics-only query — origin up by `floor(1.5·DPI/96)` px, black
-box grown the same, both capped to the font's ascent/height — so apps that
-clip glyphs to those metrics (Java2D) do not cut off the heavier rendered
-glyphs. Per-process sections such as `[Experimental@idea64.exe]` are read
-by upstream only; the core has no per-process settings.
+`[Experimental] ClipBoxFix`（既定 1）は、メトリクスのみの問い合わせで`GetGlyphOutline` が返すメトリクスを補正する。原点を `floor(1.5·DPI/96)` px 上げ、黒箱を同じだけ広げ、どちらもフォントの ascent/height で頭打ちにする。これで、そのメトリクスにグリフをクリップするアプリ（Java2D）が、太めに描かれたグリフを切り落とさない。`[Experimental@idea64.exe]` のようなプロセス別の節は上流だけが読む。コアにプロセス別設定はない。
 
-### 2.2 Menu order
+### 2.2 メニュー順
 
-The tray lists profiles in a fixed preferred order (`ORDER` in `src/main.rs`),
-not alphabetically: greyscale pair → Accurate → the LCD "Clean Sharp" series.
-Any profile not in the list falls in afterwards, alphabetically, so adding an
-`.ini` still shows it without a code change.
+トレイはプロファイルを固定の優先順（`src/main.rs` の `ORDER`）で並べ、アルファベット順にはしない: グレースケールの 2 つ → Accurate → LCD の「Clean Sharp」系。一覧にないプロファイルはその後にアルファベット順で入るので、`.ini` を足せばコード変更なしで表示される。
 
 ```
 1. Clean Greyscale
@@ -178,146 +76,87 @@ Any profile not in the list falls in afterwards, alphabetically, so adding an
 5. Clean Sharp Dark
 ```
 
-### 2.3 Blend formula
+### 2.3 ブレンド計算式
 
-The core (`render-core`) turns FreeType coverage into pixels with the same
-linear-space alpha blend as upstream MacType (`ft.cpp` `CAlphaBlend`). This is
-the specification; `render-core/src/filter.rs` implements it in `f32`. Byte
-values are normalised as `x = v/255`.
+コア（`render-core`）は、上流 MacType（`ft.cpp` `CAlphaBlend`）と同じ線形空間のアルファブレンドで FreeType のカバレッジをピクセルに変える。これが仕様で、`render-core/src/filter.rs` が `f32` で実装する。バイト値は `x = v/255` で正規化する。
 
-**Gamma encode** `g(x)` (byte → linear light), chosen by `GammaMode`:
+**ガンマ符号化** `g(x)`（バイト → 線形光）。`GammaMode` で選ぶ:
 
 ```
-g(x) = x                                  GammaMode < 0   (linear)
+g(x) = x                                  GammaMode < 0   (線形)
      = srgb(x)                            GammaMode = 1   (sRGB)
-     = (srgb(x) + x) / 2                  GammaMode = 2   (sRGB / linear average)
-     = x ^ GammaValue                     otherwise       (plain-power gamma)
+     = (srgb(x) + x) / 2                  GammaMode = 2   (sRGB と線形の平均)
+     = x ^ GammaValue                     それ以外        (べき乗ガンマ)
 
 srgb(x) = x / 12.92                       x <= 10/255
-        = ((x + 0.055) / 1.055) ^ 2.4     otherwise
+        = ((x + 0.055) / 1.055) ^ 2.4     それ以外
 ```
 
-**Coverage curve** `a(cov)` (FreeType coverage → alpha), an S-curve from
-`RenderWeight` and `Contrast`, with `t = (cov/255) ^ (1/RenderWeight)`:
+**カバレッジ曲線** `a(cov)`（FreeType カバレッジ → アルファ）。`RenderWeight` と`Contrast` による S 字で、`t = (cov/255) ^ (1/RenderWeight)`:
 
 ```
 a(cov) = (2t) ^ Contrast / 2              t < 0.5
        = 1 - (2(1 - t)) ^ Contrast / 2    t >= 0.5
 ```
 
-**Blend** of foreground `fg` over background `bg` at coverage `cov`:
+**ブレンド**。前景 `fg` を背景 `bg` にカバレッジ `cov` で合成:
 
 ```
 out = g⁻¹( g(bg)·(1 - a(cov)) + g(fg)·a(cov) )
 ```
 
-i.e. convert both colours to linear light, interpolate by the coverage alpha,
-convert back. `g⁻¹` is the numeric inverse of `g` (a binary search over the
-per-profile encode table, which inverts every `GammaMode` including the
-average, which has no closed form). Each channel is blended independently, so
-LCD subpixel coverage feeds R/G/B separately.
+つまり両色を線形光に変換し、カバレッジのアルファで補間し、戻す。`g⁻¹` は `g` の数値的な逆関数（プロファイルごとの符号化テーブルの二分探索、閉じた式のない平均モードを含め、全 `GammaMode` を逆変換する）。各チャンネルは独立にブレンドするので、LCD サブピクセルのカバレッジは R/G/B へ別々に入る。
 
-Upstream computes this in fixed-point integers and truncates the final step; a
-port that computes the formula in `f32` and rounds to the nearest byte differs
-from upstream by at most one 8-bit level (imperceptible, and the rounded value
-is the more accurate). The formula is the correctness criterion — the
-implementation is checked against it, not against upstream's rounding.
+上流はこれを固定小数点の整数で計算し、最後の段で切り捨てる。計算式を `f32` で計算して最も近いバイトへ丸める移植は、上流と最大 1 階調しか違わない（知覚できず、丸めた値の方が正確）。計算式が正しさの基準で、実装はそれに対して検証する。上流の丸めに対してではない。
 
-The `[DirectWrite]` section provides a separate set of values (gamma, contrast,
-ClearType level, rendering mode) for the text Direct2D draws itself where the
-core cannot rasterise it; see 1.2.
+`[DirectWrite]` 節は、コアがラスタライズできない Direct2D 自身の描画向けに、別の値（gamma、contrast、ClearType level、rendering mode）を与える（1.2）。
 
 ---
 
-## 3. System-font switcher
+## 3. システムフォント切替
 
-Tray submenu "システムフォント / System font" (`src/sysfont.rs`). Swaps the
-shell UI fonts (caption, small-caption, menu, status, message, icon-title) via
-`SystemParametersInfo` (`SPI_SET{NONCLIENTMETRICS,ICONTITLELOGFONT}`), which is a
-persistent per-user setting broadcast with `WM_SETTINGCHANGE`.
+トレイのサブメニュー「システムフォント / System font」（`src/sysfont.rs`）。シェルの UI フォント（caption、small-caption、menu、status、message、icon-title）を`SystemParametersInfo`（`SPI_SET{NONCLIENTMETRICS,ICONTITLELOGFONT}`）で入れ替える。これはユーザーごとに永続する設定で、`WM_SETTINGCHANGE` でブロードキャストされる。
 
-* Fixed candidate list: `BIZ UDPゴシック`, `BIZ UDゴシック`, `Noto Sans JP`,
-  `メイリオ`.
-* On the first change the original font set is saved to
-  `%LOCALAPPDATA%\font-tuner\sysfont-backup.bin`. "既定に戻す / Default (restore)"
-  restores it and deletes the backup.
-* Hardening: on restore the `cbSize` from the (user-writable) backup file is
-  **not** trusted — it is forced to the real struct size so
-  `SystemParametersInfo` can never read past the buffer.
+* 固定の候補: `BIZ UDPゴシック`、`BIZ UDゴシック`、`Noto Sans JP`、`メイリオ`。
+* 初回の変更時に元のフォント一式を`%LOCALAPPDATA%\font-tuner\sysfont-backup.bin` に保存する。「既定に戻す /Default (restore)」がそれを復元し、バックアップを消す。
+* 堅牢化: 復元時、（ユーザーが書き換えられる）バックアップファイルの `cbSize` は**信頼しない**。本物の構造体サイズに強制するので、`SystemParametersInfo` がバッファの外を読むことはない。
 
-Fully applies to newly drawn UI immediately; the shell picks it up completely
-after a sign-out/in.
+新しく描かれる UI には即座に完全適用される。シェルはサインアウト/インの後に完全に反映する。
 
 ---
 
-## 4. Tray icon
+## 4. トレイアイコン
 
-Two icons are embedded in the exe via `app.rc` / `build.rs` (`embed-resource`):
+2 つのアイコンを `app.rc` / `build.rs`（`embed-resource`）で exe に埋め込む:
 
-* `assets/tray-dark.ico` — **silver** metallic gear + "A", for a **dark** taskbar.
-* `assets/tray-light.ico` — **black** metallic gear + "A", for a **light** taskbar.
+* `assets/tray-dark.ico` — **シルバー**の金属光沢の歯車 + 「A」。**暗い**タスクバー用。
+* `assets/tray-light.ico` — **黒**の金属光沢の歯車 + 「A」。**明るい**タスクバー用。
 
-At startup and on every `WM_SETTINGCHANGE`, Font-tuner reads
-`HKCU\...\Themes\Personalize\SystemUsesLightTheme` and picks the matching icon,
-swapping live when the theme changes. Missing value ⇒ dark (Windows 11 default).
-Icon art is CC0 (public-domain gear) with a rendered letter "A".
+起動時と `WM_SETTINGCHANGE` のたびに、Font-tuner は`HKCU\...\Themes\Personalize\SystemUsesLightTheme` を読んで一致するアイコンを選び、テーマ変更時にその場で入れ替える。値が無ければ暗（Windows 11 の既定）。アイコンの図案は CC0（パブリックドメインの歯車）に描画した「A」。
 
 ---
 
-## 5. Build
+## 5. ビルド
 
-* **Toolflags** — `.cargo/config.toml` sets `+crt-static` for the MSVC target,
-  removing the `VCRUNTIME140.dll` dependency (and its DLL-search-order hijack
-  surface). Release profile: `opt-level="s"`, LTO, `panic="abort"`, stripped.
-* **`build-core.ps1`** — builds only the one native dependency the shipped DLL
-  needs: the snowie2000 FreeType fork (`freetype64.lib`) via MSBuild/vswhere.
-  The C++ MacType core, Detours and IniParser are no longer built — the render
-  core is Rust (`RenderCore64.dll`) and hooking uses `retour`.
-* **`build-msi.ps1`** — runs `build-core.ps1`, `cargo build --release`
-  (workspace + `render-inject`), checks with `check-export-rva.ps1` that the
-  core exports `GetMsgProc` at RVA `0x1000` (aborts otherwise — see 1.1),
-  stages exe + DLLs + `font-tuner.ini` + `ini\*.ini` into `build\pkg`, then
-  `wix build` →
-  `dist\font-tuner-<ver>-x64.msi`.
+* **ツールフラグ** — `.cargo/config.toml` が MSVC ターゲットに `+crt-static` を設定し、`VCRUNTIME140.dll` 依存（と DLL 探索順ハイジャックの面）を消す。Releaseプロファイル: `opt-level="s"`、LTO、`panic="abort"`、strip 済み。
+* **`build-core.ps1`** — 出荷 DLL に必要な唯一のネイティブ依存だけをビルドする:snowie2000 の FreeType フォーク（`freetype64.lib`）を MSBuild/vswhere で。C++ のMacType コア・Detours・IniParser はもうビルドしない。描画コアは Rust（`RenderCore64.dll`）で、フックは `retour` を使う。
+* **`build-msi.ps1`** — `build-core.ps1`、`cargo build --release`（ワークスペース + `render-inject`）を走らせる。`check-export-rva.ps1` でコアが `GetMsgProc` を RVA`0x1000` に export しているか確認する（違えば中止、1.1 参照）。次に exe + DLL 群 +`font-tuner.ini` + `ini\*.ini` を `build\pkg` に集める。最後に `wix build` で `dist\font-tuner-<ver>-x64.msi`。
 
 ---
 
-## 6. Installer (MSI, WiX v6)
+## 6. インストーラ（MSI、WiX v6）
 
-* **Scope** perMachine, installs to `C:\Program Files\Font-tuner`; adds a Start
-  menu shortcut so the tray can be relaunched after "Exit".
-* **Run at logon** — writes `HKLM\...\CurrentVersion\Run\Font-tuner`.
-* **On install** — stops a running `font-tuner.exe`, then launches
-  Font-tuner.
-* **Restart Manager disabled** (`MSIRESTARTMANAGERCONTROL=Disable`,
-  `REBOOT=ReallySuppress`): `RenderCore64.dll` is mapped into every GUI process,
-  so the Restart Manager would otherwise close them all (it has killed the
-  user's shell). Only the tray is closed.
-* **In-use core swap** — because the core is mapped (and self-pinned) in every
-  running process, its file is never free to overwrite. A deferred custom
-  action (`RenameOldCore`, scheduled right after `InstallInitialize`, before
-  `RemoveExistingProducts`) renames the in-use `RenderCore64.dll` aside so
-  `InstallFiles` can place the new one immediately; the freshly launched tray
-  then hooks with the new core. Renamed-aside copies are queued for deletion at
-  next reboot (`MoveFileEx DELAY_UNTIL_REBOOT`). No reboot is needed for the
-  upgrade to take effect on newly started processes.
-  The renamed-aside image stays mapped in every running process under its
-  original path, which is why `GetMsgProc` must keep the same RVA in the new
-  core (1.1); if the tray finds a running process whose core disagrees, it
-  does not hook and asks for a sign-out (1.2).
-* **`font-tuner.ini`** is marked `NeverOverwrite` — a user's selected profile
-  (the `AlternativeFile` value) survives upgrades.
-* **Uninstall** — standard Add/Remove Programs entry, or
-  `msiexec /x {ProductCode}`. Removes files, the Run registry value, and stops
-  the process.
-* **Signing** — the MSI and its payload are **unsigned**, so install shows a UAC
-  "unknown publisher" prompt (and possibly SmartScreen). It is not blocked.
-  Signing is intentionally omitted to keep the release unattributable; it would
-  not help reach the browser renderer/GPU processes anyway (see §1.3).
+* **スコープ** perMachine、`C:\Program Files\Font-tuner` に入れる。「終了」後にトレイを起動し直せるようスタートメニューのショートカットを足す。
+* **ログオン時に起動** — `HKLM\...\CurrentVersion\Run\Font-tuner` を書く。
+* **インストール時** — 動作中の `font-tuner.exe` を止め、Font-tuner を起動する。
+* **Restart Manager 無効化**（`MSIRESTARTMANAGERCONTROL=Disable`、`REBOOT=ReallySuppress`）: `RenderCore64.dll` は全 GUI プロセスにマップされている。無効化しないと Restart Manager がそれらを全部閉じる（ユーザーのシェルを落としたことがある）。閉じるのはトレイだけにする。
+* **使用中コアの入れ替え** — コアが全動作中プロセスにマップ（かつ常駐固定）されているため、そのファイルは決して上書きできない。遅延カスタムアクション（`RenameOldCore`、`InstallInitialize` の直後、`RemoveExistingProducts` の前にスケジュール）が使用中の `RenderCore64.dll` を脇へリネームし、`InstallFiles` が新しいものをすぐ置ける。起動し直したトレイが新コアでフックする。脇へリネームしたコピーは次の再起動時の削除に予約する（`MoveFileEx DELAY_UNTIL_REBOOT`）。以降に起動するプロセスへ更新を効かせるのに再起動は要らない。脇へリネームしたイメージは元のパスのまま全動作中プロセスにマップされ続ける。だから新コアで`GetMsgProc` の RVA を同じに保つ必要がある（1.1）。コアが食い違う動作中プロセスをトレイが見つけたら、フックせずサインアウトを促す（1.2）。
+* **`font-tuner.ini`** は `NeverOverwrite` を付ける。ユーザーが選んだプロファイル（`AlternativeFile` の値）が更新をまたいで残る。
+* **アンインストール** — 標準の「プログラムの追加と削除」項目、または`msiexec /x {ProductCode}`。ファイル・Run レジストリ値を消し、プロセスを止める。
+* **署名** — MSI とそのペイロードは**未署名**なので、インストール時に UAC が「発行元不明」と出す（SmartScreen も出うる）。ブロックはされない。署名はリリースを帰属不能に保つためあえて省く。どのみちブラウザのレンダラー/GPU プロセスへ到達する助けにならない（§1.3）。
 
 ---
 
-## 7. Licensing
+## 7. ライセンス
 
-GPL-3.0-only. Bundles a FreeType fork from `vendor/`
-under their respective licenses. Tray icon art is CC0.
+GPL-3.0-only。`vendor/` の FreeType フォークをそれぞれのライセンスで同梱する。トレイアイコンの図案は CC0。

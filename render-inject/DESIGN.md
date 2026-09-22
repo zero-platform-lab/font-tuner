@@ -1,70 +1,66 @@
-# render-inject — design & history
+# render-inject — 設計と経緯
 
-The system-wide half of the tool: `RenderCore64.dll`, injected into every
-process, intercepts text drawing and renders it with `render-core` instead of
-Windows' own rasteriser. This is the hard, high-risk part — the code runs
-**inside every process on the machine**, so a fault crashes apps or
-destabilises the desktop.
+ツールのシステム全体側。`RenderCore64.dll` を全プロセスに注入し、テキスト
+描画を横取りして Windows 標準のラスタライザではなく `render-core` で描く。
+ここが難しく危険な部分で、コードは**マシン上の全プロセスの中で動く**ため、
+不具合はアプリを落とすかデスクトップを不安定にする。
 
-This is now **implemented and shipped** (see `docs/RUST-PORT.md` for the
-consolidated, current picture). The staged roadmap below is kept as history:
-each stage was built and verified before the next.
+現在は**実装・出荷済み**（統合された最新像は `docs/RUST-PORT.md`）。以下の
+段階的ロードマップは経緯として残す。各段階は次に進む前にビルドして検証した。
 
-## Target architecture
+## 目標アーキテクチャ
 
 ```
-render-core (lib)          rendering brain (verified bit-exact)
-      ^ links
-render-inject (cdylib DLL)  RenderCore64.dll — injected into each process
-  - DllMain: on attach, install hooks (off the loader lock)
-  - hook ExtTextOutW (GDI text APIs) via retour inline detour (pure Rust)
-  - hook DirectWrite (IDWriteBitmapRenderTarget / IDWriteFontFace) via COM vtable
-  - for each intercepted draw: shape -> render-core -> blit into the target DC/DIB
+render-core (lib)          描画の頭脳（数式に対して検証済み）
+      ^ リンク
+render-inject (cdylib DLL)  RenderCore64.dll — 各プロセスに注入される
+  - DllMain: アタッチ時にフックを張る（ローダーロックの外で）
+  - ExtTextOutW（GDI テキスト API）を retour のインライン detour で（純 Rust）
+  - DirectWrite（IDWriteBitmapRenderTarget / IDWriteFontFace）を COM vtable で
+  - 横取りした描画ごとに: shape → render-core → 対象 DC/DIB へ blit
 ```
 
-Injection into other processes reuses the existing loader design (the tray sets
-a `WH_GETMESSAGE` hook whose proc lives in this DLL; the child bootstrap
-`RenderBootstrap64.dll` LoadLibrary's it). This crate is the render core
-itself, not the injection mechanism.
+他プロセスへの注入は既存の loader 設計を再利用する（トレイが `WH_GETMESSAGE`
+フックを張り、そのプロシージャがこの DLL にある。子プロセス用ブートストラップ
+`RenderBootstrap64.dll` がそれを LoadLibrary する）。このクレートは描画コア本体で
+あり、注入機構ではない。
 
-## Stages (each verified before the next)
+## 段階（各段階を次の前に検証した）
 
-1. **Skeleton (done):** cdylib builds; `DllMain` returns TRUE; a test export
-   calls into `render-core`. No hooks. Safe.
-2. **GDI capture harness (offline):** in a *single test process only*, hook
-   `ExtTextOutW`, capture its arguments (string, DC, position, font), and log —
-   do **not** yet change output. Verify we can reconstruct MacType's inputs.
-3. **GDI writeback (single process):** render with `render-core` and blit into
-   the DC's DIB; compare on-screen against the C++ core in the same app. Still
-   opt-in, one process, easy to kill.
-4. **Injection (few processes):** enable the loader path for a small allowlist
-   (e.g. notepad), never system-wide, with a hard kill switch.
-5. **DirectWrite:** COM vtable interception. Hardest; version-dependent.
-6. **Broaden** cautiously.
+1. **骨組み（完了）:** cdylib がビルドでき、`DllMain` が TRUE を返し、テスト
+   用 export が `render-core` を呼ぶ。フックなし。安全。
+2. **GDI キャプチャ（オフライン）:** *単一のテストプロセスだけ*で `ExtTextOutW`
+   を横取りし、引数（文字列・DC・位置・フォント）を記録する。出力はまだ変え
+   ない。MacType の入力を再構成できるか確認する。
+3. **GDI 書き戻し（単一プロセス）:** `render-core` で描いて DC の DIB へ blit し、
+   同じアプリ内で C++ コアと画面上で比較する。まだ opt-in、1 プロセス、止め
+   やすい状態。
+4. **注入（少数プロセス）:** 小さな許可リスト（例: notepad）だけで loader 経路
+   を有効にする。システム全体では絶対に有効化せず、確実なキルスイッチを持つ。
+5. **DirectWrite:** COM vtable の横取り。最難関でバージョン依存。
+6. 慎重に**対象を広げる**。
 
-## Risks / rules
+## リスク・ルール
 
-- Never LoadLibrary under the loader lock (spawn a thread from DllMain, as
-  `RenderBootstrap64` already does).
-- Self-pin on attach (GetModuleHandleEx FLAG_PIN): never unmapped from a
-  running process, so no code can run after unmap. DllMain DETACH is a no-op.
-- `GetMsgProc` stays at RVA 0x1000 (`build.rs`, linker `/ORDER`). Because of
-  the pin, running processes keep the previous build after an upgrade, and
-  the tray's hook resolves to `old_base + RVA` inside them — a moved RVA
-  crashed every GUI process at once (2026-09-22, the lib.rs split). Do not
-  drop `build.rs`/`order.txt`; `build-msi.ps1` and the tray both verify it.
-- retour does not stop threads while patching, so freeze the other threads
-  around each byte patch; serialise one-time vtable patches with a mutex.
-- Every stage stays opt-in and process-scoped until proven; no system-wide
-  enable without a tested kill switch.
-- Chrome/Edge renderer & GPU stay unreachable (MS-signed-binaries mitigation) —
-  same limitation as the C++ core.
+- ローダーロックの下で LoadLibrary しない（`RenderBootstrap64` と同様、DllMain
+  からスレッドを起こす）
+- アタッチ時に自己を常駐固定する（GetModuleHandleEx FLAG_PIN）。動作中のプロ
+  セスから決してアンマップされないので、アンマップ後にコードが走ることはない。
+  DllMain の DETACH は何もしない
+- `GetMsgProc` は RVA 0x1000 から動かさない（`build.rs`、リンカ `/ORDER`）。
+  常駐固定のため、更新後も動作中プロセスは前のビルドを保持し、トレイのフックは
+  その中で `old_base + RVA` に解決される。RVA がずれると全 GUI プロセスが一斉に
+  落ちた（2026-09-22、lib.rs の分割）。`build.rs` / `order.txt` を消さない。
+  `build-msi.ps1` とトレイの両方が検証する
+- retour はパッチ中に他スレッドを止めないので、バイトパッチの前後で他スレッド
+  を凍結する。一度きりの vtable パッチはミューテックスで直列化する
+- 各段階は実証されるまで opt-in かつプロセス限定にする。検証済みのキルスイッチ
+  なしにシステム全体で有効にしない
+- Chrome/Edge のレンダラー・GPU プロセスは到達不能のまま（MS 署名バイナリ必須
+  の緩和）。C++ コアと同じ制限
 
-## Status
+## 状態
 
-All stages below are now implemented (GDI + DirectWrite interception, writeback,
-font resolution, cross-process and WH_GETMESSAGE injection, profile loading,
-self-pinning instead of unload). See `docs/RUST-PORT.md` for the current, consolidated picture and
-`../loader` to try the core in a single process. The per-stage probe/window
-crates that built this up were removed once the work landed in this DLL.
-Remaining work is fidelity/robustness (see RUST-PORT.md "Not done").
+以下の段階はすべて実装済み（GDI + DirectWrite 横取り・書き戻し・フォント解決・クロスプロセスと WH_GETMESSAGE 注入・プロファイル読み込み・アンロードの代わりの常駐固定）。最新の統合像は `docs/RUST-PORT.md`、単一プロセスで試すなら
+`../loader` を参照。各段階を積み上げた probe/window クレートは、成果がこの DLL
+に落ちた時点で削除した。残りは忠実性・堅牢性（RUST-PORT.md の「Not done」）。

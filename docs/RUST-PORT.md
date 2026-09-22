@@ -1,125 +1,124 @@
-# Rust reimplementation of the MacType pipeline
+# MacType パイプラインの Rust 再実装
 
-A from-scratch Rust reimplementation of what MacType does: intercept text
-drawing in every process and render it with FreeType + custom gamma/LCD tuning.
-This **is** the shipped core: the `font-tuner` MSI installs `RenderCore64.dll`
-(this crate), not the C++ MacType core.
+MacType がやっていること — 全プロセスでテキスト描画を横取りし、FreeType +
+独自のガンマ/LCD 調整で描く — をゼロから Rust で再実装したもの。これが**出荷
+される**コアで、`font-tuner` の MSI は C++ の MacType コアではなくこのクレート
+の `RenderCore64.dll` を入れる。
 
-FreeType itself is reused unchanged (the fork's `freetype64.lib`); everything
-else — the tuning maths, the hooking, and the FreeType glue — is Rust. The only
-native code linked into the shipped DLL is that FreeType static lib.
+FreeType 自体はフォークの `freetype64.lib` を変更せず再利用する。それ以外 —
+調整の数式、フック、FreeType との橋渡し — はすべて Rust。出荷 DLL にリンクされる
+ネイティブコードはその FreeType 静的ライブラリだけ。
 
-## Crates
+## クレート
 
-| crate | kind | role |
+| クレート | 種別 | 役割 |
 |---|---|---|
-| `render-core` | lib | the rendering engine: gamma/contrast/LCD LUTs + blend (ported from ft.cpp, verified to match the formula within 1 level), direct FreeType FFI (no C shim), `Profile` (incl. `from_ini`), glyph/string compositing |
-| `render-inject` | cdylib `RenderCore64.dll` | injected into each process; hooks GDI + DirectWrite/Direct2D text and renders with render-core; exports `GetMsgProc` for auto-injection; self-pins so it is never unmapped from a running process |
-| `loader` | bin | install a WH_GETMESSAGE hook backed by RenderCore64.dll, scoped to one process — the test harness for trying the core in a single app |
+| `render-core` | lib | 描画エンジン: ガンマ/コントラスト/LCD の LUT + ブレンド（ft.cpp から移植、計算式に対して 1 階調以内で一致）、FreeType への直接 FFI（C シムなし）、`Profile`（`from_ini` 含む）、グリフ/文字列の合成 |
+| `render-inject` | cdylib `RenderCore64.dll` | 各プロセスに注入され、GDI + DirectWrite/Direct2D のテキストをフックして render-core で描く。自動注入用に `GetMsgProc` を export。自己を常駐固定し、動作中プロセスから決してアンマップされない |
+| `loader` | bin | RenderCore64.dll を使う WH_GETMESSAGE フックを 1 プロセスだけに張る。単一アプリでコアを試すテストハーネス |
 
-## Pipeline (as built)
+## パイプライン（実装済み）
 
 ```
-the tray's global (or loader's single-process) WH_GETMESSAGE hook maps RenderCore64.dll
-  → DllMain self-pins (GetModuleHandleEx FLAG_PIN) and spawns a thread
-    (off the loader lock) that, once per process (named-mutex guard):
-      loads the active profile (install-dir font-tuner.ini AlternativeFile, else default)
-      hooks gdi32!ExtTextOutW               (retour inline detour, other threads frozen;
-                                             TextOutW/TextOutA/ExtTextOutA arrive here too)
-      hooks gdi32!GetGlyphOutlineW/A        (ClipBoxFix: pad metrics-only queries)
-      patches IDWriteBitmapRenderTarget::DrawGlyphRun in the shared vtable
-      patches IDWriteFactory{,2,3}::CreateGlyphRunAnalysis (→ CreateAlphaTexture)
-      hooks d2d1!D2D1CreateFactory / D2D1CreateDevice / D2D1CreateDeviceContext, then
+トレイのグローバル（または loader の単一プロセス）WH_GETMESSAGE フックが RenderCore64.dll をマップ
+  → DllMain が自己を常駐固定（GetModuleHandleEx FLAG_PIN）し、スレッドを起こす
+    （ローダーロックの外で。プロセスごとに一度、名前付きミューテックスで保証）:
+      有効なプロファイルを読む（インストール先 font-tuner.ini の AlternativeFile、無ければ既定）
+      gdi32!ExtTextOutW をフック          （retour インライン detour、他スレッド凍結。
+                                           TextOutW/TextOutA/ExtTextOutA もここに来る）
+      gdi32!GetGlyphOutlineW/A をフック    （ClipBoxFix: メトリクスのみの問い合わせを補正）
+      共有 vtable の IDWriteBitmapRenderTarget::DrawGlyphRun をパッチ
+      IDWriteFactory{,2,3}::CreateGlyphRunAnalysis をパッチ（→ CreateAlphaTexture）
+      d2d1!D2D1CreateFactory / D2D1CreateDevice / D2D1CreateDeviceContext をフックし、
         ID2D1Factory1..7::CreateDevice → ID2D1Device..6::CreateDeviceContext →
-        DrawGlyphRun (29) / DrawGlyphRun with description (82) /
-        SetTextAntialiasMode (34) / SetTextRenderingParams (36) on every target
-  → each text draw:
-      resolve the font from the DC / glyph run (GetFontData 'ttcf' for TTCs,
-        or IDWriteFontFace file bytes + index)
-      render the run with render-core (grey/LCD per profile) over the DC's pixels
-      blit back, skipping the OS rasteriser
-  → Direct2D targets that lend no GDI DC (DXGI surfaces): DrawGlyphRun runs the
-      OS rasteriser with the profile's [DirectWrite] IDWriteRenderingParams,
-      greyscale/ClearType antialias mode, and upstream's 1/65535 transform
-      nudge when grid fitting is off — what upstream does for all of Direct2D
-  → never unloaded from a running process (pinned); DllMain DETACH is a no-op
-    reached only at process teardown
+        全ターゲットで DrawGlyphRun (29) / 記述付き DrawGlyphRun (82) /
+        SetTextAntialiasMode (34) / SetTextRenderingParams (36)
+  → テキスト描画ごとに:
+      DC / グリフラン からフォントを解決（TTC は GetFontData 'ttcf'、
+        または IDWriteFontFace のファイルバイト + index）
+      render-core で描画（プロファイルに応じ grey/LCD）し、DC の既存ピクセルに重ねる
+      blit で書き戻し、OS ラスタライザを飛ばす
+  → GDI DC を貸せない Direct2D ターゲット（DXGI サーフェス）: DrawGlyphRun は
+      プロファイルの [DirectWrite] IDWriteRenderingParams、グレースケール/ClearType
+      のアンチエイリアスモード、grid fit 無効時の 1/65535 変換ずらしで OS に描かせる
+      — Direct2D 全体に対して上流がやっていることと同じ
+  → 動作中プロセスから決してアンロードされない（常駐固定）。DllMain の DETACH は
+    プロセス終了時にだけ来る no-op
 ```
 
-Rendering is serialised by a mutex (one shared FreeType face, re-faced per draw).
-Hooking uses **retour** (pure Rust; iced-x86 disassembler), not MinHook/Detours;
-because retour does not stop threads while patching, `install_hook` freezes the
-other threads around the byte patch. The one-time vtable patches are serialised
-by a mutex so two threads cannot both capture the "original" and recurse.
+描画はミューテックスで直列化する（共有 FreeType face 1 つ、描画ごとに reface）。
+フックは **retour**（純 Rust、iced-x86 逆アセンブラ）で、MinHook/Detours ではない。
+retour はパッチ中に他スレッドを止めないので、`install_hook` がバイトパッチの前後で
+他スレッドを凍結する。一度きりの vtable パッチはミューテックスで直列化し、2 つの
+スレッドが同時に「元の関数」を捕まえて再帰するのを防ぐ。
 
-## What works
+## 動くもの
 
-- **render-core**: greyscale + LCD, gamma modes, weight/embolden — implements
-  the blend formula in docs/SPEC.md 2.3 (in f32, not upstream's fixed-point
-  integers; agrees with upstream within 1 level, this side more accurate).
-- **GDI** text replaced under injection (string + `ETO_GLYPH_INDEX`), with the
-  DC's font/colour/baseline, over the existing content.
-- **DirectWrite** (`IDWriteBitmapRenderTarget::DrawGlyphRun`) replaced under
-  injection via the shared-vtable patch.
-- **Auto-injection** via a WH_GETMESSAGE hook (the upstream mechanism); the
-  `loader` bin scopes it to one process for testing, the tray installs it
-  globally. The DLL self-pins, so it is never unmapped from a running process.
-- **Profiles** driven by font-tuner's own `.ini` files (`Profile::from_ini`),
-  read once at attach from the install dir's `font-tuner.ini` (`AlternativeFile`).
-  A profile switch takes effect for processes started afterwards; the tray's
-  "Reload profile" broadcasts a registered message that makes already-injected
-  processes re-read the ini on their own UI thread (no watcher thread).
-- **GDI fidelity**: `ETO_OPAQUE` / `ETO_CLIPPED` / `lpDx` honoured in
-  `render-inject`.
-- **Performance**: the font file is extracted + re-faced only when the font
-  actually changes (cached), not per draw.
-- **Tests**: `render-core` has `cargo test` units for the blend (endpoints,
-  monotonicity, every GammaMode, a gamma-1.25 regression) and
-  `Profile::from_ini`; the formula they check is docs/SPEC.md 2.3.
+- **render-core**: グレースケール + LCD、ガンマモード、weight/embolden — ブレンド
+  計算式（docs/SPEC.md §2.3）を f32 で実装（上流の固定小数点の整数ではない。上流と
+  1 階調以内で一致し、こちらの方が正確）。
+- **GDI** テキストを注入下で置換（文字列 + `ETO_GLYPH_INDEX`）。DC のフォント/色/
+  ベースラインで、既存の内容の上に描く。
+- **DirectWrite**（`IDWriteBitmapRenderTarget::DrawGlyphRun`）を共有 vtable の
+  パッチで注入下に置換。
+- **自動注入** を WH_GETMESSAGE フックで（上流の仕組み）。`loader` は 1 プロセスに
+  限定して試すため、トレイはグローバルに張る。DLL は自己を常駐固定するので、
+  動作中プロセスから決してアンマップされない。
+- **プロファイル** は font-tuner 自身の `.ini`（`Profile::from_ini`）で駆動し、
+  アタッチ時にインストール先の `font-tuner.ini`（`AlternativeFile`）を一度読む。
+  プロファイル切替は以降に起動するプロセスで効く。トレイの「プロファイルを再読み込み」
+  は登録メッセージをブロードキャストし、注入済みプロセスが自分の UI スレッドで
+  ini を読み直す（監視スレッドなし）。
+- **GDI の忠実性**: `render-inject` で `ETO_OPAQUE` / `ETO_CLIPPED` / `lpDx` を尊重。
+- **性能**: フォントファイルの抽出 + reface はフォントが実際に変わったときだけ
+  （キャッシュ）で、描画ごとではない。
+- **テスト**: `render-core` はブレンド（端点、単調性、全 GammaMode、gamma 1.25 の
+  回帰）と `Profile::from_ini` の `cargo test` を持つ。テストが照合する計算式は
+  docs/SPEC.md §2.3。
 
-## Port scope = MacType's full hook coverage
+## 移植範囲 = MacType の全フック
 
-This is a **port**: the target is everything the C++ MacType intercepts
-([`hooklist.h`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/hooklist.h), [`directwrite.cpp`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/directwrite.cpp), upstream commit `05052e8`), not a narrowed subset. Text
-paths MacType hooks, and where we stand:
+これは**移植**であり、対象は C++ の MacType が横取りするすべて
+（[`hooklist.h`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/hooklist.h)、[`directwrite.cpp`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/directwrite.cpp)、上流コミット `05052e8`）で、絞った部分集合ではない。MacType が
+フックするテキスト経路と、現状:
 
-| path | MacType hooks | ours |
+| 経路 | MacType | 本実装 |
 |---|---|---|
-| GDI `ExtTextOutW` | yes | **done** |
-| GDI `ExtTextOutA` / `TextOutW` / `TextOutA` | yes | **covered without own hooks**: on Windows 11 (26200) all three end in the `ExtTextOutW` entry our inline detour patches (verified with the probe harness) |
-| GDI `GetGlyphOutlineW` / `GetGlyphOutlineA` (upstream "ClipBoxFix") | yes | **done** (`gdi_metrics.rs`; `[Experimental] ClipBoxFix`, default on; per-process `[Experimental@exe]` sections not applied) |
-| DirectWrite `IDWriteBitmapRenderTarget::DrawGlyphRun` (vtbl 3) | yes | **done** |
-| DirectWrite `CreateGlyphRunAnalysis` → `CreateAlphaTexture` (Chromium/Skia, VS Code), incl. the `IDWriteFactory2`/`3` overloads | yes | **done** |
-| Direct2D `ID2D1RenderTarget::DrawGlyphRun` (vtbl 29) | yes | **done** (via `D2D1CreateFactory` → RT creation → per-vtable patch) |
-| Direct2D `DrawGlyphRun1` (vtbl 82) / `ID2D1DeviceContext` | yes | **done** (`D2D1CreateDevice`, `D2D1CreateDeviceContext`, `ID2D1Factory1..7::CreateDevice`, `ID2D1Device..6::CreateDeviceContext`); render-core where the target lends a GDI DC, else upstream's rendering-params route |
-| Direct2D `SetTextAntialiasMode` (34) / `SetTextRenderingParams` (36) forced to the profile | yes | **done** |
-| `DWriteCreateFactory` / `GetGdiInterop` | yes | not needed: upstream uses them only to reach the shared vtables, which we patch directly from our own factory |
-| `CreateTextFormat` / `CreateFontFace` (upstream's `[FontSubstitutes]` font replacement) | yes | **not ported, by decision**: Font-tuner replaces fonts through the tray's system-font switcher instead; every shipped profile has `FontSubstitutes=0` |
+| GDI `ExtTextOutW` | あり | **完了** |
+| GDI `ExtTextOutA` / `TextOutW` / `TextOutA` | あり | **自前フック不要でカバー**: Windows 11 (26200) では 3 つとも我々のインライン detour が張る `ExtTextOutW` 入口に来る（プローブハーネスで確認） |
+| GDI `GetGlyphOutlineW` / `GetGlyphOutlineA`（上流の "ClipBoxFix"） | あり | **完了**（`gdi_metrics.rs`。`[Experimental] ClipBoxFix`、既定オン。プロセス別の `[Experimental@exe]` 節は未適用） |
+| DirectWrite `IDWriteBitmapRenderTarget::DrawGlyphRun`（vtbl 3） | あり | **完了** |
+| DirectWrite `CreateGlyphRunAnalysis` → `CreateAlphaTexture`（Chromium/Skia、VS Code）、`IDWriteFactory2`/`3` の overload 含む | あり | **完了** |
+| Direct2D `ID2D1RenderTarget::DrawGlyphRun`（vtbl 29） | あり | **完了**（`D2D1CreateFactory` → RT 生成 → vtable ごとのパッチ経由） |
+| Direct2D `DrawGlyphRun1`（vtbl 82）/ `ID2D1DeviceContext` | あり | **完了**（`D2D1CreateDevice`、`D2D1CreateDeviceContext`、`ID2D1Factory1..7::CreateDevice`、`ID2D1Device..6::CreateDeviceContext`）。GDI DC を貸せる所は render-core、そうでなければ上流の rendering-params 経路 |
+| Direct2D `SetTextAntialiasMode` (34) / `SetTextRenderingParams` (36) をプロファイルに強制 | あり | **完了** |
+| `DWriteCreateFactory` / `GetGdiInterop` | あり | 不要: 上流はこれらを共有 vtable に到達するためだけに使う。我々は自前の factory から直接その vtable をパッチする |
+| `CreateTextFormat` / `CreateFontFace`（上流の `[FontSubstitutes]` フォント置換） | あり | **判断で未移植**: Font-tuner はトレイのシステムフォント切替でフォントを置換する。出荷プロファイルはすべて `FontSubstitutes=0` |
 
-Do not treat any path MacType covers as out of scope: the remaining rows are
-not-yet-ported, not deliberately dropped.
+MacType がカバーする経路を対象外扱いしない。残りの行は「まだ移植していない」で
+あって「意図的に落とした」ではない。
 
-## Other remaining
+## その他の残り
 
-- DPI transforms and non-natural DirectWrite measuring modes.
-- Coloured LCD is only exercised for black/greyscale text in verification.
+- DPI 変換と、自然でない DirectWrite measuring mode。
+- カラー LCD は検証では黒/グレースケールのテキストでしか動かしていない。
 
-## Build & try (single process)
+## ビルドして試す（単一プロセス）
 
-Requires `build/lib/freetype64.lib` first (run `build-core.ps1` once). Then, per
-crate: `cargo build --release`. Quick demos:
+先に `build/lib/freetype64.lib` が要る（`build-core.ps1` を一度実行）。その後
+クレートごとに `cargo build --release`。手早いデモ:
 
 ```powershell
-# offline render gallery (no hooking)
+# オフライン描画ギャラリー（フックなし）
 cargo run --release --manifest-path render-core/Cargo.toml
 
-# inject into ONE running app (here charmap) for 8 seconds, then unhook
-loader\target\release\loader.exe <abs path>\RenderCore64.dll charmap.exe 8
+# 動作中アプリ 1 つ（ここでは charmap）に 8 秒だけ注入し、その後フックを外す
+loader\target\release\loader.exe <絶対パス>\RenderCore64.dll charmap.exe 8
 ```
 
-Test with the tray stopped: a running tray injects the *installed* core into
-every process, so two builds would fight over the same hooks.
+検証はトレイを止めて行う。動作中のトレイはインストール済みコアを全プロセスに
+注入するので、2 つのビルドが同じフックを奪い合う。
 
-The injected DLL logs to `%TEMP%\render-inject.log` and saves one capture PNG.
-The per-stage probe/window crates used to develop each path were removed once
-the work landed in `render-inject`; see git history if you need them.
+注入 DLL は `%TEMP%\render-inject.log` に記録し、キャプチャ PNG を 1 枚保存する。
+各段階を開発した probe/window クレートは、成果が `render-inject` に落ちた時点で
+削除した。必要なら git 履歴を見る。
