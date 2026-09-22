@@ -28,6 +28,9 @@ impl Aa {
         }
     }
     pub fn is_lcd(self) -> bool { !matches!(self, Aa::Grey) }
+    /// LightLCD (AntiAliasMode 4/5): upstream loads with `FT_LOAD_TARGET_LIGHT`
+    /// (vertical-only autohinting) and still renders LCD.
+    pub fn is_light(self) -> bool { matches!(self, Aa::LightLcdRgb | Aa::LightLcdBgr) }
 }
 
 /// The `[DirectWrite]` section: what the injected core hands to DirectWrite /
@@ -88,10 +91,10 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Clean Greyscale (shipped default): greyscale, no hinting bias, gamma 1.25.
+    /// Clean Greyscale (shipped default): greyscale, FreeType auto-hinter, gamma 1.25.
     pub fn clean_greyscale() -> Profile {
         Profile { gamma: 1.25, weight: 1.0, contrast: 1.0, gamma_mode: 0,
-                  aa: Aa::Grey, hinting: 0, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.25), clipbox_fix: true }
+                  aa: Aa::Grey, hinting: 2, lcd_filter: 0, embolden: 0, dw: DwParams::derived_from(1.25), clipbox_fix: true }
     }
     /// Clean Sharp: LCD subpixel, no hinting, gamma 1.2, no LCD filter.
     pub fn clean_sharp() -> Profile {
@@ -180,6 +183,7 @@ impl Profile {
                                      4 => Aa::LightLcdRgb, 5 => Aa::LightLcdBgr, _ => p.aa };
                 },
                 "GammaValue" => if let Ok(f) = v.parse() { p.gamma = f; },
+                "GammaMode" => if let Ok(n) = v.parse() { p.gamma_mode = n; },
                 "Contrast" => if let Ok(f) = v.parse() { p.contrast = f; },
                 "RenderWeight" => if let Ok(f) = v.parse() { p.weight = f; },
                 "LcdFilter" => if let Ok(n) = v.parse() { p.lcd_filter = n; },
@@ -233,6 +237,22 @@ Contrast=0.0
         assert!((p.dw.contrast - 0.0625).abs() < 1e-6);
         assert!((p.dw.cleartype_level - 1.0).abs() < 1e-6, "absent key keeps the upstream default");
         assert_eq!(p.dw.rendering_mode, 5);
+    }
+
+    #[test]
+    fn from_ini_parses_gamma_mode() {
+        let p = Profile::from_ini_str("[General]
+GammaMode=1
+NormalWeight=8
+");
+        assert_eq!(p.gamma_mode, 1);
+        assert_eq!(p.embolden, 8);
+        // Shipped profiles say GammaMode=0 (plain power gamma), the default.
+        assert_eq!(Profile::from_ini_str("[General]
+GammaMode=0
+").gamma_mode, 0);
+        assert_eq!(Profile::from_ini_str("[General]
+").gamma_mode, 0);
     }
 
     #[test]

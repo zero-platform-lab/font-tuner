@@ -9,6 +9,9 @@ license = "GPL-3.0-only"
 name = "RenderCore64"
 crate-type = ["cdylib"]
 
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 render-core = { path = "../render-core" }
 retour = "0.4.0-alpha.4"

@@ -7,6 +7,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod custom;
 mod lang;
 mod stale;
 mod sysfont;
@@ -14,13 +15,13 @@ mod sysfont;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::Threading::{CreateMutexW};
 use windows::Win32::System::WindowsProgramming::{GetPrivateProfileStringW, WritePrivateProfileStringW};
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE, Shell_NotifyIconW};
-use windows::Win32::UI::WindowsAndMessaging::{WM_DESTROY, WM_SETTINGCHANGE, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HHOOK, HICON, HMENU, HOOKPROC, HWND_BROADCAST, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, SetWindowsHookExW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_GETMESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW};
+use windows::Win32::UI::WindowsAndMessaging::{WM_COMMAND, WM_DESTROY, WM_SETTINGCHANGE, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HHOOK, HICON, HMENU, HOOKPROC, HWND_BROADCAST, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, SetWindowsHookExW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_GETMESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW};
 use windows::core::{s, w, PCWSTR};
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -28,6 +29,9 @@ const ID_ENABLED: usize = 1;
 const ID_EXIT: usize = 2;
 const ID_RELOAD: usize = 3;
 const ID_VERSION: usize = 4;
+const ID_CUSTOM: usize = 5;
+const ID_CUSTOM_EDIT: usize = 6;
+const ID_RESTART: usize = 7;
 const ID_PROFILE_BASE: usize = 100;
 const ID_SYSFONT_DEFAULT: usize = 200;
 const ID_SYSFONT_BASE: usize = 201;
@@ -362,6 +366,16 @@ impl App {
                 let t = wide(n.trim_end_matches(".ini"));
                 let _ = AppendMenuW(sub, MF_STRING | checked, ID_PROFILE_BASE + i, PCWSTR(t.as_ptr()));
             }
+            // The per-user custom profile (%APPDATA%\Font-tuner\Custom.ini) and
+            // its dialog. Selectable only once the dialog has written it.
+            let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
+            let has_custom = custom::ini_path().is_some_and(|p| p.exists());
+            let checked = if has_custom && cur.eq_ignore_ascii_case(custom::FILE_NAME) { MF_CHECKED } else { MF_UNCHECKED };
+            let grey = if has_custom { MF_STRING } else { MF_GRAYED };
+            let tc = wide(self.s.custom);
+            let _ = AppendMenuW(sub, MF_STRING | checked | grey, ID_CUSTOM, PCWSTR(tc.as_ptr()));
+            let te = wide(self.s.custom_edit);
+            let _ = AppendMenuW(sub, MF_STRING, ID_CUSTOM_EDIT, PCWSTR(te.as_ptr()));
             // System-font submenu: "restore default" then the fixed font list.
             let fsub = CreatePopupMenu().unwrap_or_default();
             let cur_face = sysfont::current_face().unwrap_or_default();
@@ -389,6 +403,8 @@ impl App {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let tv = wide(&format!("{} {}", self.s.version, env!("CARGO_PKG_VERSION")));
             let _ = AppendMenuW(menu, MF_STRING, ID_VERSION, PCWSTR(tv.as_ptr()));
+            let trs = wide(self.s.restart);
+            let _ = AppendMenuW(menu, MF_STRING, ID_RESTART, PCWSTR(trs.as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, PCWSTR(t3.as_ptr()));
             menu
         }
@@ -397,6 +413,8 @@ impl App {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// Set by "Restart": relaunch after the message loop ends.
+    static RESTART: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
@@ -437,6 +455,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 LRESULT(0)
             }
+            WM_COMMAND => {
+                handle_command(hwnd, wparam.0 & 0xFFFF);
+                LRESULT(0)
+            }
             WM_SETTINGCHANGE => {
                 // Fires on theme (light/dark) changes; swap the icon if needed.
                 with_app(App::refresh_theme_icon);
@@ -474,6 +496,13 @@ fn handle_command(hwnd: HWND, cmd: usize) {
         ID_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
         },
+        // Same as Exit, then `main` relaunches this exe once the hook is off
+        // and the single-instance mutex is released (see the end of `main`).
+        // SAFETY: destroying our own window.
+        ID_RESTART => unsafe {
+            RESTART.with(|r| r.set(true));
+            let _ = DestroyWindow(hwnd);
+        },
         // Ask every injected process to re-read font-tuner.ini. The core's
         // GetMsgProc handles this message on each process's own UI thread.
         // SAFETY: a static message name; broadcasting a registered message.
@@ -492,6 +521,21 @@ fn handle_command(hwnd: HWND, cmd: usize) {
             env!("CARGO_PKG_VERSION"),
             env!("CARGO_PKG_REPOSITORY"),
         )),
+        ID_CUSTOM => {
+            with_app(|a| custom::select(&a.profiles.ini));
+        }
+        ID_CUSTOM_EDIT => {
+            // Drop the APP borrow first: the dialog's window procedure runs on
+            // this thread and the tray's menu can be opened while it is up.
+            let args = with_app(|a| {
+                let cur = a.profiles.current();
+                let current = (!cur.is_empty() && !cur.eq_ignore_ascii_case(custom::FILE_NAME)).then(|| a.dir.join("ini").join(cur));
+                (a.profiles.ini.clone(), current, a.s)
+            });
+            if let Some((ini, current, s)) = args {
+                custom::open(ini, current, &s);
+            }
+        }
         ID_SYSFONT_DEFAULT => sysfont::restore(),
         c if (ID_SYSFONT_BASE..ID_SYSFONT_BASE + sysfont::FONTS.len()).contains(&c) => {
             sysfont::apply(sysfont::FONTS[c - ID_SYSFONT_BASE]);
@@ -518,7 +562,7 @@ fn main() {
     // ours, and `msg` is our own MSG.
     unsafe {
         let name = wide("Local\\font-tuner");
-        let _mutex = CreateMutexW(None, false, PCWSTR(name.as_ptr()));
+        let mutex = CreateMutexW(None, false, PCWSTR(name.as_ptr()));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             msgbox(s.err_already);
             return;
@@ -574,6 +618,11 @@ fn main() {
         if let Some(Some(err)) = err {
             msgbox(&err);
         }
+        // `--custom`: open the custom-profile dialog right away (a shortcut
+        // target; the tray menu offers the same item).
+        if std::env::args().nth(1).as_deref() == Some("--custom") {
+            let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(ID_CUSTOM_EDIT), LPARAM(0));
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&raw mut msg, None, 0, 0).as_bool() {
@@ -581,5 +630,17 @@ fn main() {
             DispatchMessageW(&raw const msg);
         }
         APP.with(|a| *a.borrow_mut() = None);
+        // "Restart": the hook is already off (WM_DESTROY) and the tray icon
+        // gone. Release the single-instance mutex before spawning, or the
+        // child would see ERROR_ALREADY_EXISTS and quit. Nothing else of ours
+        // runs at this point, so the child hooks afresh like a manual start.
+        if RESTART.with(std::cell::Cell::get) {
+            if let Ok(h) = mutex {
+                let _ = CloseHandle(h);
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).spawn();
+            }
+        }
     }
 }
