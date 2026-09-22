@@ -248,7 +248,7 @@ FreeType は C のヘッダを bindgen せず、使う分だけ手で宣言す�
 | プロファイルを再読み込み | `FontTuner.ReloadProfile` をブロードキャスト（3.1） |
 | システムフォント ▶ | 5 |
 | バージョン x.y.z | About。バージョン・ライセンス（GPL-3.0-only）・ソース URL・必須の FreeType クレジット |
-| Font-tuner を再起動 | 「終了」と同じ経路（`WM_DESTROY` でフック解除・アイコン削除）で抜けた後、`main` の末尾で単一インスタンスのミューテックスを閉じてから同じ exe を起動し直す。手で終了 → 起動するのと同じで、コアには何もしない。メニューからの実操作は未確認 |
+| Font-tuner を再起動 | 「終了」と同じ経路（`WM_DESTROY` でフック解除・アイコン削除）で抜けた後、`main` の末尾で単一インスタンスのミューテックスを閉じてから同じ exe を起動し直す。手で終了 → 起動するのと同じで、コアには何もしない（メニューからの実操作を確認済み） |
 | 終了 | フックを外して終了 |
 
 アイコンは 2 つを `app.rc` / `build.rs`（`embed-resource`）で exe に埋め込む: `assets/tray-dark.ico`（シルバーの歯車 + 「A」、暗いタスクバー用）と `assets/tray-light.ico`（黒、明るいタスクバー用）。起動時と `WM_SETTINGCHANGE` のたびに `HKCU\...\Themes\Personalize\SystemUsesLightTheme` を読んで一致する方を選ぶ。値が無ければ暗（Windows 11 の既定）。図案は CC0。Explorer が再起動したら（`TaskbarCreated`）アイコンを置き直す。
