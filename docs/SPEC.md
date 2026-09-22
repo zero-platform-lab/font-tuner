@@ -11,7 +11,6 @@ Windows 向けの小さな自己完結型フォント描画チューナ（トレ
 | `font-tuner`（`src/`） | `font-tuner.exe` | トレイ。フックを張る。プロファイル選択、カスタムダイアログ、システムフォント切替 |
 | `render-inject` | `RenderCore64.dll` | 注入されるコア。GDI / DirectWrite / Direct2D をフックし、`render-core` で描く |
 | `render-core` | （lib） | 描画エンジン。FreeType の上のヒンティング・ガンマ・ブレンド。注入もフックもしない |
-| `render-bootstrap`（`bootstrap/`） | `RenderBootstrap64.dll` | 子プロセスでコアを `LoadLibraryW` するだけの小さな DLL。同梱するが、注入する側の経路は未移植（1.1） |
 
 ---
 
@@ -29,7 +28,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 * **font-tuner.exe** — `RenderCore64.dll` が export する `GetMsgProc` を使うグローバルな `WH_GETMESSAGE` フックを 1 つ張る。64bit GUI プロセスがメッセージを取り出すと、Windows がコア DLL をそこにマップしてフックが発火し、コアの `DllMain` が走ってフォント描画 API をパッチする。
 * **RenderCore64.dll** — アタッチ時にプロセスの寿命の間だけ自己をアンロード不可にする（`GetModuleHandleEx` + `GET_MODULE_HANDLE_EX_FLAG_PIN`）。フックを外しても（トレイ OFF / 終了 / 更新 / アンインストール）*新規*プロセスへの注入が止まるだけで、動作中プロセスからは決してアンマップされない。だから「アンマップ後にコードが走る」クラッシュ経路がない。プロファイル切替・ON/OFF・更新はすべて以降に起動するプロセスで効く。
 * **フックプロシージャの RVA 固定** — `SetWindowsHookEx` は `GetMsgProc - hmod` しか記録しない。対象プロセスでは Windows が DLL をパスで解決し、そのプロセスが既に持つ（常駐固定された）イメージを見つけて `その base + RVA` を呼ぶ。更新後も動作中プロセスは*前*のビルドを保持するので、RVA がビルド間で同一でなければ、次のメッセージでそれらが一斉にランダムなバイトを実行して落ちる（一度実際に起きた: リファクタで `GetMsgProc` が `0x1100` から `0x8300` に動いた）。コアの `build.rs` はリンカの `/ORDER` で `GetMsgProc` を RVA `0x1000`（`.text` の先頭）に固定する。`build-msi.ps1` は動いたコアをパッケージせず、トレイは張らない（1.2）。バージョン資源は `.rsrc` に入るので RVA に影響しない（確認済み）。
-* **RenderBootstrap64.dll** — 上流の非公開ブートストラップ（`expfunc.cpp` `GdippInjectDLL` が子プロセスに注入する DLL）の Rust 代替。役割はバックグラウンドスレッドからコアを `LoadLibraryW` することだけ（`DllMain` から `CreateThread` し、ローダーロックの下で `LoadLibrary` しない）。**ただし注入する側（コアが `CreateProcess` を横取りして子に送り込む経路）は移植していない**。MSI に同梱はするが、現状はどこからもロードされない。子プロセスへは、それがメッセージポンプを持てば `WH_GETMESSAGE` で届く。
+* **子プロセスへの注入は移植しない** — 上流のコアは `CreateProcess` を横取りし、非公開のブートストラップ DLL（`expfunc.cpp` `GdippInjectDLL`）を子に送り込んで、メッセージポンプが回る前にコアをロードする。移植にはこの経路がない。メッセージポンプを持つ子プロセスなら `WH_GETMESSAGE` で届く（最初のメッセージを取り出す前の描画には効かない）。0.1.1 までは Rust 版のブートストラップ DLL を同梱していた。ロードする側が無いので 0.1.2 で外した。理由: 得られるのは起動直後の数フレームと、署名の壁（1.3）で届かない Chrome 系の子だけ。その代償として `CreateProcess` の detour が全プロセスで走る。
 
 ### 1.2 フックと並行性
 
@@ -43,7 +42,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 ### 1.3 届かないもの
 
-* **Chrome/Edge のレンダラー・GPU プロセス** — `MITIGATION_FORCE_MS_SIGNED_BINS`（Microsoft 署名バイナリのみ）で阻まれる。未署名のコア/ブートストラップ DLL は `LoadLibrary` で拒否される。通常の子プロセス（crashpad-handler、utility）には届く。これは Windows のセキュリティ境界であってバグではない。回避策は Microsoft 署名（任意の DLL には得られない）か、ブラウザごとに緩和を無効化すること（`RendererCodeIntegrityEnabled=0` ポリシー、サンドボックスを弱めるので本プロジェクトでは設定しない）だけ。
+* **Chrome/Edge のレンダラー・GPU プロセス** — `MITIGATION_FORCE_MS_SIGNED_BINS`（Microsoft 署名バイナリのみ）で阻まれる。未署名のコア DLL は `LoadLibrary` で拒否される。通常の子プロセス（crashpad-handler、utility）には届く。これは Windows のセキュリティ境界であってバグではない。回避策は Microsoft 署名（任意の DLL には得られない）か、ブラウザごとに緩和を無効化すること（`RendererCodeIntegrityEnabled=0` ポリシー、サンドボックスを弱めるので本プロジェクトでは設定しない）だけ。
 * **メッセージポンプを持たないプロセス**（コンソールアプリ、サービス）— `WH_GETMESSAGE` が発火しない。
 * **自前でテキストを描くアプリ**（Windows ターミナルの AtlasEngine など）— GDI / `IDWriteBitmapRenderTarget` / Direct2D のテキスト API を通らない描画には手が届かない。
 * **32bit プロセス** — 対象外。64bit 専用ビルド。
@@ -280,10 +279,10 @@ FreeType は C のヘッダを bindgen せず、使う分だけ手で宣言す�
 
 ## 6. ビルド
 
-* **版** — root `Cargo.toml` の `[workspace.package] version` が唯一の出所。`font-tuner` と `render-bootstrap` は `version.workspace = true` で継承し、ワークスペース外の `render-inject` は `build.rs` が root `Cargo.toml` を読む。exe と両 DLL は各 `build.rs` が生成する `VERSIONINFO` を埋め込む。リリースごとに上げる（7）。
+* **版** — root `Cargo.toml` の `[workspace.package] version` が唯一の出所。`font-tuner` は `version.workspace = true` で継承し、ワークスペース外の `render-inject` は `build.rs` が root `Cargo.toml` を読む。exe とコア DLL は各 `build.rs` が生成する `VERSIONINFO` を埋め込む。リリースごとに上げる（7）。
 * **ツールフラグ** — `.cargo/config.toml` が MSVC ターゲットに `+crt-static` を設定し、`VCRUNTIME140.dll` 依存（と DLL 探索順ハイジャックの面）を消す。Release プロファイル: `opt-level="s"`、LTO、`panic="abort"`、strip 済み。
 * **`build-core.ps1`** — 出荷 DLL に必要な唯一のネイティブ依存だけをビルドする: snowie2000 の FreeType フォーク（`freetype64.lib`）を MSBuild/vswhere で。
-* **`build-msi.ps1`** — `build-core.ps1`、`cargo build --release`（ワークスペース + `render-inject`）を走らせる。`check-export-rva.ps1` でコアが `GetMsgProc` を RVA `0x1000` に export しているか、exe と 2 つの DLL のファイルバージョンが `Cargo.toml` の版と一致するかを確認する（違えば中止）。次に exe + DLL 群 + `font-tuner.ini` + `ini\*.ini` を `build\pkg` に集める。最後に `wix build` で `dist\font-tuner-<ver>-x64.msi`。
+* **`build-msi.ps1`** — `build-core.ps1`、`cargo build --release`（ワークスペース + `render-inject`）を走らせる。`check-export-rva.ps1` でコアが `GetMsgProc` を RVA `0x1000` に export しているか、exe とコア DLL のファイルバージョンが `Cargo.toml` の版と一致するかを確認する（違えば中止）。次に exe + DLL 群 + `font-tuner.ini` + `ini\*.ini` を `build\pkg` に集める。最後に `wix build` で `dist\font-tuner-<ver>-x64.msi`。
 * **検証** — `check-lint.ps1`（PSScriptAnalyzer / textlint + prh / `cargo clippy`）と `cargo test`（`render-core` は 23 件。ブレンド、フラグ、TTC の名前一致、FFI 構造体のオフセット）。
 
 ---
@@ -294,8 +293,8 @@ FreeType は C のヘッダを bindgen せず、使う分だけ手で宣言す�
 * **インストール時** — 動作中の `font-tuner.exe` を止め、Font-tuner を起動する。
 * **Restart Manager 無効化**（`MSIRESTARTMANAGERCONTROL=Disable`、`REBOOT=ReallySuppress`）: `RenderCore64.dll` は全 GUI プロセスにマップされている。無効化しないと Restart Manager がそれらを全部閉じる（ユーザーのシェルを落としたことがある）。閉じるのはトレイだけにする。手で `msiexec` を打つときも `MSIRESTARTMANAGERCONTROL=Disable` を付ける。
 * **使用中コアの入れ替え** — コアが全動作中プロセスにマップ（かつ常駐固定）されているため、そのファイルは決して上書きできない。遅延カスタムアクション（`RenameOldCore`、`InstallInitialize` の直後、`RemoveExistingProducts` の前）が使用中の `RenderCore64.dll` を脇へリネームし、`InstallFiles` が新しいものをすぐ置ける。脇へリネームしたコピーは次の再起動時の削除に予約する（`MoveFileEx DELAY_UNTIL_REBOOT`）。以降に起動するプロセスへ更新を効かせるのに再起動は要らない。脇へリネームしたイメージは元のパスのまま全動作中プロセスにマップされ続ける。だから新コアで `GetMsgProc` の RVA を同じに保つ必要がある（1.1）。
-* **ファイルの置換規則** — Windows Installer は版付きのファイルを「新しい版が高いときだけ」置き換える。版なしのファイルは、更新日時が作成日時と違うと「利用者が改変した」とみなして置き換えない（[File Versioning Rules](https://learn.microsoft.com/en-us/windows/win32/msi/file-versioning-rules)）。0.1.0 は版なしで、更新で `font-tuner.exe` が古いまま残った（ログに `Existing file is unversioned but modified`）。0.1.1 から 3 バイナリに版を埋め込み、版なし → 0.1.1、0.1.0 → 0.1.1 の更新でいずれも置き換わることを実機で確認した。版を上げずに作り直した MSI は同じ版のファイルを置き換えない（`Existing file is of an equal version`）。`REINSTALL=ALL` も効かない（`wix build` のたびに ProductCode が変わり、未インストールの製品扱いで 1603）。開発中に同じ版で入れ直すときは、アンインストール（`msiexec /x {ProductCode}`。新しい MSI ファイルを `/x` に渡しても 1605）してから入れる。
-* **`font-tuner.ini`** は `NeverOverwrite`。版を上げた通常の更新ではユーザーの `AlternativeFile` が残る想定だが未確認。アンインストール → インストールでは消えて既定に戻る（確認済み）。
+* **ファイルの置換規則** — Windows Installer は版付きのファイルを「新しい版が高いときだけ」置き換える。版なしのファイルは、更新日時が作成日時と違うと「利用者が改変した」とみなして置き換えない（[File Versioning Rules](https://learn.microsoft.com/en-us/windows/win32/msi/file-versioning-rules)）。0.1.0 は版なしで、更新で `font-tuner.exe` が古いまま残った（ログに `Existing file is unversioned but modified`）。0.1.1 から exe と DLL に版を埋め込み、版なし → 0.1.1、0.1.0 → 0.1.1 の更新でいずれも置き換わることを実機で確認した。版を上げずに作り直した MSI は同じ版のファイルを置き換えない（`Existing file is of an equal version`）。`REINSTALL=ALL` も効かない（`wix build` のたびに ProductCode が変わり、未インストールの製品扱いで 1603）。開発中に同じ版で入れ直すときは、アンインストール（`msiexec /x {ProductCode}`。新しい MSI ファイルを `/x` に渡しても 1605）してから入れる。
+* **`font-tuner.ini`** は `NeverOverwrite`。版を上げた通常の更新ではユーザーの `AlternativeFile` が残る（0.1.1 → 0.1.2 で Accurate を選んだまま更新し、残ることを確認）。アンインストール → インストールでは消えて既定に戻る（確認済み）。
 * **アンインストール** — 「プログラムの追加と削除」または `msiexec /x {ProductCode}`。ファイル・Run レジストリ値を消し、トレイを止める。`%APPDATA%\Font-tuner\Custom.ini` と `%LOCALAPPDATA%\font-tuner\sysfont-backup.bin` は残る。
 * **署名** — MSI とそのペイロードは未署名なので、インストール時に UAC が「発行元不明」と出す（SmartScreen も出うる）。ブロックはされない。署名はリリースを帰属不能に保つためあえて省く。どのみちブラウザのレンダラー/GPU プロセスへ到達する助けにならない（1.3）。
 

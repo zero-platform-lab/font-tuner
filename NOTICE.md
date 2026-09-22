@@ -10,7 +10,6 @@ Font-tuner は GPL-3.0-only で配布する。MSI に同梱するものと、そ
 | `RenderCore64.dll` (描画コア + フック) | このリポジトリ (`render-inject/`, `render-core/`)。描画アルゴリズム (`render-core`) は [snowie2000/mactype](https://github.com/snowie2000/mactype) の `ft.cpp` ほかを Rust に移植したもの (翻訳 = 改変物) | GPL-3.0-only (派生元 MacType が GPLv3 の LICENSE のみで「or later」を明示していないため、v3 限定) | ソース公開。派生元の表記を消さない |
 | ↳ 内部に静的リンク: FreeType | [snowie2000/freetype](https://github.com/snowie2000/freetype) (`vendor/freetype`)。本家 FreeType に `FT_Glyph_To_BitmapEx` を足したフォーク | FTL または GPLv2+ の二択 | **表示義務**: 「Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.」を README か About に載せる |
 | ↳ フック機構: retour + iced-x86 | [Hpmason/retour-rs](https://github.com/Hpmason/retour-rs) (inline detour) / [icedland/iced](https://github.com/icedland/iced) (逆アセンブラ) | retour: BSD-3-Clause / iced-x86: MIT | 著作権表示 (crate に同梱) |
-| `RenderBootstrap64.dll` (子プロセス用ローダ) | このリポジトリ (`bootstrap/`) | GPL-3.0-only | ソース公開 |
 | `font-tuner.ini` | このリポジトリ (`profiles/`)。`[UnloadDll]` の除外リストは純正 MacType 同梱のものを元にした | GPL-3.0 | — |
 | `ini\*.ini` (プロファイル 5 本) | 純正 MacType 同梱のプロファイルを元にした。各ファイル冒頭に作者名あり (Samantha Glocker, mufunyo) | MacType 配布物の一部として GPL-3.0 で配布されている | 作者コメント行を削らない |
 | Rust `windows` / `windows-numerics` crate | microsoft/windows-rs | MIT または Apache-2.0 | 著作権表示 |

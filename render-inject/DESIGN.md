@@ -21,9 +21,9 @@ render-inject (cdylib DLL)  RenderCore64.dll — 各プロセスに注入され�
 ```
 
 他プロセスへの注入は既存の loader 設計を再利用する（トレイが `WH_GETMESSAGE`
-フックを張り、そのプロシージャがこの DLL にある。子プロセス用ブートストラップ
-`RenderBootstrap64.dll` がそれを LoadLibrary する）。このクレートは描画コア本体で
-あり、注入機構ではない。
+フックを張り、そのプロシージャがこの DLL にある）。上流が `CreateProcess` を
+横取りして子プロセスに送り込むブートストラップ DLL は移植しない（docs/SPEC.md
+1.1）。このクレートは描画コア本体であり、注入機構ではない。
 
 ## 段階（各段階を次の前に検証した）
 
@@ -42,8 +42,7 @@ render-inject (cdylib DLL)  RenderCore64.dll — 各プロセスに注入され�
 
 ## リスク・ルール
 
-- ローダーロックの下で LoadLibrary しない（`RenderBootstrap64` と同様、DllMain
-  からスレッドを起こす）
+- ローダーロックの下で LoadLibrary しない（DllMain からスレッドを起こす）
 - アタッチ時に自己を常駐固定する（GetModuleHandleEx FLAG_PIN）。動作中のプロ
   セスから決してアンマップされないので、アンマップ後にコードが走ることはない。
   DllMain の DETACH は何もしない
