@@ -119,9 +119,12 @@ unsafe extern "system" fn detour(
     }
 }
 
-/// Resolve the DC's font into render-core (returns the pixel size), or None.
-/// Re-extracts + re-faces only when the font differs from `cache`.
-fn resolve_font(hdc: HDC, ft: &Ft, cache: &mut Option<String>) -> Option<i32> {
+/// Resolve the DC's font into render-core, or None. Re-extracts + re-faces
+/// only when the font differs from `cache`. The pixel size is not taken from
+/// here: `LOGFONTW.lfHeight` means the em size when negative but the *cell*
+/// height (em + internal leading) when positive, so the caller derives it
+/// from the text metrics instead (see `em_px`).
+fn resolve_font(hdc: HDC, ft: &Ft, cache: &mut Option<String>) -> Option<()> {
     let mut lf = LOGFONTW::default();
     // SAFETY: `lf` is a LOGFONTW and the size passed is exactly its size.
     unsafe {
@@ -129,8 +132,6 @@ fn resolve_font(hdc: HDC, ft: &Ft, cache: &mut Option<String>) -> Option<i32> {
         let size = i32::try_from(core::mem::size_of::<LOGFONTW>()).unwrap_or(i32::MAX);
         GetObjectW(hfont, size, Some((&raw mut lf).cast::<c_void>()));
     }
-    let px = i32::try_from(lf.lfHeight.unsigned_abs()).ok().filter(|&p| p != 0).unwrap_or(16);
-
     // Size-only probe is cheap; the full read only happens on a cache miss.
     // SAFETY: GetFontData with a null buffer only reports the size.
     let (table, size) = unsafe {
@@ -152,7 +153,16 @@ fn resolve_font(hdc: HDC, ft: &Ft, cache: &mut Option<String>) -> Option<i32> {
         ft.reface_memory(&buf, &face).ok()?;
         *cache = Some(key);
     }
-    Some(px)
+    Some(())
+}
+
+/// The em size in pixels for the DC's selected font, as upstream computes it
+/// (`ft.cpp`: `tmHeight - tmInternalLeading`). This is right for both signs
+/// of `lfHeight`; `|lfHeight|` would render a positive (cell-height) font too
+/// large by the internal leading. Falls back to 16 if the metrics are odd.
+fn em_px(tm: &TEXTMETRICW) -> i32 {
+    let em = tm.tmHeight - tm.tmInternalLeading;
+    if em > 0 { em } else { 16 }
 }
 
 /// Text metrics and the run's extent on this DC. `None` when GDI cannot
@@ -173,9 +183,9 @@ fn measure(d: &Draw<'_>) -> Option<(TEXTMETRICW, SIZE)> {
 }
 
 /// Draw the run onto `canvas` with the shared face, refaced to the DC's font.
-fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, pen: (i32, i32)) -> Option<()> {
+fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, pen: (i32, i32), px: i32) -> Option<()> {
     let RenderState { ft, tables, profile, font_key, font_face } = st;
-    let px = resolve_font(d.hdc, ft, font_key)?;
+    resolve_font(d.hdc, ft, font_key)?;
     *font_face = None; // a GDI key does not name a DirectWrite face
     if d.glyph_mode() {
         draw_glyphs_onto(canvas, ft, tables, profile, ink, d.text, px, pen, d.dx);
@@ -219,7 +229,8 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     let pen = (d.x - rx, baseline - ry);
     // The render lock serialises every draw; it is held for this one
     // statement, while render-core touches the shared face.
-    RENDER.lock().ok()?.as_mut().and_then(|st| draw_run(st, &mut canvas, d, ink, pen))?;
+    let px = em_px(&tm);
+    RENDER.lock().ok()?.as_mut().and_then(|st| draw_run(st, &mut canvas, d, ink, pen, px))?;
     dib.blit(&canvas);
 
     // Save what render-core produced inside the injected process, once, as proof.
@@ -252,4 +263,21 @@ pub(crate) fn setup_gdi_hook() {
         })
     };
     log(if ok { "hook installed on ExtTextOutW" } else { "ExtTextOutW hook failed" });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A positive lfHeight font (cell height 16 = em 13 + leading 3) must
+    /// render at the em size, like upstream, not at the cell height.
+    #[test]
+    fn em_px_is_height_minus_internal_leading() {
+        let tm = TEXTMETRICW { tmHeight: 16, tmInternalLeading: 3, ..Default::default() };
+        assert_eq!(em_px(&tm), 13);
+        let neg = TEXTMETRICW { tmHeight: 12, tmInternalLeading: 0, ..Default::default() };
+        assert_eq!(em_px(&neg), 12);
+        let odd = TEXTMETRICW { tmHeight: 0, tmInternalLeading: 0, ..Default::default() };
+        assert_eq!(em_px(&odd), 16);
+    }
 }
