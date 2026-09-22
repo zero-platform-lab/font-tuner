@@ -28,6 +28,9 @@ impl Aa {
         }
     }
     pub fn is_lcd(self) -> bool { !matches!(self, Aa::Grey) }
+    /// LightLCD (AntiAliasMode 4/5): upstream loads with `FT_LOAD_TARGET_LIGHT`
+    /// (vertical-only autohinting) and still renders LCD.
+    pub fn is_light(self) -> bool { matches!(self, Aa::LightLcdRgb | Aa::LightLcdBgr) }
 }
 
 /// The `[DirectWrite]` section: what the injected core hands to DirectWrite /

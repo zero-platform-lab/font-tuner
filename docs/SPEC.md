@@ -58,7 +58,11 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | **Clean Sharp** | 1（なし） | 2 LCD | サブピクセル（カラー）LCD、ヒンティングなし。横方向の細部が高く鮮鋭。（旧「Clean」） |
 | **Clean Sharp Dark** | 0（フォント内蔵） | 2 LCD | 暗い背景向けに調整した LCD サブピクセル。（旧「Clean Dark」） |
 
-ヒンティングモード（上流 `ft.cpp` の `FreeTypePrepare` と同じ対応。`render-core/src/ft.rs` の `flags`）: **0** = フラグなし＝FreeType の既定。フォント内蔵の TrueType バイトコードがあればそれでヒントする。**1** = `FT_LOAD_NO_HINTING`（アウトラインのまま、最も柔らかく最も忠実な形）。**2** = `FT_LOAD_FORCE_AUTOHINT`（FreeType のオートヒンタ、最も強く小サイズで最も鮮鋭、形が少し歪みうる）。全プロファイルが DirectWrite `RenderingMode=2`（GDI_CLASSIC）を使い、GDI と DirectWrite のテキストを一致させる。
+ヒンティングモード（上流 `ft.cpp` の `FreeTypePrepare` と同じ対応。`render-core/src/ft.rs` の `flags`）: **0** = フラグなし＝FreeType の既定。フォント内蔵の TrueType バイトコードがあればそれでヒントする。**1** = `FT_LOAD_NO_HINTING`（アウトラインのまま、最も柔らかく最も忠実な形）。**2** = `FT_LOAD_FORCE_AUTOHINT`（FreeType のオートヒンタ、最も強く小サイズで最も鮮鋭、形が少し歪みうる）。
+
+アンチエイリアスモードもロードターゲットを決める（同じく `FreeTypePrepare`）: **0** グレースケール = `FT_LOAD_TARGET_NORMAL`。**2/3** LCD = `FT_LOAD_TARGET_LCD`。**4/5** LightLCD = `FT_LOAD_TARGET_LIGHT`（縦方向だけスナップする軽いオートヒント）で描画は LCD。オートヒント（HintingMode 2）は 12px 前後の日本語フォントの欧文で大文字の高さが字ごとにずれる（C や 3 が大きく、Z が小さく見える）。これは FreeType のオートヒンタの挙動で、ブレンドの計算とは無関係（`render-core` を直接呼んで HintingMode 0/1/2 を並べて確認した）。
+
+全プロファイルが DirectWrite `RenderingMode=2`（GDI_CLASSIC）を使い、GDI と DirectWrite のテキストを一致させる。
 
 `[DirectWrite]` 節（`GammaValue`・`Contrast`・`ClearTypeLevel`・`RenderingMode`）は、自前でラスタライズできないテキストに対して Direct2D へ指定する値（1.2）。既定は上流に従う: gamma は一般の gamma から導出（`g² > 1.3 ? g²/2 : 0.7`）、contrast 1.0、ClearType level 1.0、mode 5。`GammaValue` が 0（グレースケール系プロファイルの出荷値）のときは「上書きしない」の意味で、導出 gamma にフォールバックする（DirectWrite は gamma > 0 を要求するため）。
 

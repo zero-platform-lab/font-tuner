@@ -171,6 +171,7 @@ const FT_LOAD_NO_BITMAP: i32 = 0x8;
 const FT_LOAD_FORCE_AUTOHINT: i32 = 0x20;
 const FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH: i32 = 0x200;
 const FT_LOAD_TARGET_NORMAL: i32 = 0;
+const FT_LOAD_TARGET_LIGHT: i32 = 1 << 16;
 const FT_LOAD_TARGET_LCD: i32 = 3 << 16;
 const FT_RENDER_MODE_NORMAL: i32 = 0;
 const FT_RENDER_MODE_LCD: i32 = 3;
@@ -314,10 +315,13 @@ impl Ft {
         unsafe { FT_Library_SetLcdFilter(self.lib, filter as c_uint); }
     }
 
-    /// FreeType load flags + render mode for a profile's AA + hinting.
+    /// FreeType load flags + render mode for a profile's AA + hinting, as
+    /// upstream `FreeTypePrepare` (ft.cpp): AntiAliasMode 2/3 load with
+    /// `FT_LOAD_TARGET_LCD`, 4/5 (LightLCD) with `FT_LOAD_TARGET_LIGHT` — the
+    /// light autohinter, vertical snapping only — and both render LCD.
     fn flags(p: &Profile) -> (i32, i32) {
         let base = FT_LOAD_NO_BITMAP | FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH;
-        let target = if p.aa.is_lcd() { FT_LOAD_TARGET_LCD } else { FT_LOAD_TARGET_NORMAL };
+        let target = if p.aa.is_light() { FT_LOAD_TARGET_LIGHT } else if p.aa.is_lcd() { FT_LOAD_TARGET_LCD } else { FT_LOAD_TARGET_NORMAL };
         let render = if p.aa.is_lcd() { FT_RENDER_MODE_LCD } else { FT_RENDER_MODE_NORMAL };
         let mut flags = base | target;
         match p.hinting {
@@ -394,6 +398,36 @@ impl Drop for Ft {
 /// Convenience: does this profile need BGR subpixel order?
 pub fn is_bgr(aa: Aa) -> bool {
     matches!(aa, Aa::LcdBgr | Aa::LightLcdBgr)
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+    use crate::config::Aa;
+
+    /// Load targets follow upstream `FreeTypePrepare`: Grey → NORMAL,
+    /// LCD → TARGET_LCD, LightLCD → TARGET_LIGHT (still rendered LCD).
+    #[test]
+    fn load_target_per_aa_mode_matches_upstream() {
+        let mut p = Profile::clean_greyscale();
+        let (f, r) = Ft::flags(&p);
+        assert_eq!(f & (0xF << 16), FT_LOAD_TARGET_NORMAL);
+        assert_eq!(r, FT_RENDER_MODE_NORMAL);
+        p.aa = Aa::LcdRgb;
+        let (f, r) = Ft::flags(&p);
+        assert_eq!(f & (0xF << 16), FT_LOAD_TARGET_LCD);
+        assert_eq!(r, FT_RENDER_MODE_LCD);
+        for aa in [Aa::LightLcdRgb, Aa::LightLcdBgr] {
+            p.aa = aa;
+            let (f, r) = Ft::flags(&p);
+            assert_eq!(f & (0xF << 16), FT_LOAD_TARGET_LIGHT, "{aa:?}");
+            assert_eq!(r, FT_RENDER_MODE_LCD);
+        }
+        p.hinting = 1;
+        assert_ne!(Ft::flags(&p).0 & FT_LOAD_NO_HINTING, 0);
+        p.hinting = 2;
+        assert_ne!(Ft::flags(&p).0 & FT_LOAD_FORCE_AUTOHINT, 0);
+    }
 }
 
 #[cfg(test)]
