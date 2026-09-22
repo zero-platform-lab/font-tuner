@@ -178,6 +178,55 @@ Any profile not in the list falls in afterwards, alphabetically, so adding an
 5. Clean Sharp Dark
 ```
 
+### 2.3 Blend formula
+
+The core (`render-core`) turns FreeType coverage into pixels with the same
+linear-space alpha blend as upstream MacType (`ft.cpp` `CAlphaBlend`). This is
+the specification; `render-core/src/filter.rs` implements it in `f32`. Byte
+values are normalised as `x = v/255`.
+
+**Gamma encode** `g(x)` (byte → linear light), chosen by `GammaMode`:
+
+```
+g(x) = x                                  GammaMode < 0   (linear)
+     = srgb(x)                            GammaMode = 1   (sRGB)
+     = (srgb(x) + x) / 2                  GammaMode = 2   (sRGB / linear average)
+     = x ^ GammaValue                     otherwise       (plain-power gamma)
+
+srgb(x) = x / 12.92                       x <= 10/255
+        = ((x + 0.055) / 1.055) ^ 2.4     otherwise
+```
+
+**Coverage curve** `a(cov)` (FreeType coverage → alpha), an S-curve from
+`RenderWeight` and `Contrast`, with `t = (cov/255) ^ (1/RenderWeight)`:
+
+```
+a(cov) = (2t) ^ Contrast / 2              t < 0.5
+       = 1 - (2(1 - t)) ^ Contrast / 2    t >= 0.5
+```
+
+**Blend** of foreground `fg` over background `bg` at coverage `cov`:
+
+```
+out = g⁻¹( g(bg)·(1 - a(cov)) + g(fg)·a(cov) )
+```
+
+i.e. convert both colours to linear light, interpolate by the coverage alpha,
+convert back. `g⁻¹` is the numeric inverse of `g` (a binary search over the
+per-profile encode table, which inverts every `GammaMode` including the
+average, which has no closed form). Each channel is blended independently, so
+LCD subpixel coverage feeds R/G/B separately.
+
+Upstream computes this in fixed-point integers and truncates the final step; a
+port that computes the formula in `f32` and rounds to the nearest byte differs
+from upstream by at most one 8-bit level (imperceptible, and the rounded value
+is the more accurate). The formula is the correctness criterion — the
+implementation is checked against it, not against upstream's rounding.
+
+The `[DirectWrite]` section provides a separate set of values (gamma, contrast,
+ClearType level, rendering mode) for the text Direct2D draws itself where the
+core cannot rasterise it; see 1.2.
+
 ---
 
 ## 3. System-font switcher

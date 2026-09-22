@@ -13,7 +13,7 @@ native code linked into the shipped DLL is that FreeType static lib.
 
 | crate | kind | role |
 |---|---|---|
-| `render-core` | lib | the rendering engine: gamma/contrast/LCD LUTs + blend (ported from ft.cpp, **bit-exact verified**), direct FreeType FFI (no C shim), `Profile` (incl. `from_ini`), glyph/string compositing |
+| `render-core` | lib | the rendering engine: gamma/contrast/LCD LUTs + blend (ported from ft.cpp, verified to match the formula within 1 level), direct FreeType FFI (no C shim), `Profile` (incl. `from_ini`), glyph/string compositing |
 | `render-inject` | cdylib `RenderCore64.dll` | injected into each process; hooks GDI + DirectWrite/Direct2D text and renders with render-core; exports `GetMsgProc` for auto-injection; self-pins so it is never unmapped from a running process |
 | `loader` | bin | install a WH_GETMESSAGE hook backed by RenderCore64.dll, scoped to one process — the test harness for trying the core in a single app |
 
@@ -54,8 +54,9 @@ by a mutex so two threads cannot both capture the "original" and recurse.
 
 ## What works
 
-- **render-core**: greyscale + LCD, gamma modes, weight/embolden — verified
-  **bit-for-bit** against the C++ original (`render-core/verify/`).
+- **render-core**: greyscale + LCD, gamma modes, weight/embolden — implements
+  the blend formula in docs/SPEC.md 2.3 (in f32, not upstream's fixed-point
+  integers; agrees with upstream within 1 level, this side more accurate).
 - **GDI** text replaced under injection (string + `ETO_GLYPH_INDEX`), with the
   DC's font/colour/baseline, over the existing content.
 - **DirectWrite** (`IDWriteBitmapRenderTarget::DrawGlyphRun`) replaced under
@@ -72,9 +73,9 @@ by a mutex so two threads cannot both capture the "original" and recurse.
   `render-inject`.
 - **Performance**: the font file is extracted + re-faced only when the font
   actually changes (cached), not per draw.
-- **Tests**: `render-core` has `cargo test` units for the blend (a regression
-  guard against the C++ oracle values) and `Profile::from_ini`, plus the
-  bit-exact golden harness in `verify/`.
+- **Tests**: `render-core` has `cargo test` units for the blend (endpoints,
+  monotonicity, every GammaMode, a gamma-1.25 regression) and
+  `Profile::from_ini`; the formula they check is docs/SPEC.md 2.3.
 
 ## Port scope = MacType's full hook coverage
 

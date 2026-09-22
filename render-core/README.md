@@ -25,26 +25,17 @@ Rust.
 | `src/ft.rs` | safe wrapper over the FreeType shim; load-flag / render-mode selection |
 | `src/config.rs` | `Profile` (subset of MacType.ini) + presets |
 | `src/render.rs` | glyph layout + greyscale / LCD compositing onto an RGB canvas |
-| `src/main.rs` | demo CLI + `verify` curve dumps |
-| `shim.c` | FreeType C shim (uses the fork headers, links `freetype64.lib`) |
+| `src/main.rs` | demo CLI (renders the sample string per profile) |
 
-## Verification (bit-exact)
+## Verification
 
-The blend math is proven identical to the C++ original, not just "close":
-
-- **Greyscale**: all 256 coverage values × 6 profiles — bit-for-bit equal.
-- **LCD**: 1296 vectors (AAMode 2/3 × backgrounds × coverage triples) — equal.
-
-`verify/oracle.cpp` is the exact `ft.cpp` math compiled standalone (MSVC);
-`verify/compare.py` diffs it against this crate's dumps.
-
-```powershell
-# from render-core/
-cargo run --release -- verify           # writes rust-*.txt, lcd-rust.txt
-cl /nologo /O2 /EHsc verify\oracle.cpp /Fe:oracle.exe   # in a VS x64 prompt
-.\oracle.exe                            # writes cpp-*.txt, lcd-cpp.txt
-python verify\compare.py                # -> ALL BIT-EXACT
-```
+The blend formula is the specification — see **docs/SPEC.md §2.3** for the
+gamma encode, coverage curve and linear-space blend this crate implements.
+Correctness is "implements that formula," so it is checked by `cargo test`
+(`src/filter.rs`): endpoints, monotonicity, every `GammaMode` branch, and a
+greyscale regression at gamma 1.25. `cargo test` needs no font (the blend
+tests are pure); the FreeType path test skips cleanly if the system font is
+absent.
 
 ## Build
 
