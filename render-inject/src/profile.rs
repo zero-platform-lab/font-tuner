@@ -22,17 +22,21 @@ use crate::{log, RENDER};
 pub(crate) static RELOAD_MSG: AtomicU32 = AtomicU32::new(0);
 pub(crate) const RELOAD_MSG_NAME: PCWSTR = w!("FontTuner.ReloadProfile");
 
-/// This DLL's module handle, stored as an address because `HINSTANCE` is not
-/// `Sync`. Set in DllMain before any other thread of ours starts.
+/// This DLL's module handle, stored as an exposed address because `HINSTANCE`
+/// is not `Sync`. Set in DllMain before any other thread of ours starts.
 pub(crate) static SELF_HINST: OnceLock<usize> = OnceLock::new();
 
 /// Directory this DLL was loaded from (the install dir: font-tuner.ini + ini\).
-unsafe fn self_dir() -> Option<PathBuf> {
-    let hinst = HINSTANCE(*SELF_HINST.get()? as *mut c_void);
+fn self_dir() -> Option<PathBuf> {
+    let hinst = HINSTANCE(core::ptr::with_exposed_provenance_mut::<c_void>(*SELF_HINST.get()?));
     let mut buf = [0u16; 260];
-    let n = GetModuleFileNameW(Some(hinst.into()), &mut buf);
-    if n == 0 { return None; }
-    PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])).parent().map(|p| p.to_path_buf())
+    // SAFETY: `hinst` is our own module handle (set in DllMain, never
+    // unloaded because the DLL pins itself) and `buf` outlives the call.
+    let n = unsafe { GetModuleFileNameW(Some(hinst.into()), &mut buf) } as usize;
+    if n == 0 {
+        return None;
+    }
+    PathBuf::from(String::from_utf16_lossy(&buf[..n])).parent().map(std::path::Path::to_path_buf)
 }
 
 /// The `AlternativeFile=` value from a font-tuner.ini's text, as written by the
@@ -61,7 +65,7 @@ fn parse_alternative_file(text: &str) -> Option<&str> {
 /// The profile the tray selected: `[General] AlternativeFile=ini\<name>.ini`
 /// in the install dir's font-tuner.ini, resolved relative to that dir. Read at
 /// attach, and again when the tray broadcasts "reload profile".
-unsafe fn profile_path() -> Option<String> {
+fn profile_path() -> Option<String> {
     let dir = self_dir()?;
     let text = std::fs::read_to_string(dir.join("font-tuner.ini")).ok()?;
     let rel = parse_alternative_file(&text)?;
@@ -69,7 +73,7 @@ unsafe fn profile_path() -> Option<String> {
 }
 
 /// The active profile (path it came from, or None for the built-in default).
-pub(crate) unsafe fn load_profile() -> (Option<String>, Profile) {
+pub(crate) fn load_profile() -> (Option<String>, Profile) {
     let path = profile_path();
     let p = path.as_deref().and_then(Profile::from_ini).unwrap_or_else(Profile::clean_greyscale);
     (path, p)
@@ -79,7 +83,7 @@ pub(crate) unsafe fn load_profile() -> (Option<String>, Profile) {
 /// so no draw observes a half-updated pair. Called on this process's UI
 /// thread from GetMsgProc when the tray broadcasts RELOAD_MSG. If the ini is
 /// unreadable the built-in default applies, same as at attach.
-pub(crate) unsafe fn reload_profile() {
+pub(crate) fn reload_profile() {
     let (path, p) = load_profile();
     if let Ok(mut guard) = RENDER.lock() {
         if let Some(st) = guard.as_mut() {

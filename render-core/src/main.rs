@@ -10,21 +10,21 @@ const FONT: &str = r"C:\Windows\Fonts\meiryo.ttc";
 const SAMPLE: &str = "水面に映る Rust — glyph 0123 あア亜";
 
 fn main() {
+    const WHITE: [u8; 3] = [255, 255, 255];
+    const DARK: [u8; 3] = [30, 30, 30];
+    const LIGHT_INK: Ink = Ink { fg: [222, 222, 222] };
+    const BLUE_INK: Ink = Ink { fg: [40, 90, 200] };
+
     let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("verify") => { verify::dump(); return; }
-        _ => {}
+    if args.next().as_deref() == Some("verify") {
+        verify::dump();
+        return;
     }
 
     let ft = Ft::open(FONT, 0).expect("open font");
     let size = (760usize, 120usize);
     let pen = (24i32, 78i32);
     let px = 26;
-
-    const WHITE: [u8; 3] = [255, 255, 255];
-    const DARK: [u8; 3] = [30, 30, 30];
-    const LIGHT_INK: Ink = Ink { fg: [222, 222, 222] };
-    const BLUE_INK: Ink = Ink { fg: [40, 90, 200] };
 
     // light profiles, black text on white
     let light = [
@@ -83,6 +83,7 @@ mod verify {
     }
 
     fn dump_lcd() {
+        use std::fmt::Write;
         let t = Tables::build(1.25, 1.0, 1.0, 0);
         let bgs = [[255u8, 255, 255], [128, 128, 128], [200, 100, 50]];
         let covs = [0u8, 1, 64, 128, 200, 255];
@@ -96,7 +97,7 @@ mod verify {
                             let r = t.blend(bg[0], 0, a_b);
                             let g = t.blend(bg[1], 0, a_g);
                             let b = t.blend(bg[2], 0, a_r);
-                            out.push_str(&format!("{r},{g},{b} "));
+                            let _ = write!(out, "{r},{g},{b} ");
                         }
                     }
                 }

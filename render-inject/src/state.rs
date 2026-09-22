@@ -51,3 +51,10 @@ pub(crate) fn orig<F: Copy>(cell: &OnceLock<F>) -> F {
 /// Log the first substituted draw once, so the log shows the pipeline ran
 /// without a line per glyph run. Shared by the GDI and DirectWrite paths.
 pub(crate) static CAPTURED: AtomicBool = AtomicBool::new(false);
+
+/// `f32::round() as i32`, the one float→int cast this crate makes: pixel
+/// positions and em sizes from DirectWrite, clamped to a sane range first.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn round_i32(v: f32) -> i32 {
+    v.round().clamp(-1.0e6, 1.0e6) as i32
+}

@@ -56,6 +56,15 @@ impl DwParams {
     }
 }
 
+/// Which ini section a line belongs to while parsing.
+#[derive(PartialEq)]
+enum Section {
+    General,
+    DirectWrite,
+    Experimental,
+    Other,
+}
+
 /// A rendering profile.
 #[derive(Clone, Copy, Debug)]
 pub struct Profile {
@@ -116,15 +125,16 @@ impl Profile {
     }
 
     /// Parse profile settings from the text of a MacType `.ini`.
+    #[allow(clippy::too_many_lines)]
     pub fn from_ini_str(text: &str) -> Profile {
         let mut p = Profile::clean_greyscale();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        #[derive(PartialEq)]
-        enum Section { General, DirectWrite, Experimental, Other }
         let mut section = Section::General;
         // Explicit [DirectWrite] values; the rest is derived once the general
         // gamma is known (upstream reads the section after [General]).
-        let mut dw: [Option<f32>; 4] = [None; 4];
+        // Explicit [DirectWrite] gamma, contrast, cleartype level.
+        let mut dw: [Option<f32>; 3] = [None; 3];
+        let mut dw_mode: Option<i32> = None;
         let mut clipbox_fix: Option<bool> = None;
         for line in text.lines() {
             let line = line.trim();
@@ -145,8 +155,11 @@ impl Profile {
             let (k, v) = (k.trim(), v.trim());
             match section {
                 Section::DirectWrite => {
-                    let i = match k { "GammaValue" => 0, "Contrast" => 1, "ClearTypeLevel" => 2, "RenderingMode" => 3, _ => continue };
-                    if dw[i].is_none() { dw[i] = v.parse().ok(); }
+                    if k.eq_ignore_ascii_case("RenderingMode") {
+                        dw_mode = dw_mode.or_else(|| v.parse().ok());
+                    } else if let Some(i) = ["GammaValue", "Contrast", "ClearTypeLevel"].iter().position(|n| k == *n) {
+                        if dw[i].is_none() { dw[i] = v.parse().ok(); }
+                    }
                     continue;
                 }
                 Section::Experimental => {
@@ -179,7 +192,7 @@ impl Profile {
             gamma: dw[0].unwrap_or(d.gamma).clamp(0.0, 20.0),
             contrast: dw[1].unwrap_or(d.contrast).clamp(0.0625, 10.0),
             cleartype_level: dw[2].unwrap_or(d.cleartype_level).clamp(0.0, 1.0),
-            rendering_mode: (dw[3].unwrap_or(d.rendering_mode as f32) as i32).clamp(0, 6),
+            rendering_mode: dw_mode.unwrap_or(d.rendering_mode).clamp(0, 6),
         };
         p.clipbox_fix = clipbox_fix.unwrap_or(true);
         p

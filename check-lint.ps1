@@ -1,9 +1,12 @@
-# スクリプトとドキュメントを外部のチェッカにかける。
+# スクリプトとドキュメントとコードを外部のチェッカにかける。
 #
 #   PowerShell  PSScriptAnalyzer (Microsoft)。除外ルールと理由は
 #               PSScriptAnalyzerSettings.psd1 に書いてある
 #   ドキュメント textlint + preset-ja-technical-writing + prh。助詞の重複・
 #               一文の長さ・漢字の連続など、読んでも気づきにくいものを機械で拾う
+#   Rust        cargo clippy。C++ 由来の書き方 (切り捨てる as、生ポインタへの
+#               &x as、SAFETY 無しの unsafe 等) を拾う。lint は各 Cargo.toml の
+#               [lints] にあり、意図的なキャストはファイル単位の allow + 理由付き
 #
 # 初回だけ導入が要る。
 #   Install-Module PSScriptAnalyzer -Scope CurrentUser
@@ -97,6 +100,28 @@ if (-not $ScriptsOnly) {
   }
 }
 
+if (-not $DocsOnly) {
+  Write-Host ''
+  Write-Host '== cargo clippy =='
+  if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Warning '  cargo が無い。Rust (msvc) を入れる'
+    $fail = 1
+  } else {
+    # render-inject/render-core/loader はワークスペース外なので個別にかける。
+    # -D warnings で 1 件でも警告があれば非ゼロ終了。
+    $crates = @('.', 'render-core', 'render-inject', 'loader')
+    $clippyFail = 0
+    foreach ($c in $crates) {
+      $manifest = Join-Path $PSScriptRoot $c 'Cargo.toml'
+      & cargo clippy --quiet --manifest-path $manifest --all-targets -- -D warnings 2>&1 |
+        ForEach-Object { "  $_" }
+      if ($LASTEXITCODE -ne 0) { $clippyFail = 1 }
+    }
+    if ($clippyFail) { Write-Host '  指摘あり'; $fail = 1 }
+    else { Write-Host '  指摘なし' }
+  }
+}
+
 Write-Host ''
 if ($fail) { Write-Host '指摘あり'; exit 1 }
-Write-Host 'どちらも指摘なし'
+Write-Host 'すべて指摘なし'

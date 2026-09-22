@@ -25,22 +25,17 @@ const CORE: &str = "RenderCore64.dll";
 #[unsafe(no_mangle)]
 extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *const c_void) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
+        // Load the core from a worker thread, not inline: LoadLibrary here
+        // would run under the loader lock, and the core's own DllMain
+        // installs hooks and may load further DLLs. Nesting that under the
+        // lock can deadlock the child we are meant to instrument. A thread
+        // created in DllMain does not start until the loader lock is
+        // released, so the core loads safely afterwards.
+        // SAFETY: `hinst` is our own module handle, passed through as the
+        // thread parameter; nothing here loads a library under the loader lock.
         unsafe {
             let _ = DisableThreadLibraryCalls(hinst);
-            // Load the core from a worker thread, not inline: LoadLibrary here
-            // would run under the loader lock, and the core's own DllMain
-            // installs Detours hooks and may load further DLLs. Nesting that
-            // under the lock can deadlock the child we are meant to instrument.
-            // A thread created in DllMain does not start until the loader lock
-            // is released, so the core loads safely afterwards.
-            if let Ok(h) = CreateThread(
-                None,
-                0,
-                Some(load_thread),
-                Some(hinst.0 as *const c_void),
-                THREAD_CREATION_FLAGS(0),
-                None,
-            ) {
+            if let Ok(h) = CreateThread(None, 0, Some(load_thread), Some(hinst.0.cast_const()), THREAD_CREATION_FLAGS(0), None) {
                 let _ = CloseHandle(h);
             }
         }
@@ -55,7 +50,8 @@ extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *const c_void
 /// here would abort — and thus kill — the host child process, breaking the
 /// "never take the child down" invariant. Keep every call non-panicking.
 unsafe extern "system" fn load_thread(param: *mut c_void) -> u32 {
-    load_core(HMODULE(param as _));
+    // `param` is the HMODULE DllMain passed to CreateThread.
+    load_core(HMODULE(param));
     0
 }
 
@@ -64,6 +60,7 @@ fn load_core(hinst: HMODULE) {
     // longer than MAX_PATH still loads the core instead of silently no-op'ing.
     let mut buf = vec![0u16; 260];
     let n = loop {
+        // SAFETY: `hinst` is our module handle and `buf` outlives the call.
         let n = unsafe { GetModuleFileNameW(Some(hinst), &mut buf) } as usize;
         if n == 0 {
             return;
@@ -84,7 +81,7 @@ fn load_core(hinst: HMODULE) {
     let mut path: Vec<u16> = buf[..=slash].to_vec();
     path.extend(CORE.encode_utf16());
     path.push(0);
-    unsafe {
-        let _ = LoadLibraryW(PCWSTR(path.as_ptr()));
-    }
+    // SAFETY: `path` is NUL-terminated and outlives the call; this runs
+    // after DllMain returned, so not under the loader lock.
+    let _ = unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) };
 }

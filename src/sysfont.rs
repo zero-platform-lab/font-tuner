@@ -45,72 +45,61 @@ fn face_of(lf: &LOGFONTW) -> String {
     String::from_utf16_lossy(&f[..n])
 }
 
-fn as_bytes<T>(v: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+/// `sizeof(T)` as the `cbSize` / `uiParam` value the Win32 struct APIs want.
+fn struct_size<T>() -> u32 {
+    u32::try_from(std::mem::size_of::<T>()).expect("Win32 structs are far smaller than 4 GiB")
 }
 
+/// The raw bytes of a plain-data Win32 struct, for the backup file.
+fn as_bytes<T>(v: &T) -> &[u8] {
+    // SAFETY: `T` is a `#[repr(C)]` Win32 struct of plain data, so reading
+    // its bytes for its whole size is valid for the borrow's lifetime.
+    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), std::mem::size_of::<T>()) }
+}
+
+/// A plain-data Win32 struct read back from its bytes.
 fn from_bytes<T: Copy>(b: &[u8]) -> Option<T> {
-    if b.len() < std::mem::size_of::<T>() {
-        return None;
-    }
+    let bytes = b.get(..std::mem::size_of::<T>())?;
     let mut v = std::mem::MaybeUninit::<T>::uninit();
+    // SAFETY: `bytes` is exactly `size_of::<T>()` long and `T` is plain data
+    // (every bit pattern is a valid value), so the copy fully initialises `v`.
     unsafe {
-        std::ptr::copy_nonoverlapping(b.as_ptr(), v.as_mut_ptr() as *mut u8, std::mem::size_of::<T>());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), v.as_mut_ptr().cast::<u8>(), bytes.len());
         Some(v.assume_init())
     }
 }
 
 fn get_ncm() -> Option<NONCLIENTMETRICSW> {
-    let mut ncm = NONCLIENTMETRICSW {
-        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
-        ..Default::default()
-    };
+    let mut ncm = NONCLIENTMETRICSW { cbSize: struct_size::<NONCLIENTMETRICSW>(), ..Default::default() };
+    // SAFETY: `ncm` carries its own size and outlives the call.
     unsafe {
-        SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
-            ncm.cbSize,
-            Some(&mut ncm as *mut _ as *mut _),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-        .ok()?;
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, Some((&raw mut ncm).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).ok()?;
     }
     Some(ncm)
 }
 
 fn get_icon() -> Option<LOGFONTW> {
     let mut lf = LOGFONTW::default();
+    // SAFETY: the size passed is exactly `lf`'s, and `lf` outlives the call.
     unsafe {
-        SystemParametersInfoW(
-            SPI_GETICONTITLELOGFONT,
-            std::mem::size_of::<LOGFONTW>() as u32,
-            Some(&mut lf as *mut _ as *mut _),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-        .ok()?;
+        SystemParametersInfoW(SPI_GETICONTITLELOGFONT, struct_size::<LOGFONTW>(), Some((&raw mut lf).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).ok()?;
     }
     Some(lf)
 }
 
 fn push_ncm(ncm: &NONCLIENTMETRICSW) {
-    unsafe {
-        let _ = SystemParametersInfoW(
-            SPI_SETNONCLIENTMETRICS,
-            ncm.cbSize,
-            Some(ncm as *const _ as *mut _),
-            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-        );
-    }
+    // SAFETY: `ncm` carries its own size; SPI_SET only reads through the
+    // pointer, so handing a shared borrow as `*mut` is sound.
+    let _ = unsafe {
+        SystemParametersInfoW(SPI_SETNONCLIENTMETRICS, ncm.cbSize, Some(std::ptr::from_ref(ncm).cast_mut().cast()), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE)
+    };
 }
 
 fn push_icon(lf: &LOGFONTW) {
-    unsafe {
-        let _ = SystemParametersInfoW(
-            SPI_SETICONTITLELOGFONT,
-            std::mem::size_of::<LOGFONTW>() as u32,
-            Some(lf as *const _ as *mut _),
-            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-        );
-    }
+    // SAFETY: as in `push_ncm`, with `lf`'s exact size.
+    let _ = unsafe {
+        SystemParametersInfoW(SPI_SETICONTITLELOGFONT, struct_size::<LOGFONTW>(), Some(std::ptr::from_ref(lf).cast_mut().cast()), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE)
+    };
 }
 
 /// The face name the shell caption currently uses (for the menu check mark).
@@ -154,7 +143,7 @@ pub fn restore() {
     };
     // Do not trust cbSize from the (user-writable) backup file: force it to the
     // real struct size so SystemParametersInfo never reads past our buffer.
-    ncm.cbSize = split as u32;
+    ncm.cbSize = struct_size::<NONCLIENTMETRICSW>();
     push_ncm(&ncm);
     push_icon(&icon);
     let _ = std::fs::remove_file(&p);

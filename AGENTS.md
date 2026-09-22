@@ -2,7 +2,7 @@
 
 font-tuner のドキュメント（`README.md`・`NOTICE.md`・`docs/*.md`・各 `DESIGN.md`）を書く／直すときのチェック観点。目的は「初見の読者が、何が出荷され、どう動き、なぜそうなっているかを上から順に追えること」。文章・図はコミット前にこの観点で自己点検する。文体は「〜する／〜しない」の規則形に統一し、1行1チェックにする。
 
-機械で拾えるものは [`check-lint.ps1`](check-lint.ps1) にかける（PowerShell は PSScriptAnalyzer、日本語ドキュメントは textlint + prh）。初回だけ `Install-Module PSScriptAnalyzer -Scope CurrentUser` と `npm install` が要る。textlint の対象は、かなの比率で日本語と判定した `.md` だけで、英語で書いた `docs/SPEC.md` 等は対象外。AI っぽい言い回しは [`prh.yml`](prh.yml) の辞書で拾う（指摘が出たら1件足す）。
+機械で拾えるものは [`check-lint.ps1`](check-lint.ps1) にかける（PowerShell は PSScriptAnalyzer、日本語ドキュメントは textlint + prh、Rust は `cargo clippy`）。clippy は C++ 由来の書き方（切り捨てる `as`、生ポインタへの `&x as`、SAFETY 無しの `unsafe`）を拾う。lint は各 `Cargo.toml` の `[lints]` にあり、意図的なキャスト（検証済みの固定小数点・FFI 境界・境界チェック済みの座標）はファイル単位の `#![allow]` に理由を添えて残す。初回だけ `Install-Module PSScriptAnalyzer -Scope CurrentUser` と `npm install` が要る。textlint の対象は、かなの比率で日本語と判定した `.md` だけで、英語で書いた `docs/SPEC.md` 等は対象外。AI っぽい言い回しは [`prh.yml`](prh.yml) の辞書で拾う（指摘が出たら1件足す）。
 
 ## 1. 文書の構造
 - 上から順に読んで理解できる構成にする（前提を後回しにしない）
