@@ -24,8 +24,10 @@ use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
 
 use render_core::render::Canvas;
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDeviceCaps, RestoreDC, SaveDC,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDeviceCaps, GetGraphicsMode, GetMapMode,
+    GetViewportOrgEx, GetWindowOrgEx, GetWorldTransform, RestoreDC, SaveDC,
     SelectObject, SetGraphicsMode, SetMapMode, SetWorldTransform, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
     DT_RASDISPLAY, GM_COMPATIBLE, HBITMAP, HDC, HGDIOBJ, MM_TEXT, SRCCOPY, TECHNOLOGY, XFORM,
 };
@@ -191,6 +193,13 @@ struct DeviceUnits {
 
 impl DeviceUnits {
     fn of(hdc: HDC) -> DeviceUnits {
+        // Most DCs already work in device pixels; then nothing is changed.
+        // SaveDC / SetMapMode / RestoreDC make GDI drop the DC's realized
+        // font, and the next measurement on it realizes it again: a draw's
+        // `GetTextExtentPoint32W` took ~210 us instead of ~22 us (measured).
+        if in_device_units(hdc) {
+            return DeviceUnits { hdc, saved: 0 };
+        }
         // SAFETY: `hdc` is the app's DC, live for the enclosing draw. Every
         // change here is undone in `drop` by the matching RestoreDC.
         let saved = unsafe { SaveDC(hdc) };
@@ -205,6 +214,24 @@ impl DeviceUnits {
             }
         }
         DeviceUnits { hdc, saved }
+    }
+}
+
+/// Does `hdc` map logical coordinates to device pixels one to one? `MM_TEXT`
+/// with both origins at zero, and either the compatible graphics mode (which
+/// ignores the world transform) or an identity world transform.
+fn in_device_units(hdc: HDC) -> bool {
+    let (mut vp, mut win, mut xf) = (POINT::default(), POINT::default(), XFORM::default());
+    // SAFETY: getters on the app's DC with out-params we own.
+    unsafe {
+        GetMapMode(hdc) == MM_TEXT
+            && GetViewportOrgEx(hdc, &raw mut vp).as_bool()
+            && GetWindowOrgEx(hdc, &raw mut win).as_bool()
+            && vp == POINT::default()
+            && win == POINT::default()
+            && (GetGraphicsMode(hdc) == GM_COMPATIBLE.0
+                || (GetWorldTransform(hdc, &raw mut xf).as_bool()
+                    && xf == XFORM { eM11: 1.0, eM12: 0.0, eM21: 0.0, eM22: 1.0, eDx: 0.0, eDy: 0.0 }))
     }
 }
 
