@@ -65,6 +65,10 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 `DllMain` では常駐固定・ミューテックス取得・スレッド起動だけを行い、フックの設置と FreeType の初期化は別スレッド（`on_attach`）で行う。ローダーロックの下で detour を張らない。
 
+**テキスト配置** — `SetTextAlign` はランの原点を (x, y) からどう測るかを決める。水平は LEFT / RIGHT / CENTER、垂直は TOP / BOTTOM / BASELINE で、CENTER と BASELINE はどちらも 2 ビット立つのでマスクして等値比較する（`&` で判定すると CENTER が RIGHT にも一致する）。GDI は自前の描画にこれを適用するので、移植でも適用しないと右揃え・中央揃えの文字が文字列の幅ぶんずれる。実測（素の GDI と比較、`ALIGN-TEST` を x=160 に 14px で描画）: `TA_RIGHT` はインクが 86〜159、`TA_CENTER` は 123〜196、`TA_LEFT` は 160〜233。0.1.6 までは水平を無視して常に 160 から描いていた。幅は `dx` 配列があればその合計、無ければ実測（`text_width`）。upstream も同じ（`override.cpp` の `switch (horiz)` / `switch (vert)`）。
+
+**未対応の DC 属性** — `SetTextCharacterExtra`（字間）、`TA_UPDATECP`（DC の現在位置を原点にし、描画後に進める）、MM_TEXT 以外のマップモード、恒等でないワールド変換は、いずれも読んでいない。upstream は字間をキャンバス DC に伝え、`TA_UPDATECP` を処理し、ズーム DC を変換して描く。ここでこれらが効いた DC に当たると位置や幅がずれる。
+
 **背景モード** — GDI は `SetBkMode(OPAQUE)`（既定）のとき、文字を描きながらその文字ボックスを背景色で塗る。同じ場所に値を描き直して更新するアプリ（Process Explorer の数値列）はこれに頼っている。render-core は既存のピクセルの上に合成するだけなので、コア側で塗りを再現する必要がある。`ETO_OPAQUE`（`lprect` を塗る）に加えて `GetBkMode(hdc) == OPAQUE` なら文字ボックス（`d.x` から幅ぶん、ベースライン - `tmAscent` から `tmHeight`）を背景色で塗ってから描く。幅は `dx` 配列があればその合計、無ければ `GetTextExtentPoint*` の実測。upstream も同じ判定（`override.cpp`: `fillrect || GetBkMode(hdc) == OPAQUE`）。これを見ていなかった 0.1.3 までは、Process Explorer の CPU 列などで古い数字が残って二重に見えた。
 
 ---

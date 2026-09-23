@@ -47,7 +47,18 @@ thread_local! {
 const ETO_OPAQUE: u32 = 0x0002;
 const ETO_CLIPPED: u32 = 0x0004;
 const ETO_GLYPH_INDEX: u32 = 0x0010;
+/// `SetTextAlign` flags (wingdi.h). The horizontal ones are a 2-bit field
+/// (LEFT 0 / RIGHT 2 / CENTER 6) and the vertical ones another
+/// (TOP 0 / BOTTOM 8 / BASELINE 24); CENTER and BASELINE each set two bits,
+/// so they must be masked, not tested with `&`.
+const TA_LEFT: u32 = 0;
+const TA_RIGHT: u32 = 2;
+const TA_CENTER: u32 = 6;
+const TA_TOP: u32 = 0;
+const TA_BOTTOM: u32 = 8;
 const TA_BASELINE: u32 = 24;
+const TA_HORZ_MASK: u32 = TA_LEFT | TA_RIGHT | TA_CENTER;
+const TA_VERT_MASK: u32 = TA_TOP | TA_BOTTOM | TA_BASELINE;
 /// The `'ttcf'` table tag: present only for TrueType collections.
 const TTCF: u32 = 0x6663_7474;
 
@@ -211,11 +222,26 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     // SAFETY: attribute reads on the app's DC.
     let (color, align, bk, bk_mode) =
         unsafe { (GetTextColor(d.hdc).0, GetTextAlign(d.hdc).0, GetBkColor(d.hdc).0, GetBkMode(d.hdc)) };
-    let baseline = if align & TA_BASELINE == TA_BASELINE { d.y } else { d.y + tm.tmAscent };
+    // `SetTextAlign` places the run relative to (d.x, d.y); GDI applies it
+    // for its own draws, so the port has to apply it too or right- and
+    // centre-aligned text lands a whole string width away (measured: a
+    // TA_RIGHT run drew at x..x+w instead of x-w..x). Same as upstream
+    // (override.cpp `switch (horiz)` / `switch (vert)`).
+    let width = text_width(d, sz);
+    let left = match align & TA_HORZ_MASK {
+        TA_RIGHT => d.x - width,
+        TA_CENTER => d.x - width / 2,
+        _ => d.x,
+    };
+    let baseline = match align & TA_VERT_MASK {
+        TA_BASELINE => d.y,
+        TA_BOTTOM => d.y - tm.tmDescent,
+        _ => d.y + tm.tmAscent,
+    };
 
     // Text-extent region, unioned with the rect so opaque fill / clip fit.
-    let (mut rx, mut ry) = (d.x, baseline - tm.tmAscent);
-    let (mut right, mut bottom) = (d.x + sz.cx + 6, ry + tm.tmHeight + 4);
+    let (mut rx, mut ry) = (left, baseline - tm.tmAscent);
+    let (mut right, mut bottom) = (left + width + 6, ry + tm.tmHeight + 4);
     if let Some((l, t, r, b)) = d.rect_tuple() {
         rx = rx.min(l);
         ry = ry.min(t);
@@ -242,12 +268,11 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     // render-core composites over what is there, so do the fill ourselves.
     // Upstream does the same (override.cpp: `fillrect || GetBkMode == OPAQUE`).
     if bk_mode == OPAQUE.0.cast_signed() {
-        let left = d.x - rx;
-        let top = baseline - ry - tm.tmAscent;
-        canvas.fill_rect((left, top, left + text_width(d, sz), top + tm.tmHeight), rgb(bk));
+        let (bx, by) = (left - rx, baseline - ry - tm.tmAscent);
+        canvas.fill_rect((bx, by, bx + width, by + tm.tmHeight), rgb(bk));
     }
     let ink = Ink { fg: rgb(color) };
-    let pen = (d.x - rx, baseline - ry);
+    let pen = (left - rx, baseline - ry);
     // The render lock serialises every draw; it is held for this one
     // statement, while render-core touches the shared face.
     let px = em_px(&tm);
@@ -289,6 +314,38 @@ pub(crate) fn setup_gdi_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SetTextAlign` moves the run's origin. Measured against plain GDI: a
+    /// TA_RIGHT run ends at x, a TA_CENTER run is centred on x.
+    #[test]
+    fn text_align_places_the_run_like_gdi() {
+        let place = |align: u32, x: i32, width: i32| match align & TA_HORZ_MASK {
+            TA_RIGHT => x - width,
+            TA_CENTER => x - width / 2,
+            _ => x,
+        };
+        assert_eq!(place(TA_LEFT, 160, 74), 160);
+        assert_eq!(place(TA_RIGHT, 160, 74), 86);
+        assert_eq!(place(TA_CENTER, 160, 74), 123);
+        // TA_CENTER sets both bits of the field, so a plain `&` test would
+        // also match TA_RIGHT; the mask must be compared for equality.
+        assert_ne!(place(TA_CENTER, 160, 74), place(TA_RIGHT, 160, 74));
+    }
+
+    /// Vertical alignment: TOP puts the ascent below y, BASELINE uses y as
+    /// the baseline, BOTTOM lifts the run by the descent.
+    #[test]
+    fn vertical_align_matches_gdi() {
+        let tm = TEXTMETRICW { tmAscent: 14, tmDescent: 4, ..Default::default() };
+        let baseline = |align: u32, y: i32| match align & TA_VERT_MASK {
+            TA_BASELINE => y,
+            TA_BOTTOM => y - tm.tmDescent,
+            _ => y + tm.tmAscent,
+        };
+        assert_eq!(baseline(TA_TOP, 100), 114);
+        assert_eq!(baseline(TA_BASELINE, 100), 100);
+        assert_eq!(baseline(TA_BOTTOM, 100), 96);
+    }
 
     /// A positive lfHeight font (cell height 16 = em 13 + leading 3) must
     /// render at the em size, like upstream, not at the cell height.
