@@ -1,6 +1,6 @@
 # Font-tuner
 
-Windows のフォント描画チューナ。上流の非公開 (Delphi 製) トレイ / ウィザード / ブートストラップを使わず、
+Windows のフォント描画チューナ。upstream の非公開 (Delphi 製) トレイ / ウィザード / ブートストラップを使わず、
 公開ソースの描画 DLL (`RenderCore64.dll`) を自前でビルドして同梱する。
 
 - 64bit プロセスのみ (32bit は対象外)
@@ -50,7 +50,7 @@ cd font-tuner
 .\build-msi.ps1     # build-core.ps1 (FreeType の静的ライブラリ) → cargo → wix
 ```
 
-`build-core.ps1` は上流のプロジェクトファイルを書き換えず、`build/mactype.props` で include / lib パスを注入する。
+`build-core.ps1` は upstream のプロジェクトファイルを書き換えず、`build/mactype.props` で include / lib パスを注入する。
 
 ## 仕組み
 

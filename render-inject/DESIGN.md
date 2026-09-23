@@ -21,7 +21,7 @@ render-inject (cdylib DLL)  RenderCore64.dll — 各プロセスに注入され�
 ```
 
 他プロセスへの注入は既存の loader 設計を再利用する（トレイが `WH_GETMESSAGE`
-フックを張り、そのプロシージャがこの DLL にある）。上流が `CreateProcess` を
+フックを張り、そのプロシージャがこの DLL にある）。upstream が `CreateProcess` を
 横取りして子プロセスに送り込むブートストラップ DLL は移植しない（docs/SPEC.md
 1.1）。このクレートは描画コア本体であり、注入機構ではない。
 

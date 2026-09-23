@@ -1,8 +1,8 @@
 # Font-tuner 仕様
 
-Windows 向けの小さな自己完結型フォント描画チューナ（トレイ + 注入する描画コア）。上流は https://github.com/snowie2000/mactype（移植元コミット `05052e8`）。上流の非公開トレイが「トレイモード」でやることを再現し、描画コアを Rust で書き直して同梱し、描画プロファイル一式を束ね、トレイメニューのシステムフォント切替とカスタムプロファイルを足す。Windows 11、64bit 専用。
+Windows 向けの小さな自己完結型フォント描画チューナ（トレイ + 注入する描画コア）。upstream は https://github.com/snowie2000/mactype（移植元コミット `05052e8`）。upstream の非公開トレイが「トレイモード」でやることを再現し、描画コアを Rust で書き直して同梱し、描画プロファイル一式を束ね、トレイメニューのシステムフォント切替とカスタムプロファイルを足す。Windows 11、64bit 専用。
 
-この文書は実装の現状を書く。上流と違うところ、実機で確かめたこと、未確認のことは書き分ける。
+この文書は実装の現状を書く。upstream と違うところ、実機で確かめたこと、未確認のことは書き分ける。
 
 構成:
 
@@ -28,7 +28,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 * **font-tuner.exe** — `RenderCore64.dll` が export する `GetMsgProc` を使うグローバルな `WH_GETMESSAGE` フックを 1 つ張る。64bit GUI プロセスがメッセージを取り出すと、Windows がコア DLL をそこにマップしてフックが発火し、コアの `DllMain` が走ってフォント描画 API をパッチする。
 * **RenderCore64.dll** — アタッチ時にプロセスの寿命の間だけ自己をアンロード不可にする（`GetModuleHandleEx` + `GET_MODULE_HANDLE_EX_FLAG_PIN`）。フックを外しても（トレイ OFF / 終了 / 更新 / アンインストール）*新規*プロセスへの注入が止まるだけで、動作中プロセスからは決してアンマップされない。だから「アンマップ後にコードが走る」クラッシュ経路がない。プロファイル切替・ON/OFF・更新はすべて以降に起動するプロセスで効く。
 * **フックプロシージャの RVA 固定** — `SetWindowsHookEx` は `GetMsgProc - hmod` しか記録しない。対象プロセスでは Windows が DLL をパスで解決し、そのプロセスが既に持つ（常駐固定された）イメージを見つけて `その base + RVA` を呼ぶ。更新後も動作中プロセスは*前*のビルドを保持するので、RVA がビルド間で同一でなければ、次のメッセージでそれらが一斉にランダムなバイトを実行して落ちる（一度実際に起きた: リファクタで `GetMsgProc` が `0x1100` から `0x8300` に動いた）。コアの `build.rs` はリンカの `/ORDER` で `GetMsgProc` を RVA `0x1000`（`.text` の先頭）に固定する。`build-msi.ps1` は動いたコアをパッケージせず、トレイは張らない（1.2）。バージョン資源は `.rsrc` に入るので RVA に影響しない（確認済み）。
-* **子プロセスへの注入は移植しない** — 上流のコアは `CreateProcess` を横取りし、非公開のブートストラップ DLL（`expfunc.cpp` `GdippInjectDLL`）を子に送り込んで、メッセージポンプが回る前にコアをロードする。移植にはこの経路がない。メッセージポンプを持つ子プロセスなら `WH_GETMESSAGE` で届く（最初のメッセージを取り出す前の描画には効かない）。0.1.1 までは Rust 版のブートストラップ DLL を同梱していた。ロードする側が無いので 0.1.2 で外した。理由: 得られるのは起動直後の数フレームと、署名の壁（1.3）で届かない Chrome 系の子だけ。その代償として `CreateProcess` の detour が全プロセスで走る。
+* **子プロセスへの注入は移植しない** — upstream のコアは `CreateProcess` を横取りし、非公開のブートストラップ DLL（`expfunc.cpp` `GdippInjectDLL`）を子に送り込んで、メッセージポンプが回る前にコアをロードする。移植にはこの経路がない。メッセージポンプを持つ子プロセスなら `WH_GETMESSAGE` で届く（最初のメッセージを取り出す前の描画には効かない）。0.1.1 までは Rust 版のブートストラップ DLL を同梱していた。ロードする側が無いので 0.1.2 で外した。理由: 得られるのは起動直後の数フレームと、署名の壁（1.3）で届かない Chrome 系の子だけ。その代償として `CreateProcess` の detour が全プロセスで走る。
 
 ### 1.2 フックと並行性
 
@@ -36,7 +36,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 * **スレッド安全なパッチ** — retour は対象の先頭バイトを書き換える間、他スレッドを止めない。そこで `install_hook` はパッチの前後でプロセス内の他スレッドを全部凍結し（`CreateToolhelp32Snapshot` + `SuspendThread`）、後で再開する。MinHook が内部で閉じている窓と同じ。
 * **アタッチは一度だけ** — WH_GETMESSAGE のマップと別のロードで、DLL が 1 プロセス内に 2 つのモジュールインスタンスになりうる。プロセスごとの名前付きミューテックス（`Local\FontTuner.Attached.<pid>`）で最初のアタッチだけがフックするようにし、2 度目のアタッチが自分のジャンプの上に detour を張ってトランポリンを壊すのを防ぐ。
 * **一度きりの vtable パッチ**（CreateAlphaTexture、Direct2D の全生成スロットとテキストスロット）はミューテックスで直列化し、その下で再確認する。さもないと競合する 2 スレッドが両方ともパッチ済みスロットから「元の関数」を捕まえ、detour が自分自身を呼ぶ → 無限再帰。Direct2D のスロットは (vtable, slot) を鍵にした 1 つのマップで管理する。レンダーターゲットのクラスごとに vtable が違うため。
-* **Direct2D への到達** — `render-inject/src/d2d.rs` が上流の生成チェーンを辿る。入口は `D2D1CreateFactory`・`D2D1CreateDevice`・`D2D1CreateDeviceContext` の 3 つ。`D2D1CreateFactory` からは `CreateHwnd/DC/WicBitmapRenderTarget` と `ID2D1Factory1..7::CreateDevice` に至る。`D2D1CreateDevice` からは `ID2D1Device..6::CreateDeviceContext` に至る。各ターゲットで `CreateCompatibleRenderTarget`（12）・`DrawGlyphRun`（29）・記述付きの overload（82）・`SetTextAntialiasMode`（34）・`SetTextRenderingParams`（36）をパッチする。12 はオフスクリーンのビットマップターゲットを生成時にフックするため。フォント処理の前に `GetDC` を試すので、DC を貸せないターゲットは試行以上のコストがかからない。GDI DC を貸せるターゲットはランを render-core で描く。貸せないターゲット（DXGI サーフェス: スワップチェーン、コンポジション）は OS に描かせる。その際、プロファイルの `[DirectWrite]` `IDWriteRenderingParams` と、`AntiAliasMode` から導いたアンチエイリアスモードを渡す。`HintingMode=1` のときは上流と同じ 1/65535 の変換ずらしも加える。スロット番号は `windows` クレートの vtable 定義で照合した。
+* **Direct2D への到達** — `render-inject/src/d2d.rs` が upstream の生成チェーンを辿る。入口は `D2D1CreateFactory`・`D2D1CreateDevice`・`D2D1CreateDeviceContext` の 3 つ。`D2D1CreateFactory` からは `CreateHwnd/DC/WicBitmapRenderTarget` と `ID2D1Factory1..7::CreateDevice` に至る。`D2D1CreateDevice` からは `ID2D1Device..6::CreateDeviceContext` に至る。各ターゲットで `CreateCompatibleRenderTarget`（12）・`DrawGlyphRun`（29）・記述付きの overload（82）・`SetTextAntialiasMode`（34）・`SetTextRenderingParams`（36）をパッチする。12 はオフスクリーンのビットマップターゲットを生成時にフックするため。フォント処理の前に `GetDC` を試すので、DC を貸せないターゲットは試行以上のコストがかからない。GDI DC を貸せるターゲットはランを render-core で描く。貸せないターゲット（DXGI サーフェス: スワップチェーン、コンポジション）は OS に描かせる。その際、プロファイルの `[DirectWrite]` `IDWriteRenderingParams` と、`AntiAliasMode` から導いたアンチエイリアスモードを渡す。`HintingMode=1` のときは upstream と同じ 1/65535 の変換ずらしも加える。スロット番号は `windows` クレートの vtable 定義で照合した。
 * **再入**はスレッドごとに（`thread_local`）ガードする。あるスレッドの描画が、別スレッドの描画を未調整の GDI 経路に落とすことはない。
 * **トレイのフック設置ガード**（`Hook::install`、`src/stale.rs`）— `LoadLibraryW` の前に確認する。コアをロードするとトレイ自身に常駐固定とフックがかかるためだ。トレイは 2 点を見る。(a) ディスク上のファイルからコアの `GetMsgProc` が RVA `0x1000` にあること。(b) 同じパスのコアを `GetMsgProc` が別の場所にある状態で保持する動作中プロセスが無いこと。(b) の判定は Toolhelp のモジュール走査とそのイメージの export テーブルの `ReadProcessMemory` で行う。モジュールはあるがイメージを読めないプロセスは stale 扱いにする（その間に終了していれば除く）。別ディレクトリから読み込んだコピー（`loader` ハーネス）は問題ない。Windows はフック DLL をパスで解決し、インストール済みのものを別イメージとしてマップし、アタッチ一度きりミューテックスが 2 つ目を不活性にするからだ。どちらの確認が失敗してもエラーを出してフックを張らない。(b) ではメッセージが該当プログラムを列挙し、サインアウトして入り直す（または再起動する）よう促す。コアが常駐固定なので、それが stale なイメージを消す唯一の方法だからだ。トレイが開けないプロセス（別ユーザーやより高い整合性レベル）はトレイのフックも届かないので、飛ばしても安全。
 
@@ -65,17 +65,17 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 `DllMain` では常駐固定・ミューテックス取得・スレッド起動だけを行い、フックの設置と FreeType の初期化は別スレッド（`on_attach`）で行う。ローダーロックの下で detour を張らない。
 
-**背景モード** — GDI は `SetBkMode(OPAQUE)`（既定）のとき、文字を描きながらその文字ボックスを背景色で塗る。同じ場所に値を描き直して更新するアプリ（Process Explorer の数値列）はこれに頼っている。render-core は既存のピクセルの上に合成するだけなので、コア側で塗りを再現する必要がある。`ETO_OPAQUE`（`lprect` を塗る）に加えて `GetBkMode(hdc) == OPAQUE` なら文字ボックス（`d.x` から幅ぶん、ベースライン - `tmAscent` から `tmHeight`）を背景色で塗ってから描く。幅は `dx` 配列があればその合計、無ければ `GetTextExtentPoint*` の実測。上流も同じ判定（`override.cpp`: `fillrect || GetBkMode(hdc) == OPAQUE`）。これを見ていなかった 0.1.3 までは、Process Explorer の CPU 列などで古い数字が残って二重に見えた。
+**背景モード** — GDI は `SetBkMode(OPAQUE)`（既定）のとき、文字を描きながらその文字ボックスを背景色で塗る。同じ場所に値を描き直して更新するアプリ（Process Explorer の数値列）はこれに頼っている。render-core は既存のピクセルの上に合成するだけなので、コア側で塗りを再現する必要がある。`ETO_OPAQUE`（`lprect` を塗る）に加えて `GetBkMode(hdc) == OPAQUE` なら文字ボックス（`d.x` から幅ぶん、ベースライン - `tmAscent` から `tmHeight`）を背景色で塗ってから描く。幅は `dx` 配列があればその合計、無ければ `GetTextExtentPoint*` の実測。upstream も同じ判定（`override.cpp`: `fillrect || GetBkMode(hdc) == OPAQUE`）。これを見ていなかった 0.1.3 までは、Process Explorer の CPU 列などで古い数字が残って二重に見えた。
 
 ---
 
 ## 2. 描画コア（`render-core`）
 
-コアは「文字 + プロファイル」をピクセルにする。FreeType（snowie2000 のフォーク、`build/lib/freetype64.lib`）がアウトラインをカバレッジにし、コアがヒンティングの指定・ガンマ・コントラスト・ブレンドを受け持つ。上流 `ft.cpp` の `FreeTypePrepare` と `CAlphaBlend` の移植。
+コアは「文字 + プロファイル」をピクセルにする。FreeType（snowie2000 のフォーク、`build/lib/freetype64.lib`）がアウトラインをカバレッジにし、コアがヒンティングの指定・ガンマ・コントラスト・ブレンドを受け持つ。upstream `ft.cpp` の `FreeTypePrepare` と `CAlphaBlend` の移植。
 
 ### 2.1 プロファイルのキー
 
-コアが `.ini` から読むキー（`render-core/src/config.rs`）。ほかのキーは読み飛ばす。プロセス別の節（`[Experimental@idea64.exe]` など）は上流だけが読む。コアにプロセス別設定はない。
+コアが `.ini` から読むキー（`render-core/src/config.rs`）。ほかのキーは読み飛ばす。プロセス別の節（`[Experimental@idea64.exe]` など）は upstream だけが読む。コアにプロセス別設定はない。
 
 | 節 / キー | 値 | 既定（キーが無いとき） |
 |---|---|---|
@@ -94,7 +94,7 @@ ini が読めないときは組み込みの Clean Greyscale（`Profile::clean_gr
 
 ### 2.2 ヒンティングとロードターゲット
 
-FreeType のロードフラグは上流 `FreeTypePrepare` と同じ対応（`render-core/src/ft.rs` の `flags`。テストで固定）。
+FreeType のロードフラグは upstream `FreeTypePrepare` と同じ対応（`render-core/src/ft.rs` の `flags`。テストで固定）。
 
 | 指定 | フラグ | 意味 |
 |---|---|---|
@@ -105,7 +105,7 @@ FreeType のロードフラグは上流 `FreeTypePrepare` と同じ対応（`ren
 | `AntiAliasMode=2/3` | `FT_LOAD_TARGET_LCD` + `FT_RENDER_MODE_LCD` | LCD サブピクセル |
 | `AntiAliasMode=4/5` | `FT_LOAD_TARGET_LIGHT` + `FT_RENDER_MODE_LCD` | 縦方向だけスナップする軽いオートヒントで、描画は LCD |
 
-TrueType インタープリタは FreeType の既定（v40）。上流は `INFINALITY` 定義時に v38 を要求するが、同梱フォーク（FreeType 2.14）は v38 を v40 に丸めるので結果は同じ。
+TrueType インタープリタは FreeType の既定（v40）。upstream は `INFINALITY` 定義時に v38 を要求するが、同梱フォーク（FreeType 2.14）は v38 を v40 に丸めるので結果は同じ。
 
 **観察**（`render-core` を直接呼んで HintingMode 0/1/2 を並べ、8 倍に拡大して比較した。実機の事実）:
 
@@ -119,11 +119,11 @@ TrueType インタープリタは FreeType の既定（v40）。上流は `INFIN
 
 TTC の中のフェイスは GDI の顔名（`LOGFONTW.lfFaceName`）で選ぶ（`Ft::reface_memory`）。FreeType の ASCII の `family_name` に加えて、`name` テーブルの Windows プラットフォーム項目（ID 1 / 16 / 21、UTF-16BE）も比べる。GDI が渡す顔名は日本語（「BIZ UDPゴシック」「游ゴシック」）なので、ASCII 名だけだと一致せずフェイス 0 に落ちる。BIZ UD では 0 が等幅の BIZ UDGothic で、欧文が等幅に並んでいた（実機で確認、修正済み。テストで日本語名 → プロポーショナル、ASCII 名 → 等幅を固定）。どの名前にも一致しなければフェイス 0。
 
-ピクセルサイズ（em）は上流と同じく `GetTextMetricsW` の `tmHeight - tmInternalLeading`（`gdi.rs` の `em_px`）。`LOGFONTW.lfHeight` は負なら em、正ならセル高さ（em + 内部レディング）なので絶対値は使えない。0.1.1 までは絶対値を使っていて、`CreateFont(16, ...)` のような正の高さのフォントが内部レディングの分（Yu Gothic UI で 16 → 本来 12px のところ 16px）大きく描かれていた。フック経由で正負両方の高さを描いて修正を確認した。
+ピクセルサイズ（em）は upstream と同じく `GetTextMetricsW` の `tmHeight - tmInternalLeading`（`gdi.rs` の `em_px`）。`LOGFONTW.lfHeight` は負なら em、正ならセル高さ（em + 内部レディング）なので絶対値は使えない。0.1.1 までは絶対値を使っていて、`CreateFont(16, ...)` のような正の高さのフォントが内部レディングの分（Yu Gothic UI で 16 → 本来 12px のところ 16px）大きく描かれていた。フック経由で正負両方の高さを描いて修正を確認した。
 
 ### 2.4 ブレンド計算式
 
-上流 `CAlphaBlend` と同じ線形空間のアルファブレンドで FreeType のカバレッジをピクセルに変える。これが仕様で、`render-core/src/filter.rs` が `f32` で実装する。バイト値は `x = v/255` で正規化する。
+upstream `CAlphaBlend` と同じ線形空間のアルファブレンドで FreeType のカバレッジをピクセルに変える。これが仕様で、`render-core/src/filter.rs` が `f32` で実装する。バイト値は `x = v/255` で正規化する。
 
 **ガンマ符号化** `g(x)`（バイト → 線形光）。`GammaMode` で選ぶ:
 
@@ -152,11 +152,11 @@ out = g⁻¹( g(bg)·(1 - a(cov)) + g(fg)·a(cov) )
 
 両色を線形光に変換し、カバレッジのアルファで補間し、戻す。`g⁻¹` は `g` の数値的な逆関数（プロファイルごとの符号化テーブルの二分探索、閉じた式のない平均モードを含め、全 `GammaMode` を逆変換する）。各チャンネルは独立にブレンドするので、LCD サブピクセルのカバレッジは R/G/B へ別々に入る。
 
-上流はこれを固定小数点の整数で計算し、最後の段で切り捨てる。計算式を `f32` で計算して最も近いバイトへ丸める移植は、上流と最大 1 階調しか違わない。計算式が正しさの基準で、実装はそれに対して検証する（`cargo test`: 端点、単調性、全 `GammaMode`、gamma 1.25 の回帰値）。
+upstream はこれを固定小数点の整数で計算し、最後の段で切り捨てる。計算式を `f32` で計算して最も近いバイトへ丸める移植は、upstream と最大 1 階調しか違わない。計算式が正しさの基準で、実装はそれに対して検証する（`cargo test`: 端点、単調性、全 `GammaMode`、gamma 1.25 の回帰値）。
 
 ### 2.5 DirectWrite 節と ClipBoxFix
 
-`[DirectWrite]`（`GammaValue`・`Contrast`・`ClearTypeLevel`・`RenderingMode`）は、自前でラスタライズできないテキストに対して Direct2D へ指定する値（1.2）。既定は上流に従う: gamma は一般の gamma から導出（`g² > 1.3 ? g²/2 : 0.7`）、contrast 1.0、ClearType level 1.0、mode 5。`GammaValue` が 0（グレースケール系プロファイルの出荷値）のときは「上書きしない」の意味で、導出 gamma にフォールバックする（DirectWrite は gamma > 0 を要求するため）。出荷プロファイルは全て `RenderingMode=2`（GDI_CLASSIC）で、GDI と DirectWrite のテキストを一致させる。
+`[DirectWrite]`（`GammaValue`・`Contrast`・`ClearTypeLevel`・`RenderingMode`）は、自前でラスタライズできないテキストに対して Direct2D へ指定する値（1.2）。既定は upstream に従う: gamma は一般の gamma から導出（`g² > 1.3 ? g²/2 : 0.7`）、contrast 1.0、ClearType level 1.0、mode 5。`GammaValue` が 0（グレースケール系プロファイルの出荷値）のときは「上書きしない」の意味で、導出 gamma にフォールバックする（DirectWrite は gamma > 0 を要求するため）。出荷プロファイルは全て `RenderingMode=2`（GDI_CLASSIC）で、GDI と DirectWrite のテキストを一致させる。
 
 `[Experimental] ClipBoxFix`（既定 1）は、メトリクスのみの問い合わせで `GetGlyphOutline` が返すメトリクスを補正する。原点を `floor(1.5·DPI/96)` px 上げ、黒箱を同じだけ広げ、どちらもフォントの ascent/height で頭打ちにする。これで、そのメトリクスにグリフをクリップするアプリ（Java2D）が、太めに描かれたグリフを切り落とさない。
 
@@ -174,7 +174,7 @@ FreeType は C のヘッダを bindgen せず、使う分だけ手で宣言す�
 * **所有**: `Ft` が `FT_Library` と現在の `FT_Face` を持ち、`Drop` で `FT_Done_Face` → `FT_Done_FreeType` の順に閉じる。面を差し替える `reface_*` は先に古い面を閉じる。メモリ面のバイト列は `Ft` の `UnsafeCell<Vec<u8>>` に置き、FreeType が参照している間は差し替えない（面を閉じてから入れ替える）。
 * **借用**: `render` が返す `Glyph<'_>` はグリフスロットのビットマップを借りる。次の `FT_Load_Glyph` で上書きされるので、`&self` の寿命に縛って「描いてから次の文字」を型で強制する。
 * **`unsafe` の範囲**: FreeType を呼ぶ行と、返ってきた `*mut` を読む行だけ。`name` テーブルの UTF-16BE 復号や名前比較、カバレッジの合成は安全な Rust。
-* **上流との違い**: 上流は `FTC_Manager`（FreeType のキャッシュ）を使う。移植は面 1 つを持ち、フォントが変わるたびに `GetFontData` で読み直す（`font_key` が同じなら読み直さない）。
+* **upstream との違い**: upstream は `FTC_Manager`（FreeType のキャッシュ）を使う。移植は面 1 つを持ち、フォントが変わるたびに `GetFontData` で読み直す（`font_key` が同じなら読み直さない）。
 
 ---
 
@@ -262,7 +262,7 @@ FreeType は C のヘッダを bindgen せず、使う分だけ手で宣言す�
 * `font-tuner.ini` の読み書きは `GetPrivateProfileStringW` / `WritePrivateProfileStringW`。ANSI 版は使わない。
 * システムフォント（`sysfont.rs`）: `NONCLIENTMETRICSW` の `cbSize` は自分で埋め、バックアップから読んだ値は信頼しない（5）。
 
-`font-tuner.ini` の `[UnloadDll]` 節は「調整を効かせないプログラム」の一覧（上流の書式）。コアはアタッチ時に自分の exe 名をこの一覧と照合し、載っていればフックを張らずに戻る（`profile.rs` の `is_process_excluded`）。常駐固定は `DllMain` で先に済んでいるので DLL 自体はマップされたままだが、以降そのプロセスでコアのコードは走らず、描画は素の GDI になる。一覧の編集は以降に起動するプロセスから効く。出荷の一覧には `font-tuner.exe` が入っているので、トレイ自身のメニューとダイアログの文字は調整されない。
+`font-tuner.ini` の `[UnloadDll]` 節は「調整を効かせないプログラム」の一覧（upstream の書式）。コアはアタッチ時に自分の exe 名をこの一覧と照合し、載っていればフックを張らずに戻る（`profile.rs` の `is_process_excluded`）。常駐固定は `DllMain` で先に済んでいるので DLL 自体はマップされたままだが、以降そのプロセスでコアのコードは走らず、描画は素の GDI になる。一覧の編集は以降に起動するプロセスから効く。upstream はここに自分のトレイを載せるが、出荷の一覧からは `font-tuner.exe` を外してある。トレイのメニューとダイアログの文字をコアが描くと、フェイスやサイズの取り違えがその場で見えるため（TTC のフェイス選択の不具合はそれで見つけた）。自己フックで問題が起きた事例はない。
 
 ---
 

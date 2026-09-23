@@ -1,7 +1,7 @@
 # render-core（実験的）
 
 **MacType のグリフ描画コア**をオフラインで Rust に移植したもの。FreeType の
-上に乗るガンマ/コントラスト/LCD 調整と線形空間ブレンド（上流
+上に乗るガンマ/コントラスト/LCD 調整と線形空間ブレンド（upstream
 [`ft.cpp`](https://github.com/snowie2000/mactype/blob/05052e88c7ce134f93b66db95132284a1ed10de7/ft.cpp)）を移植している。*文字 + 描画プロファイル*を与えると、MacType と同じ計算式で
 ピクセルを生成する。
 
