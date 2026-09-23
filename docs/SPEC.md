@@ -67,6 +67,8 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 **テキスト配置** — `SetTextAlign` はランの原点を (x, y) からどう測るかを決める。水平は LEFT / RIGHT / CENTER、垂直は TOP / BOTTOM / BASELINE で、CENTER と BASELINE はどちらも 2 ビット立つのでマスクして等値比較する（`&` で判定すると CENTER が RIGHT にも一致する）。GDI は自前の描画にこれを適用するので、移植でも適用しないと右揃え・中央揃えの文字が文字列の幅ぶんずれる。実測（素の GDI と比較、`ALIGN-TEST` を x=160 に 14px で描画）: `TA_RIGHT` はインクが 86〜159、`TA_CENTER` は 123〜196、`TA_LEFT` は 160〜233。0.1.6 までは水平を無視して常に 160 から描いていた。幅は `dx` 配列があればその合計、無ければ実測（`text_width`）。upstream も同じ（`override.cpp` の `switch (horiz)` / `switch (vert)`）。
 
+**`ETO_PDY`（縦に進むラン）** — このフラグが立つと `lpDx` は 1 文字あたり `(dx, dy)` の 2 要素になり、配列長は文字数の 2 倍になる。正の `dy` はペンを**上**へ動かす（実測。upstream も `ft.cpp` で `FTInfo.y -= clpdx.gety(0)`）。`Layout { pdy }` が 2 要素ずつ読み、`render-core` は `pen_x` と `base_y` の両方を動かす。キャンバスは縦の移動量ぶん広げ、横幅は `GetTextExtentPoint*` の実測を下回らせない（`dx` が全て 0 の縦書きでもグリフ自身の幅は要るため）。0.1.9 までは配列を文字数ぶんしか読まず、1 つおきの `dy` をアドバンスとして扱っていた。縦に積むはずの文字が横に並んで 2 文字ずつ重なる（実測: 素の GDI は幅 10px・高さ 27px、こちらは幅 35px・高さ 11px）。
+
 **字間** — `SetTextCharacterExtra` は各文字のアドバンスに定数を足す。`render-core` の `Layout { dx, extra }` が `lpDx` と一緒に受け取り、`pen_x += advance + extra` で送る。upstream も自前のレイアウトループで同じことをする（`ft.cpp` の `FTInfo.x += charExtra`。`override.cpp` の `SetTextCharacterExtra(hCanvasDC, ...)` は GDI に落とす経路の辻褄合わせで、字間の再現そのものではない）。幅の扱いは `lpDx` の有無で変わる。`lpDx` が無ければ `GetTextExtentPoint*` の実測に字間が含まれるので、そのまま使う。`lpDx` があれば GDI がそこに字間を上乗せするので `sum(dx) + n * extra` とする（実測: `lpDx`=20×5・字間 10 で 5 文字目が 4×30 の位置から始まる）。
 
 **`TA_UPDATECP`** — 原点は引数の (x, y) ではなく DC の現在位置で、描画後にその位置が進む。`GetCurrentPositionEx` で取り、描画後に `MoveToEx` で進める（左揃えは GDI の実測幅ぶん進め、右揃えは戻し、中央揃えは動かさない。upstream と同じ）。0.1.7 までは引数の位置に描き、現在位置も動かさなかった（実測で x=120 のところを x=1 に描いていた）。

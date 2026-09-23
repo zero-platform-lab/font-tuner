@@ -105,35 +105,76 @@ pub struct Ink {
     pub fg: [u8; 3],
 }
 
-/// How the caller's device overrides the run's layout. `dx` is ExtTextOutW's
-/// `lpDx` (one advance per character, replacing the font's own) and `extra` is
-/// `SetTextCharacterExtra` (added to every advance, on top of `dx`; measured
-/// against GDI: with lpDx 20 and extra 10 the fifth character starts at
-/// 4x30). Upstream adds it the same way (`ft.cpp`: `FTInfo.x += charExtra`).
+/// How the caller's device overrides the run's layout.
+///
+/// `dx` is ExtTextOutW's `lpDx` (one advance per character, replacing the
+/// font's own). With `pdy` it holds `(dx, dy)` pairs instead - `ETO_PDY`,
+/// which is how a vertical run is laid out - and a positive `dy` moves the pen
+/// *up*, as GDI does (measured) and as upstream writes it (`ft.cpp`:
+/// `FTInfo.y -= clpdx.gety(0)`).
+///
+/// `extra` is `SetTextCharacterExtra`, added to every horizontal advance on
+/// top of `dx` (measured against GDI: with lpDx 20 and extra 10 the fifth
+/// character starts at 4x30; upstream does `FTInfo.x += charExtra`).
 #[derive(Clone, Copy, Default)]
 pub struct Layout<'a> {
     pub dx: Option<&'a [i32]>,
     pub extra: i32,
+    /// `dx` holds `(dx, dy)` pairs rather than plain advances.
+    pub pdy: bool,
 }
 
 impl<'a> Layout<'a> {
-    /// Just an `lpDx` array, no inter-character spacing.
+    /// Just an `lpDx` array of plain advances.
     pub fn from_dx(dx: Option<&'a [i32]>) -> Layout<'a> {
-        Layout { dx, extra: 0 }
+        Layout { dx, extra: 0, pdy: false }
     }
 
-    /// The advance after the `i`-th glyph, whose own advance is `default`.
+    /// Entries per character in `dx`.
     #[inline]
-    fn advance(&self, i: usize, default: i32) -> i32 {
-        self.dx.and_then(|d| d.get(i)).copied().unwrap_or(default) + self.extra
+    fn stride(&self) -> usize {
+        if self.pdy { 2 } else { 1 }
+    }
+
+    /// The pen movement after the `i`-th glyph, whose own advance is
+    /// `default`. `y` is positive downwards, so a positive `lpDx` `dy` (which
+    /// moves up) comes back negated.
+    #[inline]
+    fn advance(&self, i: usize, default: i32) -> (i32, i32) {
+        let at = i * self.stride();
+        let x = self.dx.and_then(|d| d.get(at)).copied().unwrap_or(default) + self.extra;
+        let y = if self.pdy { -self.dx.and_then(|d| d.get(at + 1)).copied().unwrap_or(0) } else { 0 };
+        (x, y)
     }
 
     /// Width of a `count`-glyph run laid out with an explicit `dx`, or `None`
     /// when there is none (the caller then measures it another way).
     pub fn dx_width(&self, count: usize) -> Option<i32> {
         let dx = self.dx?;
-        let n = count.min(dx.len());
-        Some(dx[..n].iter().sum::<i32>() + self.extra * i32::try_from(n).unwrap_or(0))
+        let (stride, mut sum, mut n) = (self.stride(), 0, 0);
+        for i in 0..count {
+            let Some(&step) = dx.get(i * stride) else { break };
+            sum += step;
+            n += 1;
+        }
+        Some(sum + self.extra * n)
+    }
+
+    /// How far the run travels vertically, for sizing the canvas. Positive
+    /// means downwards. `None` without an `ETO_PDY` array.
+    pub fn dy_travel(&self, count: usize) -> Option<(i32, i32)> {
+        if !self.pdy {
+            return None;
+        }
+        let dx = self.dx?;
+        let (mut at, mut lo, mut hi) = (0, 0, 0);
+        for i in 0..count {
+            let Some(&step) = dx.get(i * 2 + 1) else { break };
+            at -= step;
+            lo = lo.min(at);
+            hi = hi.max(at);
+        }
+        Some((lo, hi))
     }
 }
 
@@ -161,12 +202,14 @@ pub fn render_glyphs(ft: &Ft, tables: &Tables, profile: &Profile, ink: Ink, bg: 
 pub fn draw_text_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: &Profile,
                       ink: Ink, text: &str, px: i32, pen: (i32, i32), layout: Layout<'_>) {
     ft.prepare(profile);
-    let (mut pen_x, base_y) = pen;
+    let (mut pen_x, mut base_y) = pen;
     let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
     for (i, ch) in text.chars().enumerate() {
         if let Some(g) = ft.render(ch, px, profile) {
             blit_glyph(canvas, &Blit { tables, ink, pen_x, base_y, lcd, bgr }, &g);
-            pen_x += layout.advance(i, g.advance_px);
+            let (ax, ay) = layout.advance(i, g.advance_px);
+            pen_x += ax;
+            base_y += ay;
         }
     }
 }
@@ -175,12 +218,14 @@ pub fn draw_text_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: &P
 pub fn draw_glyphs_onto(canvas: &mut Canvas, ft: &Ft, tables: &Tables, profile: &Profile,
                         ink: Ink, glyphs: &[u16], px: i32, pen: (i32, i32), layout: Layout<'_>) {
     ft.prepare(profile);
-    let (mut pen_x, base_y) = pen;
+    let (mut pen_x, mut base_y) = pen;
     let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
     for (i, &gi) in glyphs.iter().enumerate() {
         if let Some(g) = ft.render_glyph(gi, px, profile) {
             blit_glyph(canvas, &Blit { tables, ink, pen_x, base_y, lcd, bgr }, &g);
-            pen_x += layout.advance(i, g.advance_px);
+            let (ax, ay) = layout.advance(i, g.advance_px);
+            pen_x += ax;
+            base_y += ay;
         }
     }
 }
@@ -307,22 +352,42 @@ mod tests {
     fn layout_adds_character_extra_on_top_of_dx() {
         let dx = [20, 20, 20, 20, 20];
         let plain = Layout::from_dx(Some(&dx));
-        assert_eq!(plain.advance(0, 99), 20, "lpDx overrides the font advance");
+        assert_eq!(plain.advance(0, 99), (20, 0), "lpDx overrides the font advance");
         assert_eq!(plain.dx_width(5), Some(100));
 
-        let spaced = Layout { dx: Some(&dx), extra: 10 };
-        assert_eq!(spaced.advance(0, 99), 30);
+        let spaced = Layout { dx: Some(&dx), extra: 10, pdy: false };
+        assert_eq!(spaced.advance(0, 99), (30, 0));
         assert_eq!(spaced.dx_width(5), Some(150));
 
         // No lpDx: the font's own advance, still widened by the spacing.
-        let no_dx = Layout { dx: None, extra: 6 };
-        assert_eq!(no_dx.advance(3, 12), 18);
+        let no_dx = Layout { dx: None, extra: 6, pdy: false };
+        assert_eq!(no_dx.advance(3, 12), (18, 0));
         assert_eq!(no_dx.dx_width(5), None, "the caller measures it instead");
 
         // A short lpDx falls back to the glyph's advance past its end.
-        let short = Layout { dx: Some(&dx[..2]), extra: 0 };
-        assert_eq!(short.advance(5, 7), 7);
+        let short = Layout { dx: Some(&dx[..2]), extra: 0, pdy: false };
+        assert_eq!(short.advance(5, 7), (7, 0));
         assert_eq!(short.dx_width(5), Some(40), "only the entries that exist");
+    }
+
+    /// `ETO_PDY`: the array is (dx, dy) pairs, and a positive dy moves the
+    /// pen up, so it comes back negated (measured against GDI; upstream
+    /// writes `FTInfo.y -= gety()`). Reading such an array as plain advances
+    /// takes every other dy as an x advance - which drew a vertical run
+    /// horizontally with the characters overlapping in pairs.
+    #[test]
+    fn pdy_pairs_move_the_pen_up_the_page() {
+        let pairs = [0, 24, 0, 24, 0, 24];
+        let vertical = Layout { dx: Some(&pairs), extra: 0, pdy: true };
+        assert_eq!(vertical.advance(0, 99), (0, -24));
+        assert_eq!(vertical.advance(2, 99), (0, -24));
+        assert_eq!(vertical.dx_width(3), Some(0), "no horizontal travel");
+        assert_eq!(vertical.dy_travel(3), Some((-72, 0)), "three steps upwards");
+
+        // The same array without the flag is what the port used to see.
+        let flat = Layout::from_dx(Some(&pairs));
+        assert_eq!(flat.advance(1, 99), (24, 0));
+        assert_eq!(flat.dy_travel(3), None);
     }
 
     #[test]

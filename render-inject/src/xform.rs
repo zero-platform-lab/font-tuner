@@ -66,18 +66,20 @@ impl Mapping {
     /// An explicit `lpDx` converted to device units. Stepping through the
     /// cumulative position (rather than scaling each entry on its own) keeps
     /// the rounding error from adding up along the run, as upstream's
-    /// `TransformlpDx` does.
-    pub(crate) fn device_dx(self, dx: &[i32]) -> Vec<i32> {
-        let (mut logical, mut device) = (0i32, 0i32);
-        dx.iter()
-            .map(|&step| {
-                logical += step;
-                let at = scale(logical, self.sx);
-                let out = at - device;
-                device = at;
-                out
-            })
-            .collect()
+    /// `TransformlpDx` does. With `pdy` the array is `(dx, dy)` pairs, so the
+    /// two axes are stepped separately with their own factors.
+    pub(crate) fn device_dx(self, dx: &[i32], pdy: bool) -> Vec<i32> {
+        let mut out = Vec::with_capacity(dx.len());
+        let (mut logical, mut device) = ([0i32; 2], [0i32; 2]);
+        let factor = [self.sx, self.sy];
+        for (i, &step) in dx.iter().enumerate() {
+            let axis = usize::from(pdy && i % 2 == 1);
+            logical[axis] += step;
+            let at = scale(logical[axis], factor[axis]);
+            out.push(at - device[axis]);
+            device[axis] = at;
+        }
+        out
     }
 }
 
@@ -121,6 +123,16 @@ mod tests {
         Mapping { sx, sy, hdc: HDC(std::ptr::null_mut()) }
     }
 
+    /// With `ETO_PDY` the array interleaves x and y, so each axis steps on
+    /// its own cumulative position and uses its own factor.
+    #[test]
+    fn device_dx_keeps_the_axes_apart_in_pdy_mode() {
+        let m = fake(2.0, 3.0);
+        assert_eq!(m.device_dx(&[10, 4, 10, 4], true), vec![20, 12, 20, 12]);
+        // Without the flag the same array is four x advances.
+        assert_eq!(m.device_dx(&[10, 4, 10, 4], false), vec![20, 8, 20, 8]);
+    }
+
     #[test]
     fn identity_is_recognised_and_lengths_pass_through() {
         let m = fake(1.0, 1.0);
@@ -148,7 +160,7 @@ mod tests {
     #[test]
     fn device_dx_steps_through_cumulative_positions() {
         let m = fake(1.5, 1.5);
-        let out = m.device_dx(&[3, 3, 3, 3]);
+        let out = m.device_dx(&[3, 3, 3, 3], false);
         assert_eq!(out, vec![5, 4, 5, 4]);
         assert_eq!(out.iter().sum::<i32>(), 18, "= round(12 * 1.5), no drift");
     }

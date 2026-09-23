@@ -49,6 +49,8 @@ thread_local! {
 const ETO_OPAQUE: u32 = 0x0002;
 const ETO_CLIPPED: u32 = 0x0004;
 const ETO_GLYPH_INDEX: u32 = 0x0010;
+/// `lpDx` holds `(dx, dy)` pairs: twice as many entries, a vertical run.
+const ETO_PDY: u32 = 0x2000;
 /// `SetTextAlign` flags (wingdi.h). The horizontal ones are a 2-bit field
 /// (LEFT 0 / RIGHT 2 / CENTER 6) and the vertical ones another
 /// (TOP 0 / BOTTOM 8 / BASELINE 24); CENTER and BASELINE each set two bits,
@@ -82,6 +84,11 @@ impl Draw<'_> {
     fn glyph_mode(&self) -> bool {
         self.options & ETO_GLYPH_INDEX != 0
     }
+    /// `lpDx` holds `(dx, dy)` pairs (`ETO_PDY`), so it has two entries per
+    /// character and the run can move vertically.
+    fn pdy(&self) -> bool {
+        self.options & ETO_PDY != 0
+    }
     /// The rect as `(left, top, right, bottom)`.
     fn rect_tuple(&self) -> Option<(i32, i32, i32, i32)> {
         self.rect.map(|r| (r.left, r.top, r.right, r.bottom))
@@ -107,9 +114,13 @@ unsafe extern "system" fn detour(
         false
     } else {
         let count = count as usize;
+        // `ETO_PDY` makes each lpDx entry a (dx, dy) pair, so the array is
+        // twice as long. Reading only `count` would both cut it short and
+        // read every other character's dy as an advance.
+        let dx_len = if options & ETO_PDY != 0 { count * 2 } else { count };
         // SAFETY: GDI's contract for ExtTextOutW — `text` holds `count`
-        // code units (or glyph indices), `dx` when non-null holds `count`
-        // advances, `rect` when non-null is one RECT — all valid for the
+        // code units (or glyph indices), `dx` when non-null holds `dx_len`
+        // entries, `rect` when non-null is one RECT — all valid for the
         // duration of the call. The borrows end before the call returns.
         let draw = unsafe {
             Draw {
@@ -119,7 +130,7 @@ unsafe extern "system" fn detour(
                 options,
                 rect: rect.as_ref().copied(),
                 text: core::slice::from_raw_parts(text, count),
-                dx: (!dx.is_null()).then(|| core::slice::from_raw_parts(dx, count)),
+                dx: (!dx.is_null()).then(|| core::slice::from_raw_parts(dx, dx_len)),
             }
         };
         render_into_dc(&draw).is_some()
@@ -231,10 +242,11 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     // `SetTextCharacterExtra` widens every advance, on top of any lpDx.
     // Both are logical units, so a scaled DC needs them converted; the
     // converted `lpDx` has to be owned for the rest of the draw.
-    let device_dx = (!map.is_identity()).then(|| d.dx.map(|dx| map.device_dx(dx))).flatten();
+    let device_dx = (!map.is_identity()).then(|| d.dx.map(|dx| map.device_dx(dx, d.pdy()))).flatten();
     let layout = Layout {
         dx: device_dx.as_deref().or(d.dx),
         extra: map.len_x(extra),
+        pdy: d.pdy(),
     };
     // `TA_UPDATECP`: the origin is the DC's current position, not the (x, y)
     // arguments (which GDI ignores then), and the position advances by the
@@ -271,8 +283,16 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     };
 
     // Text-extent region, unioned with the rect so opaque fill / clip fit.
-    let (mut rx, mut ry) = (left, baseline - ascent);
-    let (mut right, mut bottom) = (left + width + 6, ry + height + 4);
+    // An `ETO_PDY` run also travels vertically, so the canvas has to cover
+    // wherever the pen goes.
+    let (up, down) = layout.dy_travel(d.text.len()).unwrap_or((0, 0));
+    // How far the ink can reach horizontally. With an `lpDx` the pen may
+    // travel less than the glyphs are wide - an `ETO_PDY` run that stacks
+    // characters has zero horizontal travel, yet each glyph still paints its
+    // own width - so never size the canvas below what GDI measured.
+    let span = width.max(map.len_x(sz.cx));
+    let (mut rx, mut ry) = (left, baseline - ascent + up);
+    let (mut right, mut bottom) = (left + span + 6, baseline - ascent + down + height + 4);
     if let Some(rect) = d.rect_tuple() {
         let (left_px, top_px) = map.to_device(rect.0, rect.1);
         let (right_px, bottom_px) = map.to_device(rect.2, rect.3);
