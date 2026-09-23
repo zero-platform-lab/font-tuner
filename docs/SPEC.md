@@ -58,8 +58,8 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | detour の設置（`hook.rs`） | `retour::RawDetour`、`VirtualProtect`、`CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` + `OpenThread` + `SuspendThread` / `ResumeThread` | 対象は `GetModuleHandleW` + `GetProcAddress` で得た gdi32 / d2d1 の export | パッチの前後で自スレッド以外を全部止める。スナップショットとスレッドハンドルは RAII で閉じる。作った detour は `static DETOURS: Mutex<Vec<RawDetour>>` に入れて解放しない（常駐固定なので、トランポリンが消えることはない） |
 | `ExtTextOutW` の横取り（`gdi.rs`） | `GetTextMetricsW`、`GetTextExtentPoint32W` / `GetTextExtentPointI`、`GetTextColor` / `GetTextAlign` / `GetBkColor`、`GetCurrentObject` + `GetObjectW`（`LOGFONTW`）、`GetFontData` | 引数の `hdc`・`text`（`count` 要素）・`dx`（非 null なら `count` 要素）・`lprect` は呼び出し元の契約どおり | 測れないラン（`GetTextExtent` 失敗、`cx <= 0`）と読めないフォント（`GetFontData` 失敗）は元の `ExtTextOutW`（トランポリン）に落とす。オフスクリーン DIB（`dib.rs`: `CreateDIBSection` + `BitBlt` の往復）に描き、`ETO_OPAQUE` / `ETO_CLIPPED` / 背景モードは DIB 側で再現する（下記） |
 | 再入 | `thread_local! IN_DETOUR: Cell<bool>` | 自分の GDI 呼び出しが自分の detour に入ることがある | スレッドごとにガードする。プロセス全体のフラグにすると、あるスレッドの描画中に他スレッドが未調整の GDI に落ちて窓ごとに見た目が違う |
-| 描画状態 | `static RENDER: Mutex<Option<RenderState>>`（`Ft` + `Tables` + `Profile` + 現在のフォント鍵） | — | 1 プロセスに FreeType ライブラリと面は 1 つ。描画はロックの下で直列。プロファイル再読み込みも同じロック |
-| DirectWrite（`dwrite.rs`、`layout.rs`） | `IDWriteBitmapRenderTarget::DrawGlyphRun`、`IDWriteFactory{,2,3}::CreateGlyphRunAnalysis` の vtable スロット | `windows` クレートの vtable 定義とスロット番号が一致すること（照合済み）。ランの配列は `glyphCount` 要素（null の `glyphAdvances` / `glyphOffsets` は読まない） | 一度きりのパッチはミューテックスで直列化。`IDWriteFontFace` の bytes + index で面を開き、その COM オブジェクトを `RenderState` が clone で保持してアドレスの再利用を防ぐ。OS に描かせるときの params は、呼び出しの間 clone を持ち続ける（プロファイルの再読み込みで解放されないように） |
+| 描画状態 | `static RENDER: Mutex<Option<RenderState>>`（`Ft` + `Tables` + `Profile` + 最近の DirectWrite の面の一覧） | — | 1 プロセスに FreeType ライブラリが 1 つ。面とグリフのキャッシュは `Ft` の中にあり、ロックの下でだけ触る。描画はロックの下で直列。プロファイル再読み込みも同じロック（`Ft` ごと作り直すので、キャッシュも捨てる） |
+| DirectWrite（`dwrite.rs`、`layout.rs`） | `IDWriteBitmapRenderTarget::DrawGlyphRun`、`IDWriteFactory{,2,3}::CreateGlyphRunAnalysis` の vtable スロット | `windows` クレートの vtable 定義とスロット番号が一致すること（照合済み）。ランの配列は `glyphCount` 要素（null の `glyphAdvances` / `glyphOffsets` は読まない） | 一度きりのパッチはミューテックスで直列化。面はローカルのフォントファイルならパス + index で開き（複製しない）、そうでなければ bytes + index で開く。`IDWriteFontFace` を `RenderState` が clone で保持してアドレスの再利用を防ぐ（1.5「フォントとグリフのキャッシュ」）。OS に描かせるときの params は、呼び出しの間 clone を持ち続ける（プロファイルの再読み込みで解放されないように） |
 | Direct2D（`d2d.rs`） | `D2D1CreateFactory` / `D2D1CreateDevice` / `D2D1CreateDeviceContext` と各ターゲットの vtable スロット 12 / 27 / 28 / 29 / 82 / 34 / 36。`IDWriteTextRenderer` の実装（`windows::core::implement`） | 同上 | (vtable, slot) → 元関数のマップ `SLOT_ORIG` を 1 つのミューテックスで管理。濃淡のビットマップを塗るあいだだけターゲットの変換・アンチエイリアスとブラシの変換を差し替え、必ず戻す |
 | 自己常駐固定 | `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN)` | — | `DllMain(DLL_PROCESS_ATTACH)` で最初に行う。以降 `FreeLibrary` は no-op |
 | ログ | `%TEMP%\render-inject.log` に追記 | — | ロック付き。初回の描画結果を `render-inject-capture.png` に保存する（検証用） |
@@ -121,7 +121,23 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 実測（`verify/d2d-probe`、DC 用の描画先、25 ケース）: インクの端はすべて素の Direct2D と 1px 以内。クリップ・グラデーション・半透明のブラシ・不透明度 50% のレイヤー・範囲ごとの色・下線と取り消し線・右から左の段落・折り返し・`CLIP` 付きのレイアウト・カラー絵文字が素の Direct2D と揃った。Notepad++ 8.9.8（Scintilla の DirectWrite モードと DirectWrite DC モード）でも自前で描かれ、見た目がコアの GDI 経路と揃った。
 
-速さは課題として残っている。同じ 19 文字のランを 500 回描くと、素の Direct2D は約 7ms、こちらは約 350ms かかった（実測）。グリフのキャッシュが無く、描くたびに FreeType でラスタライズし直すため（GDI 経路も同じ）。
+速さは次の「フォントとグリフのキャッシュ」を参照。
+
+**フォントとグリフのキャッシュ** — 0.1.10 までは、`Ft` が面を 1 つだけ持っていた。フォントが変わるたびに、フォントファイルを丸ごと読んで複製していた（日本語フォントは 10〜20MB）。グリフも描くたびに FreeType でラスタライズし直していた。いまは次のとおり。
+
+* **面**: `Ft` は面を最大 8 つ、鍵つきで開いたままにする。古いものから閉じる。メモリから開いた面の複製は合計 64MB まで。鍵はフォントの出どころで決める。
+  * DirectWrite の面: ローカルのファイル（`IDWriteLocalFontFileLoader` で分かる）なら、パスと index が鍵。FreeType がパスから必要な部分だけを読み、複製しない。FreeType はパスを ANSI で開くので、それ以外の文字を含むパスはメモリに読む。アプリがメモリから渡すフォントは、`IDWriteFontFace` のアドレスと index が鍵。その面は `RenderState` の一覧（最大 32）に clone で持ち、一覧から外すときに `Ft` でも閉じる。アドレスが別のフォントに再利用されても、古い面や古いグリフを出さないため。
+  * GDI: 鍵は 0.1.10 までと同じ（フェイス名と `GetFontData` のデータ量）。キャッシュに無いときだけ `GetFontData` でデータを読む。
+* **グリフ**: 鍵は面・グリフ番号・サイズ・スタイル（縦書き・太字・斜体）・FreeType の読み込みフラグ・描画モード・LCD フィルタ・embolden。ビットマップを `Arc` で共有して持ち、合計 8MB を超えたら丸ごと捨てる。面を閉じたとき、または同じ鍵で開き直したときは、その鍵のグリフも捨てる。
+
+実測（500 回あたり。GDI は `verify/gdi-perf`、Direct2D は `verify/d2d-probe` の `perf` の行。どちらも Yu Gothic UI・24px の 19 文字）:
+
+| 経路 | 素の OS | 0.1.10 | キャッシュあり |
+|---|---|---|---|
+| GDI（`ExtTextOutW`） | 約 27ms | 約 840ms | 約 590〜690ms |
+| Direct2D（`DrawGlyphRun`） | 約 7ms | ―（描き間違えていた） | 約 128ms |
+
+残りの時間の大半は、キャッシュ以外の処理にかかっている。GDI では 1 ピクセルごとの合成・描くたびの DIB の作成・DC との転送、Direct2D ではランごとの `CreateBitmap`。これらは挙動に関わるので、キャッシュとは別に扱う。
 
 `BitBlt` も論理座標を取るので、DIB の出し入れの前後で DC を `SaveDC` → `MM_TEXT` + `GM_COMPATIBLE` + 恒等変換 → `RestoreDC` に挟む。0.1.8 まではこれをしておらず、写像のかかった DC では位置と大きさだけ `BitBlt` の引き伸ばしで偶然合い、**調整したグリフが最近傍拡大で潰れていた**（実測: 2 倍の DC で出力の 2×2 ブロックが一様 96 / 混在 0。素の GDI は同条件で混在 105）。素の GDI より悪い状態だった。
 
@@ -234,7 +250,7 @@ FreeType は C のヘッダを bindgen せず、使う分だけ手で宣言す�
 * **所有**: `Ft` が `FT_Library` と現在の `FT_Face` を持ち、`Drop` で `FT_Done_Face` → `FT_Done_FreeType` の順に閉じる。面を差し替える `reface_*` は先に古い面を閉じる。メモリ面のバイト列は `Ft` の `UnsafeCell<Vec<u8>>` に置き、FreeType が参照している間は差し替えない（面を閉じてから入れ替える）。
 * **借用**: `render` が返す `Glyph<'_>` はグリフスロットのビットマップを借りる。次の `FT_Load_Glyph` で上書きされるので、`&self` の寿命に縛って「描いてから次の文字」を型で強制する。
 * **`unsafe` の範囲**: FreeType を呼ぶ行と、返ってきた `*mut` を読む行だけ。`name` テーブルの UTF-16BE 復号や名前比較、カバレッジの合成は安全な Rust。
-* **upstream との違い**: upstream は `FTC_Manager`（FreeType のキャッシュ）を使う。移植は面 1 つを持ち、フォントが変わるたびに `GetFontData` で読み直す（`font_key` が同じなら読み直さない）。
+* **upstream との違い**: upstream は `FTC_Manager`（FreeType のキャッシュ）を使う。移植は `Ft` の中に自前の面とグリフのキャッシュを持つ（1.5「フォントとグリフのキャッシュ」）。
 
 ---
 

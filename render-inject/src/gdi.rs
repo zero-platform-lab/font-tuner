@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 use crate::dib::Dib;
+use crate::fonts;
 use crate::hook::install_hook;
 use crate::log;
 use crate::state::{orig, RenderState, CAPTURED, RENDER};
@@ -144,12 +145,13 @@ unsafe extern "system" fn detour(
     }
 }
 
-/// Resolve the DC's font into render-core, or None. Re-extracts + re-faces
-/// only when the font differs from `cache`. The pixel size is not taken from
+/// Resolve the DC's font into render-core, or None. The face stays open in
+/// `ft` under a key from the face name and the font data's size, so the
+/// data is read only the first time. The pixel size is not taken from
 /// here: `LOGFONTW.lfHeight` means the em size when negative but the *cell*
 /// height (em + internal leading) when positive, so the caller derives it
 /// from the text metrics instead (see `em_px`).
-fn resolve_font(hdc: HDC, ft: &Ft, cache: &mut Option<String>) -> Option<()> {
+fn resolve_font(hdc: HDC, ft: &Ft) -> Option<()> {
     let mut lf = LOGFONTW::default();
     // SAFETY: `lf` is a LOGFONTW and the size passed is exactly its size.
     unsafe {
@@ -170,13 +172,12 @@ fn resolve_font(hdc: HDC, ft: &Ft, cache: &mut Option<String>) -> Option<()> {
     }
     let name_len = lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(0);
     let face = String::from_utf16_lossy(&lf.lfFaceName[..name_len]);
-    let key = format!("gdi:{face}:{size}");
-    if cache.as_deref() != Some(key.as_str()) {
+    let key = fonts::hash_of(("gdi", face.as_str(), size));
+    if !ft.activate(key) {
         let mut buf = vec![0u8; size as usize];
         // SAFETY: `buf` is exactly `size` bytes, the length GDI reported.
         unsafe { GetFontData(hdc, table, 0, Some(buf.as_mut_ptr().cast::<c_void>()), size) };
-        ft.reface_memory(&buf, &face).ok()?;
-        *cache = Some(key);
+        ft.open_memory_family(key, buf, &face).ok()?;
     }
     Some(())
 }
@@ -218,9 +219,8 @@ fn text_width(d: &Draw<'_>, sz: SIZE, layout: Layout<'_>) -> i32 {
 /// Draw the run onto `canvas` with the shared face, refaced to the DC's font.
 fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, pen: (i32, i32), px: i32,
             layout: Layout<'_>) -> Option<()> {
-    let RenderState { ft, tables, profile, font_key, font_face } = st;
-    resolve_font(d.hdc, ft, font_key)?;
-    *font_face = None; // a GDI key does not name a DirectWrite face
+    let RenderState { ft, tables, profile, .. } = st;
+    resolve_font(d.hdc, ft)?;
     if d.glyph_mode() {
         draw_glyphs_onto(canvas, ft, tables, profile, ink, d.text, px, pen, layout);
     } else {

@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, RegisterWindowMess
 mod d2d;
 mod dib;
 mod dwrite;
+mod fonts;
 mod gdi;
 mod gdi_metrics;
 mod hook;
@@ -113,7 +114,7 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     let (path, p) = load_profile();
     log(&format!("profile {}: {p:?}", path.as_deref().unwrap_or("(default)")));
     if let Ok(mut guard) = RENDER.lock() {
-        *guard = Some(RenderState { ft, tables: tables_for(&p), profile: p, font_key: None, font_face: None });
+        *guard = Some(RenderState { ft, tables: tables_for(&p), profile: p, dw_faces: Vec::new() });
     }
     dwrite::refresh_dw_rendering(&p);
     // SAFETY: a static NUL-terminated message name.

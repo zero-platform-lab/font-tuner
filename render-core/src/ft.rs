@@ -21,7 +21,9 @@
     clippy::cast_lossless
 )]
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_long, c_uint, c_ulong};
 
@@ -236,16 +238,18 @@ const OBLIQUE_SHEAR_16_16: c_long = 0x1_0000 / 3;
 const BOLD_X_DIV: i64 = 40;
 const BOLD_Y_DIV: i64 = 60;
 
-/// A rendered glyph: coverage bitmap plus placement.
-pub struct Glyph<'a> {
+/// A rendered glyph: coverage bitmap plus placement. Owned (the bytes are
+/// copied out of FreeType's glyph slot), so it can be cached and shared.
+pub struct Glyph {
     pub width: i32,
     pub rows: i32,
+    /// Bytes per row of `buffer`.
     pub pitch: i32,
     pub pixel_mode: i32,
     pub left: i32,
     pub top: i32,
     pub advance_px: i32, // integer pixels (26.6 >> 6)
-    pub buffer: &'a [u8],
+    pub buffer: Vec<u8>,
 }
 
 /// Does `face` carry `want` as a family name? Checks FreeType's ASCII
@@ -286,84 +290,155 @@ unsafe fn face_has_family(face: FT_Face, want: &str) -> bool {
     false
 }
 
-/// Owned FreeType library + one active face. `&self` methods mutate FreeType
-/// state (the glyph slot, the active face) exactly as the C globals did; a
-/// `Glyph` borrowed from `render` is valid until the next `render`/`reface`.
+/// An open face and what keeps it readable: the font-file bytes for a face
+/// opened from memory (FreeType reads them for the face's whole life), or
+/// nothing for one opened from a path (FreeType reads the file on demand).
+struct FaceSlot {
+    key: u64,
+    face: FT_Face,
+    bytes: Vec<u8>,
+}
+
+/// At most this many faces stay open; the least recently used is closed.
+const MAX_FACES: usize = 8;
+/// Faces opened from memory hold a copy of the whole font file (a CJK font
+/// is 10-20 MB), so their bytes are capped too.
+const MAX_FACE_BYTES: usize = 64 << 20;
+/// Rendered glyphs are kept up to this many bytes, then dropped wholesale.
+const MAX_GLYPH_BYTES: usize = 8 << 20;
+/// Keys handed out for faces opened without one (never looked up again).
+const UNKEYED: u64 = 1 << 63;
+
+/// What a cached glyph was rendered from: the face, the glyph, its size and
+/// style, and every FreeType setting that changes the bitmap.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    face: u64,
+    gi: u32,
+    /// 26.6 em size for styled glyphs; whole pixels (negated) otherwise.
+    size: i64,
+    style: u8,
+    load_flags: i32,
+    render_mode: i32,
+    lcd_filter: i32,
+    embolden: i32,
+}
+
+/// Owned FreeType library, a handful of open faces (one of them active) and
+/// a cache of rendered glyphs. `&self` methods mutate FreeType state (the
+/// glyph slot, the active face) exactly as the C globals did; callers
+/// serialise access (render-inject keeps the `Ft` behind a mutex).
 pub struct Ft {
     lib: FT_Library,
+    /// The active face (one of `faces`), or null.
     face: Cell<FT_Face>,
-    /// Backing bytes for `FT_New_Memory_Face`; FreeType reads them for the
-    /// face's whole life, so they are replaced only after `FT_Done_Face`.
-    membuf: UnsafeCell<Vec<u8>>,
+    active: Cell<u64>,
+    /// Open faces, least recently used first.
+    faces: RefCell<Vec<FaceSlot>>,
+    next_unkeyed: Cell<u64>,
+    glyphs: RefCell<HashMap<GlyphKey, Arc<Glyph>>>,
+    glyph_bytes: Cell<usize>,
 }
 
 impl Ft {
-    /// Initialise FreeType with no face yet; `reface_memory` / `reopen` set one.
+    /// Initialise FreeType with no face yet.
     pub fn new() -> Result<Ft, i32> {
         let mut lib: FT_Library = std::ptr::null_mut();
         // SAFETY: `lib` is an out-param FreeType fills; checked before use.
         let r = unsafe { FT_Init_FreeType(&raw mut lib) };
         if r != 0 { return Err(r); }
-        Ok(Ft { lib, face: Cell::new(std::ptr::null_mut()), membuf: UnsafeCell::new(Vec::new()) })
+        Ok(Ft {
+            lib,
+            face: Cell::new(std::ptr::null_mut()),
+            active: Cell::new(0),
+            faces: RefCell::new(Vec::new()),
+            next_unkeyed: Cell::new(UNKEYED),
+            glyphs: RefCell::new(HashMap::new()),
+            glyph_bytes: Cell::new(0),
+        })
     }
 
     /// Initialise FreeType and open a face from a font file.
     pub fn open(path: &str, face_index: i64) -> Result<Ft, i32> {
         let ft = Ft::new()?;
-        let lib = ft.lib;
+        let key = ft.unkeyed();
+        ft.open_path(key, path, face_index)?;
+        Ok(ft)
+    }
+
+    fn unkeyed(&self) -> u64 {
+        let k = self.next_unkeyed.get();
+        self.next_unkeyed.set(k.wrapping_add(1) | UNKEYED);
+        k
+    }
+
+    /// Make the face opened under `key` the active one, if it is still open.
+    /// Callers key a face by what identifies its font (a file path and face
+    /// index), so the file is opened - or read - only once.
+    pub fn activate(&self, key: u64) -> bool {
+        let mut faces = self.faces.borrow_mut();
+        let Some(i) = faces.iter().position(|s| s.key == key) else { return false };
+        let slot = faces.remove(i);
+        self.face.set(slot.face);
+        self.active.set(key);
+        faces.push(slot);
+        true
+    }
+
+    /// Close the face opened under `key`, if open (it is no longer active),
+    /// and forget the glyphs rendered from it. For a key that names an object
+    /// whose identity may be reused: the next face under that key may be
+    /// another font, and must not be handed this one's glyphs.
+    pub fn close(&self, key: u64) {
+        self.forget_glyphs(key);
+        let mut faces = self.faces.borrow_mut();
+        let Some(i) = faces.iter().position(|s| s.key == key) else { return };
+        let slot = faces.remove(i);
+        if self.active.get() == key {
+            self.face.set(std::ptr::null_mut());
+            self.active.set(0);
+        }
+        // SAFETY: the face we owned, no longer active or listed; closed once.
+        unsafe { FT_Done_Face(slot.face); }
+    }
+
+    /// Open face `index` of the font file at `path` under `key` and make it
+    /// active. FreeType reads the file on demand; nothing is copied.
+    pub fn open_path(&self, key: u64, path: &str, index: i64) -> Result<(), i32> {
         let c = CString::new(path).map_err(|_| -1)?;
         let mut face: FT_Face = std::ptr::null_mut();
         // SAFETY: `lib` is live, `c` is a NUL-terminated path, `face` is an
         // out-param; a non-zero return means `face` was not set.
-        let r = unsafe { FT_New_Face(lib, c.as_ptr(), face_index as c_long, &raw mut face) };
+        let r = unsafe { FT_New_Face(self.lib, c.as_ptr(), index as c_long, &raw mut face) };
         if r != 0 { return Err(r); }
-        ft.adopt(face);
-        Ok(ft)
+        self.adopt(key, face, Vec::new());
+        Ok(())
     }
 
-    /// Release the current face (if any) and take `face` as the active one.
-    fn adopt(&self, face: FT_Face) {
-        self.drop_face();
-        if !face.is_null() {
-            // SAFETY: `face` is a live FT_Face we just took ownership of.
-            unsafe { FT_Select_Charmap(face, FT_ENCODING_UNICODE); }
-        }
-        self.face.set(face);
+    /// Open face `index` of the in-memory font file `data` under `key` and
+    /// make it active. The bytes are kept for the face's life.
+    pub fn open_memory(&self, key: u64, data: Vec<u8>, index: i64) -> Result<(), i32> {
+        let mut face: FT_Face = std::ptr::null_mut();
+        // SAFETY: `data` is moved into the face's slot below and never
+        // reallocated, so the pointer stays valid for the face's life.
+        let r = unsafe { FT_New_Memory_Face(self.lib, data.as_ptr(), data.len() as c_long, index as c_long, &raw mut face) };
+        if r != 0 { return Err(r); }
+        self.adopt(key, face, data);
+        Ok(())
     }
 
-    fn drop_face(&self) {
-        let f = self.face.replace(std::ptr::null_mut());
-        if !f.is_null() {
-            // SAFETY: `f` is the face we owned; nothing references it now.
-            unsafe { FT_Done_Face(f); }
-        }
-    }
-
-    /// Copy `data` into the backing buffer (after dropping the face that may
-    /// still reference the old bytes) and return its pointer + length.
-    fn stage_memory(&self, data: &[u8]) -> (*const u8, c_long) {
-        self.drop_face();
-        // SAFETY: no face references membuf now, and no other borrow of it is
-        // live (Glyph borrows the slot bitmap, not membuf).
-        let buf = unsafe { &mut *self.membuf.get() };
-        buf.clear();
-        buf.extend_from_slice(data);
-        (buf.as_ptr(), buf.len() as c_long)
-    }
-
-    /// Swap the active face to an in-memory font file (e.g. GDI `GetFontData`
-    /// bytes), keeping the FreeType library. For a TTC, `want_family` picks the
-    /// matching face by family name (case-insensitive), checking every `name`
-    /// table family entry so a localized GDI face name ("BIZ UDPゴシック",
-    /// "游ゴシック") finds its face too; falls back to face 0.
-    pub fn reface_memory(&self, data: &[u8], want_family: &str) -> Result<(), i32> {
-        let (base, len) = self.stage_memory(data);
+    /// Like `open_memory`, but for a TTC pick the face whose family is
+    /// `want_family` (case-insensitive), checking every `name` table family
+    /// entry so a localized GDI face name ("BIZ UDPゴシック", "游ゴシック")
+    /// finds its face too; face 0 otherwise.
+    pub fn open_memory_family(&self, key: u64, data: Vec<u8>, want_family: &str) -> Result<(), i32> {
+        let (base, len) = (data.as_ptr(), data.len() as c_long);
         let mut chosen: c_long = 0;
         if !want_family.is_empty() {
             // Probe face -1 for the face count, then open each to compare names.
             let mut probe: FT_Face = std::ptr::null_mut();
-            // SAFETY: `base`/`len` describe the staged bytes, live for this
-            // call; face index -1 asks FreeType for the face count.
+            // SAFETY: `base`/`len` describe `data`, live for this call; face
+            // index -1 asks FreeType for the face count.
             let perr = unsafe { FT_New_Memory_Face(self.lib, base, len, -1, &raw mut probe) };
             // SAFETY: `probe` is live iff the call returned 0.
             let n = if perr == 0 { unsafe { (*probe).num_faces } } else { 1 };
@@ -382,24 +457,48 @@ impl Ft {
                 if matched { chosen = i; break; }
             }
         }
-        let mut face: FT_Face = std::ptr::null_mut();
-        // SAFETY: `base`/`len` are the staged bytes; `face` is an out-param.
-        let r = unsafe { FT_New_Memory_Face(self.lib, base, len, chosen, &raw mut face) };
-        if r != 0 { return Err(r); }
-        self.adopt(face);
-        Ok(())
+        self.open_memory(key, data, i64::from(chosen))
     }
 
-    /// Swap the active face to an in-memory font file at a specific face index
-    /// (for DirectWrite's IDWriteFontFace bytes + GetIndex).
+    /// Swap the active face to an in-memory font file (e.g. GDI `GetFontData`
+    /// bytes), choosing a TTC face by family as `open_memory_family`. The
+    /// face is not looked up again: callers that repeat a font use a key.
+    pub fn reface_memory(&self, data: &[u8], want_family: &str) -> Result<(), i32> {
+        let key = self.unkeyed();
+        self.open_memory_family(key, data.to_vec(), want_family)
+    }
+
+    /// Swap the active face to an in-memory font file at a specific face index.
     pub fn reface_memory_index(&self, data: &[u8], index: i64) -> Result<(), i32> {
-        let (base, len) = self.stage_memory(data);
-        let mut face: FT_Face = std::ptr::null_mut();
-        // SAFETY: `base`/`len` are the staged bytes; `face` is an out-param.
-        let r = unsafe { FT_New_Memory_Face(self.lib, base, len, index as c_long, &raw mut face) };
-        if r != 0 { return Err(r); }
-        self.adopt(face);
-        Ok(())
+        let key = self.unkeyed();
+        self.open_memory(key, data.to_vec(), index)
+    }
+
+    /// Take `face` (already open) as the active one under `key`, closing the
+    /// least recently used faces past the limits. A face opened again under a
+    /// key already present replaces the old one.
+    fn adopt(&self, key: u64, face: FT_Face, bytes: Vec<u8>) {
+        // SAFETY: `face` is a live FT_Face we just took ownership of.
+        unsafe { FT_Select_Charmap(face, FT_ENCODING_UNICODE); }
+        // A face (re)opened under a key starts with no glyphs: whatever was
+        // cached under it came from the previous face.
+        self.forget_glyphs(key);
+        let mut faces = self.faces.borrow_mut();
+        if let Some(i) = faces.iter().position(|s| s.key == key) {
+            let old = faces.remove(i);
+            // SAFETY: the face we owned; the active pointer is replaced below.
+            unsafe { FT_Done_Face(old.face); }
+        }
+        faces.push(FaceSlot { key, face, bytes });
+        self.face.set(face);
+        self.active.set(key);
+        let mut bytes: usize = faces.iter().map(|s| s.bytes.len()).sum();
+        while faces.len() > 1 && (faces.len() > MAX_FACES || bytes > MAX_FACE_BYTES) {
+            let old = faces.remove(0);
+            bytes -= old.bytes.len();
+            // SAFETY: not the active face (that is the last one); closed once.
+            unsafe { FT_Done_Face(old.face); }
+        }
     }
 
     /// filter: FT_LCD_FILTER_* (0 NONE, 1 DEFAULT, 2 LIGHT, 3 LEGACY1, 16 LEGACY)
@@ -434,7 +533,7 @@ impl Ft {
 
     /// Render one character at `px` pixels through `p`. Returns `None` only on
     /// a hard error; a missing/empty glyph yields an empty `Glyph` (advance only).
-    pub fn render(&self, ch: char, px: i32, p: &Profile) -> Option<Glyph<'_>> {
+    pub fn render(&self, ch: char, px: i32, p: &Profile) -> Option<Arc<Glyph>> {
         let face = self.face.get();
         if face.is_null() { return None; }
         // SAFETY: `face` is a live FT_Face (null-checked above).
@@ -443,52 +542,102 @@ impl Ft {
     }
 
     /// Render a glyph by its font glyph index (for ETO_GLYPH_INDEX draws).
-    pub fn render_glyph(&self, gi: u16, px: i32, p: &Profile) -> Option<Glyph<'_>> {
+    pub fn render_glyph(&self, gi: u16, px: i32, p: &Profile) -> Option<Arc<Glyph>> {
         self.emit(gi as c_uint, px, p)
+    }
+
+    /// The cache key for glyph `gi` of the active face at `size` / `style`
+    /// through profile `p`.
+    fn key(&self, gi: c_uint, size: i64, style: u8, p: &Profile) -> GlyphKey {
+        let (load_flags, render_mode) = Self::flags(p);
+        GlyphKey {
+            face: self.active.get(),
+            gi,
+            size,
+            style,
+            load_flags,
+            render_mode,
+            lcd_filter: if p.aa.is_lcd() { p.lcd_filter } else { 0 },
+            embolden: p.embolden,
+        }
+    }
+
+    /// Drop the cached glyphs rendered from the face under `face`.
+    fn forget_glyphs(&self, face: u64) {
+        let mut map = self.glyphs.borrow_mut();
+        let before = map.len();
+        map.retain(|k, _| k.face != face);
+        if map.len() != before {
+            let bytes = map.values().map(|g| g.buffer.len() + core::mem::size_of::<Glyph>()).sum();
+            self.glyph_bytes.set(bytes);
+        }
+    }
+
+    /// The glyph for `key`, rendering it with `render` on a miss.
+    fn cached(&self, key: GlyphKey, render: impl FnOnce() -> Option<Glyph>) -> Option<Arc<Glyph>> {
+        if let Some(g) = self.glyphs.borrow().get(&key) {
+            return Some(Arc::clone(g));
+        }
+        let g = Arc::new(render()?);
+        let size = g.buffer.len() + core::mem::size_of::<Glyph>();
+        let mut map = self.glyphs.borrow_mut();
+        if self.glyph_bytes.get() + size > MAX_GLYPH_BYTES {
+            map.clear();
+            self.glyph_bytes.set(0);
+        }
+        map.insert(key, Arc::clone(&g));
+        self.glyph_bytes.set(self.glyph_bytes.get() + size);
+        Some(g)
     }
 
     /// Render glyph `gi` the way a DirectWrite run asks for it: at a
     /// fractional size, turned sideways and/or with the synthetic styles.
     /// The transform is reset afterwards, so `render`/`render_glyph` are
     /// unaffected.
-    pub fn render_glyph_styled(&self, gi: u16, style: &GlyphStyle, p: &Profile) -> Option<Glyph<'_>> {
+    pub fn render_glyph_styled(&self, gi: u16, style: &GlyphStyle, p: &Profile) -> Option<Arc<Glyph>> {
         let face = self.face.get();
         if face.is_null() || style.size_26_6 <= 0 { return None; }
-        // Shear first (the oblique lean is in the glyph's own frame), then
-        // the quarter turn: rotate(90 ccw) * shear.
-        let (mut xx, mut xy, mut yx, mut yy): (c_long, c_long, c_long, c_long) =
-            (0x1_0000, if style.oblique { OBLIQUE_SHEAR_16_16 } else { 0 }, 0, 0x1_0000);
-        if style.sideways {
-            (xx, xy, yx, yy) = (-yx, -yy, xx, xy);
-        }
-        let mut m = FT_Matrix { xx, xy, yx, yy };
-        let mut identity = FT_Matrix { xx: 0x1_0000, xy: 0, yx: 0, yy: 0x1_0000 };
-        let bold = style.bold.then_some((style.size_26_6 / BOLD_X_DIV, style.size_26_6 / BOLD_Y_DIV));
-        // SAFETY: `face` is live; the matrix pointers are valid for the calls
-        // and FreeType copies them.
-        unsafe {
-            if FT_Set_Char_Size(face, 0, style.size_26_6 as c_long, 72, 72) != 0 { return None; }
-            FT_Set_Transform(face, &raw mut m, std::ptr::null_mut());
-        }
-        let g = self.load_render(gi as c_uint, p, bold);
-        // SAFETY: as above.
-        unsafe { FT_Set_Transform(face, &raw mut identity, std::ptr::null_mut()); }
-        g
+        let bits = u8::from(style.sideways) | u8::from(style.bold) << 1 | u8::from(style.oblique) << 2;
+        self.cached(self.key(c_uint::from(gi), style.size_26_6, bits, p), || {
+            // Shear first (the oblique lean is in the glyph's own frame), then
+            // the quarter turn: rotate(90 ccw) * shear.
+            let (mut xx, mut xy, mut yx, mut yy): (c_long, c_long, c_long, c_long) =
+                (0x1_0000, if style.oblique { OBLIQUE_SHEAR_16_16 } else { 0 }, 0, 0x1_0000);
+            if style.sideways {
+                (xx, xy, yx, yy) = (-yx, -yy, xx, xy);
+            }
+            let mut m = FT_Matrix { xx, xy, yx, yy };
+            let mut identity = FT_Matrix { xx: 0x1_0000, xy: 0, yx: 0, yy: 0x1_0000 };
+            let bold = style.bold.then_some((style.size_26_6 / BOLD_X_DIV, style.size_26_6 / BOLD_Y_DIV));
+            // SAFETY: `face` is live; the matrix pointers are valid for the
+            // calls and FreeType copies them.
+            unsafe {
+                if FT_Set_Char_Size(face, 0, style.size_26_6 as c_long, 72, 72) != 0 { return None; }
+                FT_Set_Transform(face, &raw mut m, std::ptr::null_mut());
+            }
+            let g = self.load_render(c_uint::from(gi), p, bold);
+            // SAFETY: as above.
+            unsafe { FT_Set_Transform(face, &raw mut identity, std::ptr::null_mut()); }
+            g
+        })
     }
 
-    /// Load + render glyph `gi` into the face's slot and wrap the bitmap.
-    fn emit(&self, gi: c_uint, px: i32, p: &Profile) -> Option<Glyph<'_>> {
+    /// Load + render glyph `gi` at `px` pixels, through the cache.
+    fn emit(&self, gi: c_uint, px: i32, p: &Profile) -> Option<Arc<Glyph>> {
         let face = self.face.get();
         if face.is_null() { return None; }
-        // SAFETY: face is a live FT_Face from FreeType.
-        if unsafe { FT_Set_Pixel_Sizes(face, 0, px as c_uint) } != 0 { return None; }
-        self.load_render(gi, p, None)
+        // Whole-pixel sizes are keyed negated, apart from 26.6 ones.
+        self.cached(self.key(gi, -i64::from(px), 0, p), || {
+            // SAFETY: face is a live FT_Face from FreeType.
+            if unsafe { FT_Set_Pixel_Sizes(face, 0, px as c_uint) } != 0 { return None; }
+            self.load_render(gi, p, None)
+        })
     }
 
-    /// Load + render `gi` at the face's current size and transform. `bold` is
-    /// DirectWrite's synthetic emboldening (x, y strength in 26.6), applied
-    /// on top of the profile's own.
-    fn load_render(&self, gi: c_uint, p: &Profile, bold: Option<(i64, i64)>) -> Option<Glyph<'_>> {
+    /// Load + render `gi` at the face's current size and transform, and copy
+    /// the bitmap out of the slot. `bold` is DirectWrite's synthetic
+    /// emboldening (x, y strength in 26.6), applied on top of the profile's own.
+    fn load_render(&self, gi: c_uint, p: &Profile, bold: Option<(i64, i64)>) -> Option<Glyph> {
         let face = self.face.get();
         if face.is_null() { return None; }
         let (flags, render_mode) = Self::flags(p);
@@ -510,13 +659,19 @@ impl Ft {
             if b.buffer.is_null() || b.rows == 0 {
                 return Some(Glyph {
                     width: 0, rows: 0, pitch: 0, pixel_mode: b.pixel_mode as i32,
-                    left, top, advance_px, buffer: &[],
+                    left, top, advance_px, buffer: Vec::new(),
                 });
             }
-            let len = (b.pitch.unsigned_abs() * b.rows) as usize;
-            let buffer = std::slice::from_raw_parts(b.buffer, len);
+            // Copy row by row: a negative pitch means bottom-up rows.
+            let stride = b.pitch.unsigned_abs() as usize;
+            let rows = b.rows as usize;
+            let mut buffer = Vec::with_capacity(stride * rows);
+            for r in 0..rows {
+                let row = if b.pitch >= 0 { b.buffer.add(r * stride) } else { b.buffer.add((rows - 1 - r) * stride) };
+                buffer.extend_from_slice(std::slice::from_raw_parts(row, stride));
+            }
             Some(Glyph {
-                width: b.width as i32, rows: b.rows as i32, pitch: b.pitch, pixel_mode: b.pixel_mode as i32,
+                width: b.width as i32, rows: b.rows as i32, pitch: stride as i32, pixel_mode: b.pixel_mode as i32,
                 left, top, advance_px, buffer,
             })
         }
@@ -525,8 +680,11 @@ impl Ft {
 
 impl Drop for Ft {
     fn drop(&mut self) {
-        self.drop_face();
-        // SAFETY: called once, from Drop, after the face is released.
+        for slot in self.faces.get_mut().drain(..) {
+            // SAFETY: each face is ours and closed once, before the library.
+            unsafe { FT_Done_Face(slot.face); }
+        }
+        // SAFETY: called once, from Drop, after the faces are released.
         unsafe { FT_Done_FreeType(self.lib); }
     }
 }
@@ -618,5 +776,73 @@ mod layout_tests {
         assert_eq!(offset_of!(FT_GlyphSlotRec, bitmap), 104);
         assert_eq!(offset_of!(FT_GlyphSlotRec, bitmap_left), 144);
         assert_eq!(offset_of!(FT_GlyphSlotRec, outline), 152);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// Faces stay open under their keys and come back without reopening;
+    /// past `MAX_FACES` the least recently used one is closed.
+    #[test]
+    fn faces_are_kept_by_key() {
+        const FONT: &str = r"C:\Windows\Fonts\meiryo.ttc";
+        let Ok(ft) = Ft::new() else { return };
+        if ft.open_path(1, FONT, 0).is_err() {
+            eprintln!("skip: no {FONT}");
+            return;
+        }
+        assert!(ft.open_path(2, FONT, 1).is_ok());
+        assert!(ft.activate(1), "still open");
+        assert!(!ft.activate(99), "never opened");
+        for k in 10..10 + MAX_FACES as u64 {
+            assert!(ft.open_path(k, FONT, 0).is_ok());
+        }
+        assert!(!ft.activate(2), "the least recently used face was closed");
+        ft.close(10);
+        assert!(!ft.activate(10));
+        assert!(ft.activate(11));
+    }
+
+    /// A glyph is rasterised once per face / size / style / settings: the
+    /// second request returns the cached bitmap itself.
+    #[test]
+    fn glyphs_are_cached() {
+        const FONT: &str = r"C:\Windows\Fonts\meiryo.ttc";
+        let Ok(ft) = Ft::open(FONT, 0) else { eprintln!("skip: no {FONT}"); return };
+        let p = Profile::clean_greyscale();
+        let a = ft.render_glyph(36, 20, &p).expect("glyph");
+        let b = ft.render_glyph(36, 20, &p).expect("glyph");
+        assert!(Arc::ptr_eq(&a, &b), "cached");
+        let c = ft.render_glyph(36, 21, &p).expect("glyph");
+        assert!(!Arc::ptr_eq(&a, &c), "another size is another glyph");
+        // At 100px the synthetic bold adds 2.5px (em/40): enough to show.
+        let s1 = ft.render_glyph_styled(36, &GlyphStyle::at(100 * 64), &p).expect("glyph");
+        let s2 = ft.render_glyph_styled(36, &GlyphStyle { bold: true, ..GlyphStyle::at(100 * 64) }, &p).expect("glyph");
+        assert!(!Arc::ptr_eq(&s1, &s2), "a style is part of the key");
+        assert!(s2.width > s1.width, "synthetic bold widens");
+    }
+
+    /// Closing a face, or opening another under its key, forgets the glyphs
+    /// cached under that key: the next face there may be another font.
+    #[test]
+    fn a_reused_key_does_not_serve_the_old_glyphs() {
+        const FONT: &str = r"C:\Windows\Fonts\meiryo.ttc";
+        let Ok(ft) = Ft::new() else { return };
+        if ft.open_path(7, FONT, 0).is_err() {
+            eprintln!("skip: no {FONT}");
+            return;
+        }
+        let p = Profile::clean_greyscale();
+        let first = ft.render_glyph(36, 20, &p).expect("glyph");
+        ft.close(7);
+        assert!(ft.open_path(7, FONT, 1).is_ok(), "another face under the same key");
+        let other = ft.render_glyph(36, 20, &p).expect("glyph");
+        assert!(!Arc::ptr_eq(&first, &other), "rendered again, not served from the closed face");
+        let again = ft.render_glyph(36, 20, &p).expect("glyph");
+        assert!(ft.open_path(7, FONT, 0).is_ok(), "reopened under the key without closing");
+        let reopened = ft.render_glyph(36, 20, &p).expect("glyph");
+        assert!(!Arc::ptr_eq(&again, &reopened));
     }
 }

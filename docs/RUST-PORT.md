@@ -39,7 +39,7 @@ FreeType 自体はフォークの `freetype64.lib` を変更せず再利用す�
         共有 vtable を先にパッチ）
   → テキスト描画ごとに:
       DC / グリフラン からフォントを解決（TTC は GetFontData 'ttcf'、
-        または IDWriteFontFace のファイルバイト + index）
+        または IDWriteFontFace のファイルのパス + index。ローカルでないものはバイト + index）
       render-core で描画（プロファイルに応じ grey/LCD）し、DC の既存ピクセルに重ねる
       blit で書き戻し、OS ラスタライザを飛ばす
   → Direct2D の文字: render-core の濃淡を A8 ビットマップにし、アプリのブラシで
@@ -53,7 +53,8 @@ FreeType 自体はフォークの `freetype64.lib` を変更せず再利用す�
     プロセス終了時にだけ来る no-op
 ```
 
-描画はミューテックスで直列化する（共有 FreeType face 1 つ、描画ごとに reface）。
+描画はミューテックスで直列化する（FreeType ライブラリ 1 つに、鍵つきで開いたままの面が最大 8 つ。
+ラスタライズ済みのグリフも鍵つきで持つ。SPEC 1.5「フォントとグリフのキャッシュ」）。
 フックは **retour**（純 Rust、iced-x86 逆アセンブラ）で、MinHook/Detours ではない。
 retour はパッチ中に他スレッドを止めないので、`install_hook` がバイトパッチの前後で
 他スレッドを凍結する。一度きりの vtable パッチはミューテックスか `Once` で直列化し、2 つの

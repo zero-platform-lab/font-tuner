@@ -73,7 +73,8 @@ use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, HW
 use windows::core::IUnknown;
 use windows_numerics::{Matrix3x2, Vector2};
 
-use crate::dwrite::{dw_rendering, reface};
+use crate::dwrite::dw_rendering;
+use crate::fonts::reface;
 use crate::hook::{install_hook, patch_slot};
 use crate::layout::{self, Mapping};
 use crate::log;
@@ -612,7 +613,7 @@ fn draw_run(rt: &ID2D1RenderTarget, baseline: Vector2, run: &DWRITE_GLYPH_RUN, b
     let (rect, mask) = {
         let mut guard = RENDER.lock().ok()?;
         let st = guard.as_mut()?;
-        reface(st, face, "dw")?;
+        reface(st, face)?;
         let rendered = render_placed(&st.ft, &st.profile, &geo.glyphs, &geo.style);
         let Some(rect) = rendered.bounds else { return Some(()) }; // no ink: nothing to fill
         let mut mask = rendered.coverage(rect, 1, false);

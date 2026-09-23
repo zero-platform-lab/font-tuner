@@ -19,13 +19,19 @@ pub(crate) struct RenderState {
     pub(crate) ft: Ft,
     pub(crate) tables: Tables,
     pub(crate) profile: Profile,
-    /// Identity of the face currently loaded into `ft`, so a draw only
-    /// re-extracts and re-faces when the font actually changes.
-    pub(crate) font_key: Option<String>,
-    /// When `font_key` names an `IDWriteFontFace` by address, this clone
-    /// keeps that object alive, so the address cannot be recycled for a
-    /// different font while the key still matches it. `None` for GDI keys.
-    pub(crate) font_face: Option<IDWriteFontFace>,
+    /// DirectWrite faces recently drawn, and the key each is open under in
+    /// `ft` (`fonts::reface`). Least recently used first.
+    pub(crate) dw_faces: Vec<DwFace>,
+}
+
+/// A DirectWrite face and its key in `Ft`. The clone keeps the object alive,
+/// so its address cannot be recycled for another font while it is listed.
+pub(crate) struct DwFace {
+    pub(crate) face: IDWriteFontFace,
+    pub(crate) key: u64,
+    /// Keyed by the object rather than a file path (a font supplied from
+    /// memory): closed in `Ft` when it leaves the list.
+    pub(crate) memory: bool,
 }
 
 // SAFETY: `Ft` owns raw FreeType handles, which are not thread-safe on their

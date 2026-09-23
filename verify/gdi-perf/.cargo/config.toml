@@ -1,0 +1,4 @@
+# The repo root sets +crt-static for the shipped binaries; the probe does not
+# need it and links the DirectWrite import libs more simply without it.
+[target.x86_64-pc-windows-msvc]
+rustflags = []

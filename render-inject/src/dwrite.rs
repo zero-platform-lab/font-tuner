@@ -19,7 +19,7 @@ use windows::core::{Interface, HRESULT};
 use windows::Win32::Foundation::{E_FAIL, RECT};
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFactory1, IDWriteFactory2,
-    IDWriteFactory3, IDWriteFontFace, IDWriteFontFile, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_SHARED,
+    IDWriteFactory3, IDWriteFontFace, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE, DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_GRID_FIT_MODE_DISABLED,
     DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_MATRIX, DWRITE_PIXEL_GEOMETRY, DWRITE_PIXEL_GEOMETRY_BGR,
     DWRITE_PIXEL_GEOMETRY_FLAT, DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE, DWRITE_RENDERING_MODE1,
@@ -27,10 +27,11 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 
 use crate::dib::Dib;
+use crate::fonts::reface;
 use crate::hook::patch_slot;
 use crate::layout::{self, Mapping};
 use crate::log;
-use crate::state::{orig, RenderState, CAPTURED, RENDER};
+use crate::state::{orig, CAPTURED, RENDER};
 
 // ---- Rendering params for the text the OS still draws ----
 
@@ -162,46 +163,6 @@ fn custom_params(f: &IDWriteFactory, w: &ParamsWanted) -> Option<IDWriteRenderin
     }
 }
 
-// ---- Fonts ----
-
-/// Make `st`'s FreeType face `face`'s font, unless it already is. Keyed on
-/// the face's address (pinned by the clone `RenderState` keeps) and index.
-pub(crate) fn reface(st: &mut RenderState, face: &IDWriteFontFace, prefix: &str) -> Option<()> {
-    // SAFETY: a COM getter on a live face.
-    let key = format!("{prefix}:{:x}:{}", face.as_raw().addr(), unsafe { face.GetIndex() });
-    if st.font_key.as_deref() != Some(key.as_str()) {
-        let (bytes, index) = font_bytes(face)?;
-        st.ft.reface_memory_index(&bytes, i64::from(index)).ok()?;
-        st.font_key = Some(key);
-        st.font_face = Some(face.clone());
-    }
-    Some(())
-}
-
-/// The font-file bytes + face index behind a DirectWrite font face.
-pub(crate) fn font_bytes(face: &IDWriteFontFace) -> Option<(Vec<u8>, u32)> {
-    // SAFETY: COM calls on a live face; `files` is sized by the first
-    // GetFiles call, the fragment is copied out before it is released.
-    unsafe {
-        let mut n = 0u32;
-        face.GetFiles(&raw mut n, None).ok()?;
-        let mut files: Vec<Option<IDWriteFontFile>> = vec![None; n as usize];
-        face.GetFiles(&raw mut n, Some(files.as_mut_ptr())).ok()?;
-        let file = files.into_iter().next()??;
-        let mut key: *mut c_void = core::ptr::null_mut();
-        let mut keysz = 0u32;
-        file.GetReferenceKey(&raw mut key, &raw mut keysz).ok()?;
-        let stream = file.GetLoader().ok()?.CreateStreamFromKey(key.cast_const(), keysz).ok()?;
-        let size = stream.GetFileSize().ok()?;
-        let mut frag: *mut c_void = core::ptr::null_mut();
-        let mut ctx: *mut c_void = core::ptr::null_mut();
-        stream.ReadFileFragment(&raw mut frag, 0, size, &raw mut ctx).ok()?;
-        let bytes = core::slice::from_raw_parts(frag.cast_const().cast::<u8>(), usize::try_from(size).ok()?).to_vec();
-        stream.ReleaseFileFragment(ctx);
-        Some((bytes, face.GetIndex()))
-    }
-}
-
 // ---- IDWriteBitmapRenderTarget::DrawGlyphRun (vtable slot 3) ----
 
 /// `DrawGlyphRun(baselineOriginX, baselineOriginY, measuringMode, glyphRun,
@@ -255,7 +216,7 @@ fn dgr_render(brt: &IDWriteBitmapRenderTarget, run: &DWRITE_GLYPH_RUN, baseline:
     // The render lock serialises every draw; held until the bitmap is written.
     let mut guard = RENDER.lock().ok()?;
     let st = guard.as_mut()?;
-    reface(st, face, "dw")?;
+    reface(st, face)?;
     let rendered = render_placed(&st.ft, &st.profile, &geo.glyphs, &geo.style);
     let Some(ink) = rendered.bounds else {
         // No ink (spaces): DirectWrite reports the empty rectangle at the
@@ -731,7 +692,7 @@ fn with_rendered<T>(key: usize, ty: i32, f: impl FnOnce(&RenderedRun, bool) -> T
         Profile { aa: Aa::LcdRgb, ..st.profile }
     };
     if a.rendered.as_ref().is_none_or(|(g, _)| *g != grey) {
-        if reface(st, &a.face, "dw").is_none() {
+        if reface(st, &a.face).is_none() {
             all.map.remove(&key);
             return None;
         }

@@ -20,6 +20,8 @@
 
 use crate::config::Profile;
 use crate::filter::Tables;
+use std::sync::Arc;
+
 use crate::ft::{self, Ft, GlyphStyle, PIXEL_MODE_GRAY, PIXEL_MODE_LCD};
 
 /// An RGB pixel buffer.
@@ -294,31 +296,16 @@ fn glyph_rect(g: &ft::Glyph, at: &Placed) -> Option<Rect> {
     Some((l, t, l + w, t + g.rows))
 }
 
-/// One rasterised glyph, copied out of FreeType's slot so a whole run can be
-/// measured before it is drawn.
-struct OwnedGlyph {
+/// One rasterised glyph of a run and where it goes.
+struct PlacedGlyph {
     at: Placed,
-    left: i32,
-    top: i32,
-    width: i32,
-    rows: i32,
-    pitch: i32,
-    pixel_mode: i32,
-    buffer: Vec<u8>,
+    g: Arc<ft::Glyph>,
 }
 
-impl OwnedGlyph {
-    fn view(&self) -> ft::Glyph<'_> {
-        ft::Glyph {
-            width: self.width, rows: self.rows, pitch: self.pitch, pixel_mode: self.pixel_mode,
-            left: self.left, top: self.top, advance_px: 0, buffer: &self.buffer,
-        }
-    }
-}
-
-/// A run rasterised once: its glyph bitmaps and the union of where they land.
+/// A run rasterised once: its glyph bitmaps (shared with `Ft`'s cache) and
+/// the union of where they land.
 pub struct RenderedRun {
-    glyphs: Vec<OwnedGlyph>,
+    glyphs: Vec<PlacedGlyph>,
     /// Ink bounds in the glyphs' pixel space; `None` when nothing has ink.
     pub bounds: Option<Rect>,
 }
@@ -331,10 +318,7 @@ pub fn render_placed(ft: &Ft, profile: &Profile, glyphs: &[Placed], style: &Glyp
         let Some(g) = ft.render_glyph_styled(at.gi, style, profile) else { continue };
         let Some(r) = glyph_rect(&g, at) else { continue };
         out.bounds = Some(union(out.bounds, r));
-        out.glyphs.push(OwnedGlyph {
-            at: *at, left: g.left, top: g.top, width: g.width, rows: g.rows, pitch: g.pitch,
-            pixel_mode: g.pixel_mode, buffer: g.buffer.to_vec(),
-        });
+        out.glyphs.push(PlacedGlyph { at: *at, g });
     }
     out
 }
@@ -345,9 +329,9 @@ impl RenderedRun {
     /// with (it picks the greyscale or LCD blend and the subpixel order).
     pub fn draw_onto(&self, canvas: &mut Canvas, origin: (i32, i32), tables: &Tables, profile: &Profile, ink: Ink) {
         let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
-        for g in &self.glyphs {
-            let blit = Blit { tables, ink, pen_x: g.at.x - origin.0, base_y: g.at.y - origin.1, lcd, bgr };
-            blit_glyph(canvas, &blit, &g.view());
+        for PlacedGlyph { at, g } in &self.glyphs {
+            let blit = Blit { tables, ink, pen_x: at.x - origin.0, base_y: at.y - origin.1, lcd, bgr };
+            blit_glyph(canvas, &blit, g);
         }
     }
 
@@ -360,10 +344,10 @@ impl RenderedRun {
     pub fn coverage(&self, rect: Rect, channels: usize, bgr: bool) -> Vec<u8> {
         let (w, h) = ((rect.2 - rect.0).max(0) as usize, (rect.3 - rect.1).max(0) as usize);
         let mut cov = vec![0u8; w * h * channels];
-        for g in &self.glyphs {
+        for PlacedGlyph { at, g } in &self.glyphs {
             let lcd = g.pixel_mode == PIXEL_MODE_LCD;
             let gw = if lcd { g.width / 3 } else { g.width };
-            let (gl, gt) = (g.at.x + g.left, g.at.y - g.top);
+            let (gl, gt) = (at.x + g.left, at.y - g.top);
             for row in 0..g.rows {
                 let y = gt + row - rect.1;
                 if y < 0 || y as usize >= h {

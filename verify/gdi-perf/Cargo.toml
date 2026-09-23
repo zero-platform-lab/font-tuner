@@ -1,0 +1,20 @@
+# Timing harness for the GDI path: 500 ExtTextOutW calls of one string on a
+# memory DC, with and without the core loaded, so the cost of the port's GDI
+# path can be measured and compared the same way every time.
+#
+# Its own workspace: never built by the shipped `cargo build` or build-msi.ps1.
+[workspace]
+
+[package]
+name = "gdi-perf"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies.windows]
+version = "0.62"
+features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"]
+
+[profile.release]
+opt-level = "s"
