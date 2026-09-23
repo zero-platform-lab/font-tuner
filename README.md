@@ -56,6 +56,6 @@ cd font-tuner
 
 `SetWindowsHookEx(WH_GETMESSAGE)` のフックプロシージャに `RenderCore64.dll` が export する `GetMsgProc` を指定するだけ。
 これで GUI を持つ全 64bit プロセスに DLL がマップされ、DLL 側の `DllMain` が自分の隣の `font-tuner.ini` を読んで GDI / DirectWrite をフックする。
-Font-tuner 自身は `[UnloadDll]` に載せてあり、描画差し替えの対象外。
+`[UnloadDll]` に載っているプログラムはフックを張らず、素の Windows 描画のままにする。Font-tuner 自身は載せていないので、トレイのメニューやダイアログもコアが描く。
 
 Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.

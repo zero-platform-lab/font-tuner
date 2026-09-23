@@ -12,6 +12,18 @@ crate-type = ["cdylib"]
 [build-dependencies]
 embed-resource = "3"
 
+# The workspace sets these for the shipped binaries; this crate is outside it
+# (it links the FreeType fork lib), so state them here. `panic = "abort"`
+# matters: a panic must not unwind out of a detour - the `extern "system"`
+# boundary aborts anyway, and this makes that explicit and drops the landing
+# pads from a DLL that is mapped into every GUI process.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [dependencies]
 render-core = { path = "../render-core" }
 retour = "0.4.0-alpha.4"
