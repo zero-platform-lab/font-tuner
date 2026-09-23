@@ -262,7 +262,7 @@ FreeType は C のヘッダを bindgen せず、使う分だけ手で宣言す�
 * `font-tuner.ini` の読み書きは `GetPrivateProfileStringW` / `WritePrivateProfileStringW`。ANSI 版は使わない。
 * システムフォント（`sysfont.rs`）: `NONCLIENTMETRICSW` の `cbSize` は自分で埋め、バックアップから読んだ値は信頼しない（5）。
 
-`font-tuner.ini` の `[UnloadDll]` 節（`font-tuner.exe` を含む除外リスト）は上流の書式で同梱しているが、コアは読まない。トレイ自身にもコアが注入される。
+`font-tuner.ini` の `[UnloadDll]` 節は「調整を効かせないプログラム」の一覧（上流の書式）。コアはアタッチ時に自分の exe 名をこの一覧と照合し、載っていればフックを張らずに戻る（`profile.rs` の `is_process_excluded`）。常駐固定は `DllMain` で先に済んでいるので DLL 自体はマップされたままだが、以降そのプロセスでコアのコードは走らず、描画は素の GDI になる。一覧の編集は以降に起動するプロセスから効く。出荷の一覧には `font-tuner.exe` が入っているので、トレイ自身のメニューとダイアログの文字は調整されない。
 
 ---
 

@@ -62,6 +62,42 @@ fn parse_alternative_file(text: &str) -> Option<&str> {
     None
 }
 
+/// Is `exe` (a file name, no directory) listed in the `[UnloadDll]` section of
+/// a font-tuner.ini's text? That section is upstream's list of programs the
+/// tuning must stay out of: ones with no GUI, ones that dislike an injected
+/// DLL, and the tray itself. Pure so it can be tested without a filesystem.
+///
+/// Lenient like the rest of the ini handling: section and entry names match
+/// case-insensitively, blanks are trimmed, `;`/`#` comment lines are skipped,
+/// and anything that is not a bare file name (a `key=value` line) is ignored.
+fn is_excluded(text: &str, exe: &str) -> bool {
+    let mut in_section = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with(';') || line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_section = name.trim().eq_ignore_ascii_case("UnloadDll");
+            continue;
+        }
+        if in_section && !line.contains('=') && line.eq_ignore_ascii_case(exe) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Should this process be left alone? True when its exe is listed in
+/// `[UnloadDll]` of the install dir's font-tuner.ini. Read once at attach;
+/// editing the list takes effect in processes started afterwards.
+pub(crate) fn is_process_excluded(exe_path: &str) -> bool {
+    let Some(dir) = self_dir() else { return false };
+    let Ok(text) = std::fs::read_to_string(dir.join("font-tuner.ini")) else { return false };
+    let exe = exe_path.rsplit(['\\', '/']).next().unwrap_or(exe_path);
+    is_excluded(&text, exe)
+}
+
 /// The profile the tray selected: `[General] AlternativeFile=ini\<name>.ini`
 /// in the install dir's font-tuner.ini, resolved relative to that dir. Read at
 /// attach, and again when the tray broadcasts "reload profile".
@@ -100,6 +136,17 @@ mod tests {
     use super::*;
 
     // "Small" tests: pure, no filesystem, no threads, deterministic.
+
+    #[test]
+    fn unload_dll_matches_only_bare_names_in_its_own_section() {
+        let ini = "[General]\nAlternativeFile=ini\\Clean Greyscale.ini\n\n[UnloadDll]\n; List of .exes\nfont-tuner.exe\n  MsMpEng.exe  \n\n[Exclude]\nnotepad.exe\n";
+        assert!(is_excluded(ini, "font-tuner.exe"));
+        assert!(is_excluded(ini, "MSMPENG.EXE"), "names match case-insensitively");
+        assert!(!is_excluded(ini, "notepad.exe"), "only the [UnloadDll] section counts");
+        assert!(!is_excluded(ini, "AlternativeFile"), "key=value lines are not entries");
+        assert!(!is_excluded(ini, "explorer.exe"));
+        assert!(!is_excluded("", "anything.exe"), "no section, no exclusion");
+    }
 
     #[test]
     fn alternative_file_reads_the_tray_written_key() {

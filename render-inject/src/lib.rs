@@ -91,7 +91,17 @@ unsafe extern "system" fn on_attach(_p: *mut c_void) -> u32 {
     let mut buf = [0u16; 260];
     // SAFETY: `None` = this process's exe; `buf` outlives the call.
     let n = unsafe { GetModuleFileNameW(None, &mut buf) } as usize;
-    log(&format!("loaded into pid={pid} exe={}", String::from_utf16_lossy(&buf[..n])));
+    let exe = String::from_utf16_lossy(&buf[..n]);
+    log(&format!("loaded into pid={pid} exe={exe}"));
+
+    // `[UnloadDll]` in font-tuner.ini: programs the tuning stays out of. We
+    // cannot unload (the DLL pins itself at attach), so skip the hooks
+    // instead - the process then draws with plain GDI. Nothing else of ours
+    // runs in it afterwards.
+    if profile::is_process_excluded(&exe) {
+        log("excluded by [UnloadDll]; not hooking");
+        return 0;
+    }
 
     let Ok(ft) = Ft::open(r"C:\Windows\Fonts\meiryo.ttc", 0) else {
         log("Ft::open failed");
