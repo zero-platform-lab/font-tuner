@@ -17,8 +17,8 @@ use render_core::Ft;
 use windows::core::{s, w, BOOL};
 use windows::Win32::Foundation::{RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    GetBkColor, GetCurrentObject, GetFontData, GetObjectW, GetTextAlign, GetTextColor, GetTextExtentPoint32W,
-    GetTextExtentPointI, GetTextMetricsW, HDC, LOGFONTW, OBJ_FONT, TEXTMETRICW,
+    GetBkColor, GetBkMode, GetCurrentObject, GetFontData, GetObjectW, GetTextAlign, GetTextColor,
+    GetTextExtentPoint32W, GetTextExtentPointI, GetTextMetricsW, HDC, LOGFONTW, OBJ_FONT, OPAQUE, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -182,6 +182,16 @@ fn measure(d: &Draw<'_>) -> Option<(TEXTMETRICW, SIZE)> {
     (ok.as_bool() && sz.cx > 0).then_some((tm, sz))
 }
 
+/// Width of the run in pixels: the sum of an explicit `dx` array when the
+/// caller supplied one (it overrides the font's advances), else what
+/// `GetTextExtentPoint*` measured.
+fn text_width(d: &Draw<'_>, sz: SIZE) -> i32 {
+    match d.dx {
+        Some(dx) => dx.iter().copied().sum(),
+        None => sz.cx,
+    }
+}
+
 /// Draw the run onto `canvas` with the shared face, refaced to the DC's font.
 fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, pen: (i32, i32), px: i32) -> Option<()> {
     let RenderState { ft, tables, profile, font_key, font_face } = st;
@@ -199,7 +209,8 @@ fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, p
 fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     let (tm, sz) = measure(d)?;
     // SAFETY: attribute reads on the app's DC.
-    let (color, align, bk) = unsafe { (GetTextColor(d.hdc).0, GetTextAlign(d.hdc).0, GetBkColor(d.hdc).0) };
+    let (color, align, bk, bk_mode) =
+        unsafe { (GetTextColor(d.hdc).0, GetTextAlign(d.hdc).0, GetBkColor(d.hdc).0, GetBkMode(d.hdc)) };
     let baseline = if align & TA_BASELINE == TA_BASELINE { d.y } else { d.y + tm.tmAscent };
 
     // Text-extent region, unioned with the rect so opaque fill / clip fit.
@@ -224,6 +235,16 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
         if d.options & ETO_CLIPPED != 0 {
             canvas.set_clip(Some((l - rx, t - ry, r - rx, b - ry)));
         }
+    }
+    // `SetBkMode(OPAQUE)` — GDI's default — fills the text box with the
+    // background colour as it draws, which is how apps overwrite a value in
+    // place (Process Explorer's numeric columns doubled up without this).
+    // render-core composites over what is there, so do the fill ourselves.
+    // Upstream does the same (override.cpp: `fillrect || GetBkMode == OPAQUE`).
+    if bk_mode == OPAQUE.0.cast_signed() {
+        let left = d.x - rx;
+        let top = baseline - ry - tm.tmAscent;
+        canvas.fill_rect((left, top, left + text_width(d, sz), top + tm.tmHeight), rgb(bk));
     }
     let ink = Ink { fg: rgb(color) };
     let pen = (d.x - rx, baseline - ry);

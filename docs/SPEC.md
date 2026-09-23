@@ -55,7 +55,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | 境界 | 使う API | 何を信頼するか | 守り |
 |---|---|---|---|
 | detour の設置（`hook.rs`） | `retour::RawDetour`、`VirtualProtect`、`CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` + `OpenThread` + `SuspendThread` / `ResumeThread` | 対象は `GetModuleHandleW` + `GetProcAddress` で得た gdi32 / d2d1 の export | パッチの前後で自スレッド以外を全部止める。スナップショットとスレッドハンドルは RAII で閉じる。作った detour は `static DETOURS: Mutex<Vec<RawDetour>>` に入れて解放しない（常駐固定なので、トランポリンが消えることはない） |
-| `ExtTextOutW` の横取り（`gdi.rs`） | `GetTextMetricsW`、`GetTextExtentPoint32W` / `GetTextExtentPointI`、`GetTextColor` / `GetTextAlign` / `GetBkColor`、`GetCurrentObject` + `GetObjectW`（`LOGFONTW`）、`GetFontData` | 引数の `hdc`・`text`（`count` 要素）・`dx`（非 null なら `count` 要素）・`lprect` は呼び出し元の契約どおり | 測れないラン（`GetTextExtent` 失敗、`cx <= 0`）と読めないフォント（`GetFontData` 失敗）は元の `ExtTextOutW`（トランポリン）に落とす。オフスクリーン DIB（`dib.rs`: `CreateDIBSection` + `BitBlt` の往復）に描き、`ETO_OPAQUE` / `ETO_CLIPPED` は DIB 側で再現する |
+| `ExtTextOutW` の横取り（`gdi.rs`） | `GetTextMetricsW`、`GetTextExtentPoint32W` / `GetTextExtentPointI`、`GetTextColor` / `GetTextAlign` / `GetBkColor`、`GetCurrentObject` + `GetObjectW`（`LOGFONTW`）、`GetFontData` | 引数の `hdc`・`text`（`count` 要素）・`dx`（非 null なら `count` 要素）・`lprect` は呼び出し元の契約どおり | 測れないラン（`GetTextExtent` 失敗、`cx <= 0`）と読めないフォント（`GetFontData` 失敗）は元の `ExtTextOutW`（トランポリン）に落とす。オフスクリーン DIB（`dib.rs`: `CreateDIBSection` + `BitBlt` の往復）に描き、`ETO_OPAQUE` / `ETO_CLIPPED` / 背景モードは DIB 側で再現する（下記） |
 | 再入 | `thread_local! IN_DETOUR: Cell<bool>` | 自分の GDI 呼び出しが自分の detour に入ることがある | スレッドごとにガードする。プロセス全体のフラグにすると、あるスレッドの描画中に他スレッドが未調整の GDI に落ちて窓ごとに見た目が違う |
 | 描画状態 | `static RENDER: Mutex<Option<RenderState>>`（`Ft` + `Tables` + `Profile` + 現在のフォント鍵） | — | 1 プロセスに FreeType ライブラリと面は 1 つ。描画はロックの下で直列。プロファイル再読み込みも同じロック |
 | DirectWrite（`dwrite.rs`） | `IDWriteBitmapRenderTarget::DrawGlyphRun`、`IDWriteFactory{,2,3}::CreateGlyphRunAnalysis` の vtable スロット | `windows` クレートの vtable 定義とスロット番号が一致すること（照合済み） | 一度きりのパッチはミューテックスで直列化。`IDWriteFontFace` の bytes + index で面を開き、その COM オブジェクトを `RenderState` が clone で保持してアドレスの再利用を防ぐ |
@@ -64,6 +64,8 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | ログ | `%TEMP%\render-inject.log` に追記 | — | ロック付き。初回の描画結果を `render-inject-capture.png` に保存する（検証用） |
 
 `DllMain` では常駐固定・ミューテックス取得・スレッド起動だけを行い、フックの設置と FreeType の初期化は別スレッド（`on_attach`）で行う。ローダーロックの下で detour を張らない。
+
+**背景モード** — GDI は `SetBkMode(OPAQUE)`（既定）のとき、文字を描きながらその文字ボックスを背景色で塗る。同じ場所に値を描き直して更新するアプリ（Process Explorer の数値列）はこれに頼っている。render-core は既存のピクセルの上に合成するだけなので、コア側で塗りを再現する必要がある。`ETO_OPAQUE`（`lprect` を塗る）に加えて `GetBkMode(hdc) == OPAQUE` なら文字ボックス（`d.x` から幅ぶん、ベースライン - `tmAscent` から `tmHeight`）を背景色で塗ってから描く。幅は `dx` 配列があればその合計、無ければ `GetTextExtentPoint*` の実測。上流も同じ判定（`override.cpp`: `fillrect || GetBkMode(hdc) == OPAQUE`）。これを見ていなかった 0.1.3 までは、Process Explorer の CPU 列などで古い数字が残って二重に見えた。
 
 ---
 
