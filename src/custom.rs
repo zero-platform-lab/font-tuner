@@ -564,11 +564,11 @@ impl Dlg {
         let px = self.em_px.max(6);
         let big = px * 3 / 2;
         let pad = self.px(6);
-        render_core::render::draw_text_onto(&mut canvas, ft, &tables, p, ink, self.s.custom_sample, px, (pad, pad + px), None);
+        render_core::render::draw_text_onto(&mut canvas, ft, &tables, p, ink, self.s.custom_sample, px, (pad, pad + px), render_core::render::Layout::default());
         // The larger line only when it fits (descender ≈ a quarter of the size).
         let base2 = pad + px + self.px(6) + big;
         if base2 + big / 4 <= height {
-            render_core::render::draw_text_onto(&mut canvas, ft, &tables, p, ink, self.s.custom_sample, big, (pad, base2), None);
+            render_core::render::draw_text_onto(&mut canvas, ft, &tables, p, ink, self.s.custom_sample, big, (pad, base2), render_core::render::Layout::default());
         }
         canvas
     }

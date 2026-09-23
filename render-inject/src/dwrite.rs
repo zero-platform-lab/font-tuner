@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use render_core::render::{draw_glyphs_onto, glyph_run_coverage_lcd, Ink};
+use render_core::render::{draw_glyphs_onto, glyph_run_coverage_lcd, Layout, Ink};
 use render_core::{Aa, Profile};
 use windows::core::{Interface, HRESULT};
 use windows::Win32::Foundation::RECT;
@@ -261,7 +261,7 @@ fn dgr_render(brt: &IDWriteBitmapRenderTarget, g: &GlyphRun<'_>, baseline: (f32,
     RENDER.lock().ok()?.as_mut().and_then(|st| {
         g.reface(st, "dw")?;
         let RenderState { ft, tables, profile, .. } = st;
-        draw_glyphs_onto(&mut canvas, ft, tables, profile, Ink { fg: rgb(color) }, g.glyphs, g.px, pen, None);
+        draw_glyphs_onto(&mut canvas, ft, tables, profile, Ink { fg: rgb(color) }, g.glyphs, g.px, pen, Layout::default());
         Some(())
     })?;
     dib.blit(&canvas);

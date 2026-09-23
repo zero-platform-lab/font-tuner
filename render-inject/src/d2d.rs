@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use render_core::render::{draw_glyphs_onto, Ink};
+use render_core::render::{draw_glyphs_onto, Ink, Layout};
 use windows::core::{s, w, Interface, GUID, HRESULT, PCSTR};
 use windows::Win32::Graphics::Direct2D::{
     ID2D1Brush, ID2D1Device, ID2D1Device1, ID2D1Device2, ID2D1Device3, ID2D1Device4, ID2D1Device5, ID2D1Device6,
@@ -526,7 +526,7 @@ fn substitute_on_dc(hdc: HDC, baseline: Vector2, g: &GlyphRun<'_>, ink: Ink) -> 
     RENDER.lock().ok()?.as_mut().and_then(|st| {
         g.reface(st, "d2d")?;
         let RenderState { ft, tables, profile, .. } = st;
-        draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, g.glyphs, g.px, (bx - rx, by - ry), None);
+        draw_glyphs_onto(&mut canvas, ft, tables, profile, ink, g.glyphs, g.px, (bx - rx, by - ry), Layout::default());
         Some(())
     })?;
     dib.blit(&canvas);

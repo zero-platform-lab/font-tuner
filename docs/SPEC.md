@@ -67,7 +67,11 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 **テキスト配置** — `SetTextAlign` はランの原点を (x, y) からどう測るかを決める。水平は LEFT / RIGHT / CENTER、垂直は TOP / BOTTOM / BASELINE で、CENTER と BASELINE はどちらも 2 ビット立つのでマスクして等値比較する（`&` で判定すると CENTER が RIGHT にも一致する）。GDI は自前の描画にこれを適用するので、移植でも適用しないと右揃え・中央揃えの文字が文字列の幅ぶんずれる。実測（素の GDI と比較、`ALIGN-TEST` を x=160 に 14px で描画）: `TA_RIGHT` はインクが 86〜159、`TA_CENTER` は 123〜196、`TA_LEFT` は 160〜233。0.1.6 までは水平を無視して常に 160 から描いていた。幅は `dx` 配列があればその合計、無ければ実測（`text_width`）。upstream も同じ（`override.cpp` の `switch (horiz)` / `switch (vert)`）。
 
-**未対応の DC 属性** — `SetTextCharacterExtra`（字間）、`TA_UPDATECP`（DC の現在位置を原点にし、描画後に進める）、MM_TEXT 以外のマップモード、恒等でないワールド変換は、いずれも読んでいない。upstream は字間をキャンバス DC に伝え、`TA_UPDATECP` を処理し、ズーム DC を変換して描く。ここでこれらが効いた DC に当たると位置や幅がずれる。
+**字間** — `SetTextCharacterExtra` は各文字のアドバンスに定数を足す。`render-core` の `Layout { dx, extra }` が `lpDx` と一緒に受け取り、`pen_x += advance + extra` で送る。upstream も自前のレイアウトループで同じことをする（`ft.cpp` の `FTInfo.x += charExtra`。`override.cpp` の `SetTextCharacterExtra(hCanvasDC, ...)` は GDI に落とす経路の辻褄合わせで、字間の再現そのものではない）。幅の扱いは `lpDx` の有無で変わる。`lpDx` が無ければ `GetTextExtentPoint*` の実測に字間が含まれるので、そのまま使う。`lpDx` があれば GDI がそこに字間を上乗せするので `sum(dx) + n * extra` とする（実測: `lpDx`=20×5・字間 10 で 5 文字目が 4×30 の位置から始まる）。
+
+**`TA_UPDATECP`** — 原点は引数の (x, y) ではなく DC の現在位置で、描画後にその位置が進む。`GetCurrentPositionEx` で取り、描画後に `MoveToEx` で進める（左揃えは GDI の実測幅ぶん進め、右揃えは戻し、中央揃えは動かさない。upstream と同じ）。0.1.7 までは引数の位置に描き、現在位置も動かさなかった（実測で x=120 のところを x=1 に描いていた）。
+
+**未対応の DC 属性** — MM_TEXT 以外のマップモードと、恒等でないワールド変換は読んでいない。upstream はズーム DC を変換して描く。こちらは何もしない。拡大縮小のかかった DC では位置や大きさがずれうる。**未検証**: 拡大した DC を作って素の GDI と比べる試験を書いたものの、試験側で拡大が反映されず判定できなかった。
 
 **背景モード** — GDI は `SetBkMode(OPAQUE)`（既定）のとき、文字を描きながらその文字ボックスを背景色で塗る。同じ場所に値を描き直して更新するアプリ（Process Explorer の数値列）はこれに頼っている。render-core は既存のピクセルの上に合成するだけなので、コア側で塗りを再現する必要がある。`ETO_OPAQUE`（`lprect` を塗る）に加えて `GetBkMode(hdc) == OPAQUE` なら文字ボックス（`d.x` から幅ぶん、ベースライン - `tmAscent` から `tmHeight`）を背景色で塗ってから描く。幅は `dx` 配列があればその合計、無ければ `GetTextExtentPoint*` の実測。upstream も同じ判定（`override.cpp`: `fillrect || GetBkMode(hdc) == OPAQUE`）。これを見ていなかった 0.1.3 までは、Process Explorer の CPU 列などで古い数字が残って二重に見えた。
 

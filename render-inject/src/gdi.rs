@@ -12,13 +12,14 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
-use render_core::render::{draw_glyphs_onto, draw_text_onto, Canvas, Ink};
+use render_core::render::{draw_glyphs_onto, draw_text_onto, Canvas, Ink, Layout};
 use render_core::Ft;
 use windows::core::{s, w, BOOL};
-use windows::Win32::Foundation::{RECT, SIZE};
+use windows::Win32::Foundation::{POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    GetBkColor, GetBkMode, GetCurrentObject, GetFontData, GetObjectW, GetTextAlign, GetTextColor,
-    GetTextExtentPoint32W, GetTextExtentPointI, GetTextMetricsW, HDC, LOGFONTW, OBJ_FONT, OPAQUE, TEXTMETRICW,
+    GetBkColor, GetBkMode, GetCurrentObject, GetCurrentPositionEx, GetFontData, GetObjectW, GetTextAlign,
+    GetTextCharacterExtra, GetTextColor, GetTextExtentPoint32W, GetTextExtentPointI, GetTextMetricsW, MoveToEx, HDC,
+    LOGFONTW, OBJ_FONT, OPAQUE, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -57,6 +58,7 @@ const TA_CENTER: u32 = 6;
 const TA_TOP: u32 = 0;
 const TA_BOTTOM: u32 = 8;
 const TA_BASELINE: u32 = 24;
+const TA_UPDATECP: u32 = 1;
 const TA_HORZ_MASK: u32 = TA_LEFT | TA_RIGHT | TA_CENTER;
 const TA_VERT_MASK: u32 = TA_TOP | TA_BOTTOM | TA_BASELINE;
 /// The `'ttcf'` table tag: present only for TrueType collections.
@@ -193,25 +195,24 @@ fn measure(d: &Draw<'_>) -> Option<(TEXTMETRICW, SIZE)> {
     (ok.as_bool() && sz.cx > 0).then_some((tm, sz))
 }
 
-/// Width of the run in pixels: the sum of an explicit `dx` array when the
-/// caller supplied one (it overrides the font's advances), else what
-/// `GetTextExtentPoint*` measured.
-fn text_width(d: &Draw<'_>, sz: SIZE) -> i32 {
-    match d.dx {
-        Some(dx) => dx.iter().copied().sum(),
-        None => sz.cx,
-    }
+/// Width of the run in pixels. An explicit `lpDx` overrides the font's
+/// advances, so sum it (plus the inter-character spacing GDI adds on top —
+/// measured). Without `lpDx`, `GetTextExtentPoint*` already includes the
+/// spacing, so its measurement stands.
+fn text_width(d: &Draw<'_>, sz: SIZE, layout: Layout<'_>) -> i32 {
+    layout.dx_width(d.text.len()).unwrap_or(sz.cx)
 }
 
 /// Draw the run onto `canvas` with the shared face, refaced to the DC's font.
-fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, pen: (i32, i32), px: i32) -> Option<()> {
+fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, pen: (i32, i32), px: i32,
+            layout: Layout<'_>) -> Option<()> {
     let RenderState { ft, tables, profile, font_key, font_face } = st;
     resolve_font(d.hdc, ft, font_key)?;
     *font_face = None; // a GDI key does not name a DirectWrite face
     if d.glyph_mode() {
-        draw_glyphs_onto(canvas, ft, tables, profile, ink, d.text, px, pen, d.dx);
+        draw_glyphs_onto(canvas, ft, tables, profile, ink, d.text, px, pen, layout);
     } else {
-        draw_text_onto(canvas, ft, tables, profile, ink, &String::from_utf16_lossy(d.text), px, pen, d.dx);
+        draw_text_onto(canvas, ft, tables, profile, ink, &String::from_utf16_lossy(d.text), px, pen, layout);
     }
     Some(())
 }
@@ -220,23 +221,38 @@ fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, p
 fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     let (tm, sz) = measure(d)?;
     // SAFETY: attribute reads on the app's DC.
-    let (color, align, bk, bk_mode) =
-        unsafe { (GetTextColor(d.hdc).0, GetTextAlign(d.hdc).0, GetBkColor(d.hdc).0, GetBkMode(d.hdc)) };
-    // `SetTextAlign` places the run relative to (d.x, d.y); GDI applies it
+    let (color, align, bk, bk_mode, extra) = unsafe {
+        (GetTextColor(d.hdc).0, GetTextAlign(d.hdc).0, GetBkColor(d.hdc).0, GetBkMode(d.hdc), GetTextCharacterExtra(d.hdc))
+    };
+    // `SetTextCharacterExtra` widens every advance, on top of any lpDx.
+    let layout = Layout { dx: d.dx, extra };
+    // `TA_UPDATECP`: the origin is the DC's current position, not the (x, y)
+    // arguments (which GDI ignores then), and the position advances by the
+    // run afterwards. Without this the run landed at the arguments - x=1
+    // instead of x=120 in a measured sample - and the position never moved.
+    let (ox, oy) = if align & TA_UPDATECP != 0 {
+        let mut p = POINT::default();
+        // SAFETY: `p` is an out-param we own; `hdc` is the app's DC.
+        if unsafe { GetCurrentPositionEx(d.hdc, &raw mut p) }.as_bool() { (p.x, p.y) } else { (d.x, d.y) }
+    } else {
+        (d.x, d.y)
+    };
+
+    // `SetTextAlign` places the run relative to (ox, oy); GDI applies it
     // for its own draws, so the port has to apply it too or right- and
     // centre-aligned text lands a whole string width away (measured: a
     // TA_RIGHT run drew at x..x+w instead of x-w..x). Same as upstream
     // (override.cpp `switch (horiz)` / `switch (vert)`).
-    let width = text_width(d, sz);
+    let width = text_width(d, sz, layout);
     let left = match align & TA_HORZ_MASK {
-        TA_RIGHT => d.x - width,
-        TA_CENTER => d.x - width / 2,
-        _ => d.x,
+        TA_RIGHT => ox - width,
+        TA_CENTER => ox - width / 2,
+        _ => ox,
     };
     let baseline = match align & TA_VERT_MASK {
-        TA_BASELINE => d.y,
-        TA_BOTTOM => d.y - tm.tmDescent,
-        _ => d.y + tm.tmAscent,
+        TA_BASELINE => oy,
+        TA_BOTTOM => oy - tm.tmDescent,
+        _ => oy + tm.tmAscent,
     };
 
     // Text-extent region, unioned with the rect so opaque fill / clip fit.
@@ -276,7 +292,7 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     // The render lock serialises every draw; it is held for this one
     // statement, while render-core touches the shared face.
     let px = em_px(&tm);
-    RENDER.lock().ok()?.as_mut().and_then(|st| draw_run(st, &mut canvas, d, ink, pen, px))?;
+    RENDER.lock().ok()?.as_mut().and_then(|st| draw_run(st, &mut canvas, d, ink, pen, px, layout))?;
     dib.blit(&canvas);
 
     // Save what render-core produced inside the injected process, once, as proof.
@@ -288,6 +304,19 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
         }
     }
     dib.copy_to(d.hdc, rx, ry);
+
+    // Advance the current position the way GDI would, using its own measured
+    // width (the app measured with that, not with the tuned glyphs).
+    // Upstream does the same: right-aligned moves back, centred does not move.
+    if align & TA_UPDATECP != 0 {
+        let nx = match align & TA_HORZ_MASK {
+            TA_RIGHT => ox - sz.cx,
+            TA_CENTER => ox,
+            _ => ox + sz.cx,
+        };
+        // SAFETY: setting the current position on the app's DC.
+        let _ = unsafe { MoveToEx(d.hdc, nx, oy, None) };
+    }
     Some(())
 }
 
