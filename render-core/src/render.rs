@@ -72,22 +72,39 @@ impl Canvas {
     }
     /// Build a canvas from a 32bpp top-down BGRA buffer (e.g. a DIB section).
     pub fn from_bgra_topdown(w: usize, h: usize, bgra: &[u8]) -> Canvas {
+        Canvas::from_bgra_rows(w, h, bgra, w)
+    }
+
+    /// Like `from_bgra_topdown`, from a buffer whose rows are `stride`
+    /// pixels apart (a larger bitmap's top-left corner).
+    pub fn from_bgra_rows(w: usize, h: usize, bgra: &[u8], stride: usize) -> Canvas {
         let mut rgb = vec![0u8; w * h * 3];
-        for i in 0..w * h {
-            rgb[i * 3] = bgra[i * 4 + 2]; // R
-            rgb[i * 3 + 1] = bgra[i * 4 + 1]; // G
-            rgb[i * 3 + 2] = bgra[i * 4]; // B
+        for y in 0..h {
+            for x in 0..w {
+                let (i, s) = (y * w + x, (y * stride + x) * 4);
+                rgb[i * 3] = bgra[s + 2]; // R
+                rgb[i * 3 + 1] = bgra[s + 1]; // G
+                rgb[i * 3 + 2] = bgra[s]; // B
+            }
         }
         Canvas { w, h, rgb, clip: None }
     }
 
     /// Write this canvas back into a 32bpp top-down BGRA buffer (alpha=255).
     pub fn blit_to_bgra_topdown(&self, bgra: &mut [u8]) {
-        for i in 0..self.w * self.h {
-            bgra[i * 4] = self.rgb[i * 3 + 2]; // B
-            bgra[i * 4 + 1] = self.rgb[i * 3 + 1]; // G
-            bgra[i * 4 + 2] = self.rgb[i * 3]; // R
-            bgra[i * 4 + 3] = 255; // A
+        self.blit_to_bgra_rows(bgra, self.w);
+    }
+
+    /// Like `blit_to_bgra_topdown`, into rows `stride` pixels apart.
+    pub fn blit_to_bgra_rows(&self, bgra: &mut [u8], stride: usize) {
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let (i, d) = (y * self.w + x, (y * stride + x) * 4);
+                bgra[d] = self.rgb[i * 3 + 2]; // B
+                bgra[d + 1] = self.rgb[i * 3 + 1]; // G
+                bgra[d + 2] = self.rgb[i * 3]; // R
+                bgra[d + 3] = 255; // A
+            }
         }
     }
 

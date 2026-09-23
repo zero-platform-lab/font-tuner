@@ -143,6 +143,16 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | GDI（`ExtTextOutW`） | 約 27ms | 約 840ms | 約 590〜690ms |
 | Direct2D（`DrawGlyphRun`） | 約 7ms | ―（描き間違えていた） | 約 128ms |
 
+**GDI の DIB の使い回し** — GDI の描画は、DC の該当部分を DIB に写し、render-core で描いて書き戻す。この DIB を描くたびに作っていた（メモリ DC と DIB セクションの作成）。いまは upstream と同じく、画面の DC（とそれと互換のメモリ DC）に描くときは、スレッドごとに 1 枚を使い回す（upstream の `CThreadLocalInfo` の `CBitmapCache`、`cache.cpp`）。
+
+* 予備が小さければ、両方を覆う大きさで作り直す。
+* 256 回使うごとに、予備が描画より大きければ、描画の大きさで作り直す（upstream の `BITMAP_REDUCE_COUNTER`）。一度だけの大きな描画のために大きな DIB が居座らない。
+* 4MB（1024 × 1024）を超える DIB は予備にせず、その場で解放する（upstream には無い）。
+* 残るもの: 画面の DC に文字を描いたスレッドごとに、メモリ DC 1 つと DIB セクション 1 つ（4MB まで）。スレッドの終了時に解放する。DLL はアンロードしない（常駐固定）ので、スレッドローカルの後始末のコードは必ず残っている。
+* プリンタとメタファイルの DC には、これまでどおり毎回その DC と互換の DIB を作る。
+
+実測（`verify/gdi-perf`、交互に 5 回の中央値）: 約 573ms → 約 499ms。描いた結果はピクセル単位で同じ。
+
 残りの時間の大半は、キャッシュ以外の処理にかかっている。GDI では 1 ピクセルごとの合成・描くたびの DIB の作成・DC との転送、Direct2D ではランごとの `CreateBitmap`。これらは挙動に関わるので、キャッシュとは別に扱う。
 
 `BitBlt` も論理座標を取るので、DIB の出し入れの前後で DC を `SaveDC` → `MM_TEXT` + `GM_COMPATIBLE` + 恒等変換 → `RestoreDC` に挟む。0.1.8 まではこれをしておらず、写像のかかった DC では位置と大きさだけ `BitBlt` の引き伸ばしで偶然合い、**調整したグリフが最近傍拡大で潰れていた**（実測: 2 倍の DC で出力の 2×2 ブロックが一様 96 / 混在 0。素の GDI は同条件で混在 105）。素の GDI より悪い状態だった。
