@@ -88,6 +88,18 @@ impl Tables {
         let linear = self.encode[usize::from(bg)] * (1.0 - a) + self.encode[usize::from(fg)] * a;
         self.decode(linear)
     }
+
+    /// The coverage → opacity curve that reproduces `blend` when the caller
+    /// composites a coverage mask itself with a plain alpha blend (Direct2D's
+    /// `FillOpacityMask`): exact for dark ink on white, or for light ink on
+    /// black when `light_ink`; close in between.
+    pub fn mask_alpha(&self, cov: u8, light_ink: bool) -> u8 {
+        if light_ink {
+            self.blend(0, 255, cov)
+        } else {
+            255 - self.blend(255, 0, cov)
+        }
+    }
 }
 
 #[cfg(test)]

@@ -32,16 +32,22 @@ FreeType 自体はフォークの `freetype64.lib` を変更せず再利用す�
         GetAlphaTextureBounds / CreateAlphaTexture / GetAlphaBlendParams）
       d2d1!D2D1CreateFactory / D2D1CreateDevice / D2D1CreateDeviceContext をフックし、
         ID2D1Factory1..7::CreateDevice → ID2D1Device..6::CreateDeviceContext →
-        全ターゲットで DrawGlyphRun (29) / 記述付き DrawGlyphRun (82) /
-        SetTextAntialiasMode (34) / SetTextRenderingParams (36)
+        全ターゲットで DrawText (27) / DrawTextLayout (28) / DrawGlyphRun (29) /
+        記述付き DrawGlyphRun (82) / SetTextAntialiasMode (34) /
+        SetTextRenderingParams (36)
+        （d2d1 が注入前に読み込まれていれば、試しのファクトリと描画先で
+        共有 vtable を先にパッチ）
   → テキスト描画ごとに:
       DC / グリフラン からフォントを解決（TTC は GetFontData 'ttcf'、
         または IDWriteFontFace のファイルバイト + index）
       render-core で描画（プロファイルに応じ grey/LCD）し、DC の既存ピクセルに重ねる
       blit で書き戻し、OS ラスタライザを飛ばす
-  → GDI DC を貸せない Direct2D ターゲット（DXGI サーフェス）: DrawGlyphRun は
-      プロファイルの [DirectWrite] IDWriteRenderingParams、グレースケール/ClearType
-      のアンチエイリアスモード、grid fit 無効時の 1/65535 変換ずらしで OS に描かせる
+  → Direct2D の文字: render-core の濃淡を A8 ビットマップにし、アプリのブラシで
+      FillOpacityMask させる（クリップ・レイヤー・変換は Direct2D が適用）。
+      DrawTextLayout / DrawText は自前の IDWriteTextRenderer で glyph run に分解
+  → 濃淡のマスクで描けないもの（ClearType のプロファイル、aliased、回転、
+      カラーグリフ）: プロファイルの [DirectWrite] IDWriteRenderingParams、
+      アンチエイリアスモード、grid fit 無効時の 1/65535 変換ずらしで OS に描かせる
       — Direct2D 全体に対して upstream がやっていることと同じ
   → 動作中プロセスから決してアンロードされない（常駐固定）。DllMain の DETACH は
     プロセス終了時にだけ来る no-op
@@ -91,7 +97,8 @@ retour はパッチ中に他スレッドを止めないので、`install_hook` �
 | DirectWrite `IDWriteBitmapRenderTarget::DrawGlyphRun`（vtbl 3） | あり | **完了** |
 | DirectWrite `CreateGlyphRunAnalysis` → `GetAlphaTextureBounds` / `CreateAlphaTexture` / `GetAlphaBlendParams`（WPF で実測。Chromium/Skia も通るが注入できない）、`IDWriteFactory2`/`3` の overload 含む | あり | **完了**（範囲と濃淡は render-core。描けない変換は upstream と同じくプロファイルの描画モードで OS に作らせる） |
 | Direct2D `ID2D1RenderTarget::DrawGlyphRun`（vtbl 29） | あり | **完了**（`D2D1CreateFactory` → RT 生成 → vtable ごとのパッチ経由） |
-| Direct2D `DrawGlyphRun1`（vtbl 82）/ `ID2D1DeviceContext` | あり | **完了**（`D2D1CreateDevice`、`D2D1CreateDeviceContext`、`ID2D1Factory1..7::CreateDevice`、`ID2D1Device..6::CreateDeviceContext`）。GDI DC を貸せる所は render-core、そうでなければ upstream の rendering-params 経路 |
+| Direct2D `DrawGlyphRun1`（vtbl 82）/ `ID2D1DeviceContext` | あり | **完了**（`D2D1CreateDevice`、`D2D1CreateDeviceContext`、`ID2D1Factory1..7::CreateDevice`、`ID2D1Device..6::CreateDeviceContext`）。グレースケールで描けるものは render-core の濃淡を `FillOpacityMask`、そうでなければ upstream の rendering-params 経路 |
+| Direct2D `DrawText`（vtbl 27）/ `DrawTextLayout`（vtbl 28） | あり | **完了**（自前の `IDWriteTextRenderer` で glyph run に分解。Notepad++ / Scintilla で実測） |
 | Direct2D `SetTextAntialiasMode` (34) / `SetTextRenderingParams` (36) をプロファイルに強制 | あり | **完了** |
 | `DWriteCreateFactory` / `GetGdiInterop` | あり | 不要: upstream はこれらを共有 vtable に到達するためだけに使う。我々は自前の factory から直接その vtable をパッチする |
 | `CreateTextFormat` / `CreateFontFace`（upstream の `[FontSubstitutes]` フォント置換） | あり | **判断で未移植**: Font-tuner はトレイのシステムフォント切替でフォントを置換する。出荷プロファイルはすべて `FontSubstitutes=0` |

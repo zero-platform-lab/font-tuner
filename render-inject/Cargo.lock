@@ -303,6 +303,7 @@ dependencies = [
  "render-core",
  "retour",
  "windows",
+ "windows-core",
  "windows-numerics",
 ]
 

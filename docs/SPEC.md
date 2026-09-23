@@ -36,7 +36,8 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 * **スレッド安全なパッチ** — retour は対象の先頭バイトを書き換える間、他スレッドを止めない。そこで `install_hook` はパッチの前後でプロセス内の他スレッドを全部凍結し（`CreateToolhelp32Snapshot` + `SuspendThread`）、後で再開する。MinHook が内部で閉じている窓と同じ。
 * **アタッチは一度だけ** — WH_GETMESSAGE のマップと別のロードで、DLL が 1 プロセス内に 2 つのモジュールインスタンスになりうる。プロセスごとの名前付きミューテックス（`Local\FontTuner.Attached.<pid>`）で最初のアタッチだけがフックするようにし、2 度目のアタッチが自分のジャンプの上に detour を張ってトランポリンを壊すのを防ぐ。
 * **一度きりの vtable パッチ**は直列化する。対象は解析オブジェクトの 3 スロット（`GetAlphaTextureBounds` / `CreateAlphaTexture` / `GetAlphaBlendParams`）と、Direct2D の全生成スロットとテキストスロット。解析オブジェクトは `Once` で、Direct2D はミューテックスの下で再確認する。さもないと競合する 2 スレッドが両方ともパッチ済みスロットから「元の関数」を捕まえ、detour が自分自身を呼ぶ → 無限再帰。Direct2D のスロットは (vtable, slot) を鍵にした 1 つのマップで管理する。レンダーターゲットのクラスごとに vtable が違うため。
-* **Direct2D への到達** — `render-inject/src/d2d.rs` が upstream の生成チェーンを辿る。入口は `D2D1CreateFactory`・`D2D1CreateDevice`・`D2D1CreateDeviceContext` の 3 つ。`D2D1CreateFactory` からは `CreateHwnd/DC/WicBitmapRenderTarget` と `ID2D1Factory1..7::CreateDevice` に至る。`D2D1CreateDevice` からは `ID2D1Device..6::CreateDeviceContext` に至る。各ターゲットで `CreateCompatibleRenderTarget`（12）・`DrawGlyphRun`（29）・記述付きの overload（82）・`SetTextAntialiasMode`（34）・`SetTextRenderingParams`（36）をパッチする。12 はオフスクリーンのビットマップターゲットを生成時にフックするため。フォント処理の前に `GetDC` を試すので、DC を貸せないターゲットは試行以上のコストがかからない。GDI DC を貸せるターゲットはランを render-core で描く。貸せないターゲット（DXGI サーフェス: スワップチェーン、コンポジション）は OS に描かせる。その際、プロファイルの `[DirectWrite]` `IDWriteRenderingParams` と、`AntiAliasMode` から導いたアンチエイリアスモードを渡す。`HintingMode=1` のときは upstream と同じ 1/65535 の変換ずらしも加える。スロット番号は `windows` クレートの vtable 定義で照合した。
+* **Direct2D への到達** — `render-inject/src/d2d.rs` が upstream の生成チェーンを辿る。入口は `D2D1CreateFactory`・`D2D1CreateDevice`・`D2D1CreateDeviceContext` の 3 つ。`D2D1CreateFactory` からは `CreateHwnd/DC/WicBitmapRenderTarget` と `ID2D1Factory1..7::CreateDevice` に至る。`D2D1CreateDevice` からは `ID2D1Device..6::CreateDeviceContext` に至る。各ターゲットでパッチするスロットは 7 つ。生成系の `CreateCompatibleRenderTarget`（12）、描画系の `DrawText`（27）・`DrawTextLayout`（28）・`DrawGlyphRun`（29）・記述付きの overload（82）。設定系の `SetTextAntialiasMode`（34）・`SetTextRenderingParams`（36）。ターゲットの `ID2D1DeviceContext` の vtable が別なら、そちらにも同じものを当てる。12 はオフスクリーンのビットマップターゲットを生成時にフックするため。27 と 28 は upstream もフックしている。Scintilla（Notepad++）の文字はすべて `DrawTextLayout` を通り、`DrawGlyphRun` を通らない（実測とソース）。0.1.10 までは 27 と 28 が無く、params の差し替えすら効いていなかった。スロット番号は `windows` クレートの vtable 定義で照合した。描き方は 1.5 の「Direct2D の文字」。
+* **注入前に作られた Direct2D のオブジェクト** — コアが入るのは、アプリが最初にメッセージを取りに来たとき。それより前に作られたファクトリや描画先は、生成のフックを通らない。Notepad++ は起動直後にファクトリを作り、HWND 用の描画先も最初の描画（`UpdateWindow` がメッセージキューを通さずに送る `WM_PAINT`）で作る（実測）。そこでアタッチ時に d2d1.dll がすでに読み込まれていれば、コア自身がファクトリ（シングル / マルチスレッド）と DC 用・HWND 用の描画先を 1 つずつ作る（HWND 用はメッセージ専用ウィンドウで作り、その場で破棄する）。これらはフック済みの入口を通るので、同じクラスの vtable がパッチされ、アプリが持っているオブジェクトにも届く。DXGI サーフェスのデバイスコンテキストは Direct3D のデバイスが要るので試さない。こちらは注入後に作られたものにだけ届く。
 * **再入**はスレッドごとに（`thread_local`）ガードする。あるスレッドの描画が、別スレッドの描画を未調整の GDI 経路に落とすことはない。
 * **トレイのフック設置ガード**（`Hook::install`、`src/stale.rs`）— `LoadLibraryW` の前に確認する。コアをロードするとトレイ自身に常駐固定とフックがかかるためだ。トレイは 2 点を見る。(a) ディスク上のファイルからコアの `GetMsgProc` が RVA `0x1000` にあること。(b) 同じパスのコアを `GetMsgProc` が別の場所にある状態で保持する動作中プロセスが無いこと。(b) の判定は Toolhelp のモジュール走査とそのイメージの export テーブルの `ReadProcessMemory` で行う。モジュールはあるがイメージを読めないプロセスは stale 扱いにする（その間に終了していれば除く）。別ディレクトリから読み込んだコピー（`loader` ハーネス）は問題ない。Windows はフック DLL をパスで解決し、インストール済みのものを別イメージとしてマップし、アタッチ一度きりミューテックスが 2 つ目を不活性にするからだ。どちらの確認が失敗してもエラーを出してフックを張らない。(b) ではメッセージが該当プログラムを列挙し、サインアウトして入り直す（または再起動する）よう促す。コアが常駐固定なので、それが stale なイメージを消す唯一の方法だからだ。トレイが開けないプロセス（別ユーザーやより高い整合性レベル）はトレイのフックも届かないので、飛ばしても安全。
 
@@ -59,7 +60,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | 再入 | `thread_local! IN_DETOUR: Cell<bool>` | 自分の GDI 呼び出しが自分の detour に入ることがある | スレッドごとにガードする。プロセス全体のフラグにすると、あるスレッドの描画中に他スレッドが未調整の GDI に落ちて窓ごとに見た目が違う |
 | 描画状態 | `static RENDER: Mutex<Option<RenderState>>`（`Ft` + `Tables` + `Profile` + 現在のフォント鍵） | — | 1 プロセスに FreeType ライブラリと面は 1 つ。描画はロックの下で直列。プロファイル再読み込みも同じロック |
 | DirectWrite（`dwrite.rs`、`layout.rs`） | `IDWriteBitmapRenderTarget::DrawGlyphRun`、`IDWriteFactory{,2,3}::CreateGlyphRunAnalysis` の vtable スロット | `windows` クレートの vtable 定義とスロット番号が一致すること（照合済み）。ランの配列は `glyphCount` 要素（null の `glyphAdvances` / `glyphOffsets` は読まない） | 一度きりのパッチはミューテックスで直列化。`IDWriteFontFace` の bytes + index で面を開き、その COM オブジェクトを `RenderState` が clone で保持してアドレスの再利用を防ぐ。OS に描かせるときの params は、呼び出しの間 clone を持ち続ける（プロファイルの再読み込みで解放されないように） |
-| Direct2D（`d2d.rs`） | `D2D1CreateFactory` / `D2D1CreateDevice` / `D2D1CreateDeviceContext` と各ターゲットの vtable スロット 12 / 29 / 82 / 34 / 36 | 同上 | (vtable, slot) → 元関数のマップ `SLOT_ORIG` を 1 つのミューテックスで管理。`GetDC` を貸せないターゲットは OS に描かせる |
+| Direct2D（`d2d.rs`） | `D2D1CreateFactory` / `D2D1CreateDevice` / `D2D1CreateDeviceContext` と各ターゲットの vtable スロット 12 / 27 / 28 / 29 / 82 / 34 / 36。`IDWriteTextRenderer` の実装（`windows::core::implement`） | 同上 | (vtable, slot) → 元関数のマップ `SLOT_ORIG` を 1 つのミューテックスで管理。濃淡のビットマップを塗るあいだだけターゲットの変換・アンチエイリアスとブラシの変換を差し替え、必ず戻す |
 | 自己常駐固定 | `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN)` | — | `DllMain(DLL_PROCESS_ATTACH)` で最初に行う。以降 `FreeLibrary` は no-op |
 | ログ | `%TEMP%\render-inject.log` に追記 | — | ロック付き。初回の描画結果を `render-inject-capture.png` に保存する（検証用） |
 
@@ -105,6 +106,22 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 自前で描けない解析オブジェクト（回転・せん断の変換など）は DirectWrite に作らせる。upstream の `IMPL_CreateGlyphRunAnalysis{,2,3}` と同じく、プロファイルの描画モード・グリッドフィット（`HintingMode=1` なら 1/65535 のずらし）で作らせ、拒まれたらアプリの引数に戻す。`GetAlphaBlendParams` は upstream と同じく、プロファイルの params に対する合成の値を返す。
 
 自前で描けないラン（上記の変換、フォントファイルを読めない、プロファイルが無い）は DirectWrite に描かせる。そのときは upstream の `IMPL_BitmapRenderTarget_DrawGlyphRun` と同じく、アプリの rendering params の代わりにプロファイルの `[DirectWrite]` の params を渡す。`HintingMode=1` なら 1/65535 の変換ずらしも加える。DirectWrite が拒めば、ずらしなし、次にアプリの params のままで呼び直す。
+
+**Direct2D の文字** — Direct2D の描画先には、クリップ・レイヤー・変換・グラデーションなどのブラシ・半透明がある。GDI の DC を借りて描くと、これらが全部抜け落ちる。0.1.10 までの実装は `ID2D1GdiInteropRenderTarget::GetDC` で DC を借りて描いていた。素の Direct2D と比べると、5 文字が幅 24px に重なり、クリップ・グラデーション・半透明・DPI・変換を無視していた。不透明度 50% のレイヤーでは描画範囲の外まで灰色で塗っていた（`verify/d2d-probe` で実測）。
+
+いまは、ランを上と同じ規則で配置して render-core で描き、その濃淡を A8 のビットマップにする。それを描画先に `FillOpacityMask` でアプリのブラシのまま塗らせる。クリップやレイヤーは Direct2D がそのまま適用する。ビットマップはデバイスピクセルで作るので、塗るあいだだけ描画先の変換を単位行列にし、その変換をブラシの変換に畳み込む（グラデーションの位置が変わらない）。濃淡は `Tables::mask_alpha` でプロファイルのガンマとコントラストを通した不透明度にする。暗い文字を白に重ねた場合は GDI の合成と一致する。単色の明るいブラシなら、白い文字を黒に重ねた場合と一致する。`DrawTextLayout` と `DrawText` は、自前の `IDWriteTextRenderer` でレイアウトを glyph run に分解して描く。下線と取り消し線は塗りつぶしの矩形にし、範囲ごとのブラシ（`SetDrawingEffect`）はそのブラシで塗り、埋め込みオブジェクトには自分で描かせる。スナップと DPI は描画先の値を答える。`DrawText` は、Direct2D と同じくレイアウト矩形でテキストレイアウトを作る（GDI の計測モードでは GDI 互換のレイアウト）。
+
+濃淡のマスクはグレースケールしか表せない。そこで次のものは Direct2D に描かせる。upstream と同じく、プロファイルの params・アンチエイリアスモード・グリッドフィットのずらしを付ける。
+
+* ClearType（LCD）のプロファイル
+* aliased の文字
+* 回転・せん断・鏡像の変換
+* `ENABLE_COLOR_FONT` でカラーグリフを含むレイアウト（カラーの層に分けるのは Direct2D 自身のレイアウト描画だけ）
+* フォントファイルを読めないラン
+
+実測（`verify/d2d-probe`、DC 用の描画先、25 ケース）: インクの端はすべて素の Direct2D と 1px 以内。クリップ・グラデーション・半透明のブラシ・不透明度 50% のレイヤー・範囲ごとの色・下線と取り消し線・右から左の段落・折り返し・`CLIP` 付きのレイアウト・カラー絵文字が素の Direct2D と揃った。Notepad++ 8.9.8（Scintilla の DirectWrite モードと DirectWrite DC モード）でも自前で描かれ、見た目がコアの GDI 経路と揃った。
+
+速さは課題として残っている。同じ 19 文字のランを 500 回描くと、素の Direct2D は約 7ms、こちらは約 350ms かかった（実測）。グリフのキャッシュが無く、描くたびに FreeType でラスタライズし直すため（GDI 経路も同じ）。
 
 `BitBlt` も論理座標を取るので、DIB の出し入れの前後で DC を `SaveDC` → `MM_TEXT` + `GM_COMPATIBLE` + 恒等変換 → `RestoreDC` に挟む。0.1.8 まではこれをしておらず、写像のかかった DC では位置と大きさだけ `BitBlt` の引き伸ばしで偶然合い、**調整したグリフが最近傍拡大で潰れていた**（実測: 2 倍の DC で出力の 2×2 ブロックが一様 96 / 混在 0。素の GDI は同条件で混在 105）。素の GDI より悪い状態だった。
 

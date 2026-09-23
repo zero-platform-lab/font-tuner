@@ -10,7 +10,6 @@
 
 use core::ffi::c_void;
 use std::collections::{HashMap, VecDeque};
-use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, Once, OnceLock};
 
@@ -31,7 +30,7 @@ use crate::dib::Dib;
 use crate::hook::patch_slot;
 use crate::layout::{self, Mapping};
 use crate::log;
-use crate::state::{orig, round_i32, RenderState, CAPTURED, RENDER};
+use crate::state::{orig, RenderState, CAPTURED, RENDER};
 
 // ---- Rendering params for the text the OS still draws ----
 
@@ -163,45 +162,7 @@ fn custom_params(f: &IDWriteFactory, w: &ParamsWanted) -> Option<IDWriteRenderin
     }
 }
 
-// ---- Glyph runs ----
-
-/// A `DWRITE_GLYPH_RUN` with its pointers turned into borrows.
-pub(crate) struct GlyphRun<'a> {
-    pub(crate) face: &'a IDWriteFontFace,
-    pub(crate) glyphs: &'a [u16],
-    pub(crate) advances: Option<&'a [f32]>,
-    /// Em size in pixels, rounded.
-    pub(crate) px: i32,
-}
-
-impl GlyphRun<'_> {
-    /// Borrow the run behind `r`, if it has a face and glyphs.
-    ///
-    /// # Safety
-    /// `r` must be a run DirectWrite handed to a `DrawGlyphRun` /
-    /// `CreateGlyphRunAnalysis` call: `glyphIndices` (and `glyphAdvances`
-    /// when non-null) hold `glyphCount` entries for the call's duration.
-    pub(crate) unsafe fn borrow(r: &DWRITE_GLYPH_RUN) -> Option<GlyphRun<'_>> {
-        let face = r.fontFace.deref().as_ref()?;
-        let n = r.glyphCount as usize;
-        if n == 0 || r.glyphIndices.is_null() {
-            return None;
-        }
-        // SAFETY: per the contract above.
-        let (glyphs, advances) = unsafe {
-            (
-                core::slice::from_raw_parts(r.glyphIndices, n),
-                (!r.glyphAdvances.is_null()).then(|| core::slice::from_raw_parts(r.glyphAdvances, n)),
-            )
-        };
-        Some(GlyphRun { face, glyphs, advances, px: round_i32(r.fontEmSize) })
-    }
-
-    /// Make `st`'s FreeType face this run's font, unless it already is.
-    pub(crate) fn reface(&self, st: &mut RenderState, prefix: &str) -> Option<()> {
-        reface(st, self.face, prefix)
-    }
-}
+// ---- Fonts ----
 
 /// Make `st`'s FreeType face `face`'s font, unless it already is. Keyed on
 /// the face's address (pinned by the clone `RenderState` keeps) and index.

@@ -27,6 +27,7 @@ strip = true
 [dependencies]
 render-core = { path = "../render-core" }
 retour = "0.4.0-alpha.4"
+windows-core = "0.62"
 windows-numerics = "0.3"
 
 [dependencies.windows]
@@ -38,6 +39,7 @@ features = [
   "Win32_Graphics_DirectWrite",
   "Win32_Graphics_Direct2D",
   "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_Dxgi_Common",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Threading",
