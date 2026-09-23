@@ -54,10 +54,10 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Brush, ID2D1Device, ID2D1Device1, ID2D1Device2, ID2D1Device3, ID2D1Device4, ID2D1Device5,
     ID2D1Device6, ID2D1DeviceContext, ID2D1Factory, ID2D1Factory1, ID2D1Factory2, ID2D1Factory3, ID2D1Factory4,
-    ID2D1Factory5, ID2D1Factory6, ID2D1Factory7, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
+    ID2D1Factory5, ID2D1Factory6, ID2D1Factory7, ID2D1Multithread, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_ALIASED,
     D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
     D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_FACTORY_TYPE_MULTI_THREADED, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_OPACITY_MASK_CONTENT_TEXT_NATURAL, D2D1_RENDER_TARGET_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE,
+    D2D1_OPACITY_MASK_CONTENT_TEXT_NATURAL, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_TEXT_ANTIALIAS_MODE,
     D2D1_TEXT_ANTIALIAS_MODE_ALIASED, D2D1_UNIT_MODE_PIXELS,
 };
 use windows::Win32::Graphics::DirectWrite::{
@@ -665,6 +665,14 @@ fn fill_mask(rt: &ID2D1RenderTarget, brush: &ID2D1Brush, rect: Rect, mask: &[u8]
     // bytes (one per pixel) and outlives the CreateBitmap call, which copies it.
     unsafe {
         let bitmap = rt.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(mask.as_ptr().cast()), w, &raw const props).ok()?;
+        // The target's transform and antialias mode and the brush's transform
+        // are changed for the fill and put back. With a multithreaded factory
+        // another thread may use the same brush or target meanwhile, so hold
+        // Direct2D's own lock (reentrant) across the whole sequence.
+        let lock = rt.GetFactory().ok().and_then(|f| f.cast::<ID2D1Multithread>().ok()).filter(|m| m.GetMultithreadProtected().as_bool());
+        if let Some(m) = &lock {
+            m.Enter();
+        }
         let (mut t, mut bt) = (Matrix3x2::default(), Matrix3x2::default());
         rt.GetTransform(&raw mut t);
         brush.GetTransform(&raw mut bt);
@@ -677,6 +685,9 @@ fn fill_mask(rt: &ID2D1RenderTarget, brush: &ID2D1Brush, rect: Rect, mask: &[u8]
         rt.SetAntialiasMode(aa);
         rt.SetTransform(&raw const t);
         brush.SetTransform(&raw const bt);
+        if let Some(m) = &lock {
+            m.Leave();
+        }
     }
     Some(())
 }
@@ -694,7 +705,7 @@ fn draw_layout(rt: &ID2D1RenderTarget, origin: Vector2, layout: &IDWriteTextLayo
     target_mapping(rt)?;
     let snap_off = options & D2D1_DRAW_TEXT_OPTIONS_NO_SNAP.0 != 0;
     if options & D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT.0 != 0 {
-        let scan: IDWriteTextRenderer = Renderer { rt: rt.clone(), brush: brush.clone(), snap_off, scan: Some(Cell::new(false)) }.into();
+        let scan: IDWriteTextRenderer = Renderer::new(rt, brush, snap_off, true).into();
         // SAFETY: walking a live layout with our renderer.
         unsafe { layout.Draw(None, &scan, origin.X, origin.Y) }.ok()?;
         // SAFETY: `scan` is the Renderer made just above.
@@ -709,12 +720,16 @@ fn draw_layout(rt: &ID2D1RenderTarget, origin: Vector2, layout: &IDWriteTextLayo
             let r = D2D_RECT_F { left: origin.X, top: origin.Y, right: origin.X + layout.GetMaxWidth(), bottom: origin.Y + layout.GetMaxHeight() };
             rt.PushAxisAlignedClip(&raw const r, D2D1_ANTIALIAS_MODE_ALIASED);
         }
-        let renderer: IDWriteTextRenderer = Renderer { rt: rt.clone(), brush: brush.clone(), snap_off, scan: None }.into();
+        let renderer: IDWriteTextRenderer = Renderer::new(rt, brush, snap_off, false).into();
         let r = layout.Draw(None, &renderer, origin.X, origin.Y);
         if clip {
             rt.PopAxisAlignedClip();
         }
-        r.ok()
+        // A walk that failed part-way has already drawn some of the layout;
+        // handing it to Direct2D then would draw that part twice. Only a walk
+        // that drew nothing falls back.
+        // SAFETY: `renderer` is the Renderer made just above.
+        (r.is_ok() || renderer.as_impl().drew.get()).then_some(())
     }
 }
 
@@ -767,9 +782,15 @@ mod text_renderer {
         pub(super) brush: ID2D1Brush,
         pub(super) snap_off: bool,
         pub(super) scan: Option<Cell<bool>>,
+        /// Set once anything has been drawn.
+        pub(super) drew: Cell<bool>,
     }
 
     impl Renderer {
+        pub(super) fn new(rt: &ID2D1RenderTarget, brush: &ID2D1Brush, snap_off: bool, scan: bool) -> Renderer {
+            Renderer { rt: rt.clone(), brush: brush.clone(), snap_off, scan: scan.then(|| Cell::new(false)), drew: Cell::new(false) }
+        }
+
         /// The run's brush: its drawing effect when that is a brush (as in
         /// Direct2D's own layout drawing), else the default.
         fn brush_for(&self, effect: &Ref<IUnknown>) -> ID2D1Brush {
@@ -780,6 +801,7 @@ mod text_renderer {
             if self.scan.is_none() {
                 // SAFETY: a fill on a live target with a live brush.
                 unsafe { self.rt.FillRectangle(&raw const rect, &self.brush_for(effect)) };
+                self.drew.set(true);
             }
         }
     }
@@ -821,6 +843,7 @@ mod text_renderer {
                 return Ok(());
             }
             let brush = self.brush_for(&effect);
+            self.drew.set(true);
             if draw_run(&self.rt, baseline, r, &brush, measuring.0).is_none() {
                 // Not ours after all (an unreadable font): Direct2D's own draw.
                 let this = self.rt.as_raw();
@@ -859,8 +882,8 @@ mod text_renderer {
                 return Ok(());
             }
             let Some(object) = object.as_ref() else { return Ok(()) };
-            let me: IDWriteTextRenderer =
-                Renderer { rt: self.rt.clone(), brush: self.brush.clone(), snap_off: self.snap_off, scan: None }.into();
+            self.drew.set(true);
+            let me: IDWriteTextRenderer = Renderer::new(&self.rt, &self.brush, self.snap_off, false).into();
             // SAFETY: the inline object draws itself through our renderer.
             unsafe { object.Draw(Some(ctx), &me, x, y, sideways.as_bool(), rtl.as_bool(), effect.as_ref()) }
         }
@@ -938,7 +961,10 @@ pub(crate) fn setup_d2d_hook() {
 /// the first paint, which `UpdateWindow` sends before the message pump that
 /// brings the core in - measured with Notepad++).
 fn probe_vtables() {
+    // Software targets: the probes must not bring up a GPU device (a driver
+    // DLL load, under the loader lock, from every process that has Direct2D).
     let props = D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
         pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
         ..Default::default()
     };
@@ -954,7 +980,7 @@ fn probe_vtables() {
             made += u32::from(f.CreateDCRenderTarget(&raw const props).is_ok());
             if let Some(hwnd) = hwnd {
                 let hp = D2D1_HWND_RENDER_TARGET_PROPERTIES { hwnd, pixelSize: D2D_SIZE_U { width: 8, height: 8 }, ..Default::default() };
-                let base = D2D1_RENDER_TARGET_PROPERTIES::default();
+                let base = D2D1_RENDER_TARGET_PROPERTIES { r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE, ..Default::default() };
                 made += u32::from(f.CreateHwndRenderTarget(&raw const base, &raw const hp).is_ok());
             }
         }

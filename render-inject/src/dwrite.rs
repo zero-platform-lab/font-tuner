@@ -588,9 +588,11 @@ unsafe fn adopt_analysis(
     let key = analysis.addr();
     match entry {
         Some(e) => {
-            if all.map.insert(key, e).is_none() {
-                all.order.push_back(key);
+            // Newest last, whether new or overwriting a reused address.
+            if all.map.insert(key, e).is_some() {
+                all.order.retain(|&k| k != key);
             }
+            all.order.push_back(key);
             while all.map.len() > ANALYSES_CAP {
                 let Some(old) = all.order.pop_front() else { break };
                 all.map.remove(&old);
