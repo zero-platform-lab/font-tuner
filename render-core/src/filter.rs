@@ -14,7 +14,20 @@
 pub struct Tables {
     encode: [f32; 256], // byte -> linear light in [0, 1]  (gamma encode)
     curve: [f32; 256],  // coverage -> alpha in [0, 1]      (contrast/weight)
+    /// `mask_alpha` for dark and for light ink, precomputed (exact).
+    mask: [[u8; 256]; 2],
+    /// `decode` sampled at `DECODE_STEPS` + 1 points, even in the square root
+    /// of linear light (dense near black, where a steep gamma packs many
+    /// bytes into little light): the per-pixel inverse becomes one lookup
+    /// instead of a binary search.
+    decode_lut: Vec<u8>,
 }
+
+/// Resolution of `Tables::decode_lut`. Fine enough that the lookup stays
+/// within one level of the exact search for every blend of two bytes at any
+/// coverage in the profiles' gamma range (`decode_lut_matches_search`) - the
+/// same one level this port already allows against upstream.
+const DECODE_STEPS: usize = 1 << 14;
 
 /// sRGB electro-optical transfer: gamma-encoded byte value `x` in [0,1] to
 /// linear light.
@@ -55,7 +68,15 @@ impl Tables {
             };
             curve[usize::from(byte)] = a.clamp(0.0, 1.0);
         }
-        Tables { encode, curve }
+        let mut t = Tables { encode, curve, mask: [[0; 256]; 2], decode_lut: Vec::new() };
+        #[allow(clippy::cast_precision_loss)] // indices up to 2^14
+        let lut: Vec<u8> = (0..=DECODE_STEPS).map(|i| t.decode((i as f32 / DECODE_STEPS as f32).powi(2))).collect();
+        t.decode_lut = lut;
+        for cov in 0..=255u8 {
+            t.mask[0][usize::from(cov)] = 255 - t.blend(255, 0, cov);
+            t.mask[1][usize::from(cov)] = t.blend(0, 255, cov);
+        }
+        t
     }
 
     /// Decode a linear-light value to the gamma-encoded byte whose encoded
@@ -85,26 +106,57 @@ impl Tables {
         if a <= 0.0 {
             return bg;
         }
+        if a >= 1.0 {
+            return fg; // a glyph's solid interior: no light to mix
+        }
         let linear = self.encode[usize::from(bg)] * (1.0 - a) + self.encode[usize::from(fg)] * a;
-        self.decode(linear)
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)] // clamped to [0, 1] first
+        let i = (linear.clamp(0.0, 1.0).sqrt() * DECODE_STEPS as f32).round() as usize;
+        self.decode_lut[i]
     }
 
     /// The coverage → opacity curve that reproduces `blend` when the caller
     /// composites a coverage mask itself with a plain alpha blend (Direct2D's
     /// `FillOpacityMask`): exact for dark ink on white, or for light ink on
     /// black when `light_ink`; close in between.
+    #[inline]
     pub fn mask_alpha(&self, cov: u8, light_ink: bool) -> u8 {
-        if light_ink {
-            self.blend(0, 255, cov)
-        } else {
-            255 - self.blend(255, 0, cov)
-        }
+        self.mask[usize::from(light_ink)][usize::from(cov)]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lookup `blend` uses decodes to within one level of the exact
+    /// nearest-byte search, for every blend of two bytes (in steps of 5) at
+    /// every coverage, across the gamma modes and the shipped profiles'
+    /// gamma / weight / contrast ranges.
+    #[test]
+    fn decode_lut_matches_search() {
+        let mut worst = 0i32;
+        for (gamma, weight, contrast, mode) in
+            [(1.0, 1.0, 1.0, 0), (1.25, 1.0, 1.0, 0), (1.6, 1.2, 1.3, 0), (2.2, 0.8, 0.7, 0), (1.0, 1.0, 1.0, 1), (1.0, 1.0, 1.0, 2), (1.0, 1.0, 1.0, -1)]
+        {
+            let t = Tables::build(gamma, weight, contrast, mode);
+            for bg in (0..=255u8).step_by(5) {
+                for fg in (0..=255u8).step_by(5) {
+                    for cov in 0..=255u8 {
+                        let a = t.curve[usize::from(cov)];
+                        let exact = if a <= 0.0 {
+                            bg
+                        } else {
+                            t.decode(t.encode[usize::from(bg)] * (1.0 - a) + t.encode[usize::from(fg)] * a)
+                        };
+                        worst = worst.max((i32::from(t.blend(bg, fg, cov)) - i32::from(exact)).abs());
+                    }
+                }
+            }
+        }
+        assert!(worst <= 1, "lookup decode strays {worst} levels from the exact search");
+    }
+
     #[test]
     fn endpoints_and_monotone() {
         let t = Tables::build(1.25, 1.0, 1.0, 0);
