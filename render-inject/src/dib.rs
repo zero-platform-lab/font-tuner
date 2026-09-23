@@ -6,8 +6,9 @@ use core::ffi::c_void;
 
 use render_core::render::Canvas;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
-    BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, RestoreDC, SaveDC, SelectObject,
+    SetGraphicsMode, SetMapMode, SetWorldTransform, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GM_COMPATIBLE,
+    HBITMAP, HDC, HGDIOBJ, MM_TEXT, SRCCOPY, XFORM,
 };
 
 use crate::hook::struct_size;
@@ -78,16 +79,59 @@ impl Dib {
         canvas.blit_to_bgra_topdown(self.pixels());
     }
 
-    /// Copy the DC's pixels at (`x`, `y`) into the DIB.
+    /// Copy the DC's pixels at device (`x`, `y`) into the DIB.
     pub(crate) fn copy_from(&self, hdc: HDC, x: i32, y: i32) {
+        let _guard = DeviceUnits::of(hdc);
         // SAFETY: both DCs are live for the duration of the call.
         let _ = unsafe { BitBlt(self.memdc, 0, 0, self.w, self.h, Some(hdc), x, y, SRCCOPY) };
     }
 
-    /// Copy the DIB back onto the DC at (`x`, `y`).
+    /// Copy the DIB back onto the DC at device (`x`, `y`).
     pub(crate) fn copy_to(&self, hdc: HDC, x: i32, y: i32) {
+        let _guard = DeviceUnits::of(hdc);
         // SAFETY: as in `copy_from`.
         let _ = unsafe { BitBlt(hdc, x, y, self.w, self.h, Some(self.memdc), 0, 0, SRCCOPY) };
+    }
+}
+
+/// Puts a DC into device units (MM_TEXT, GM_COMPATIBLE, identity transform)
+/// for the life of the guard, and restores everything on drop.
+///
+/// `BitBlt` takes logical coordinates, so on a DC with a map mode or a world
+/// transform it would stretch the DIB instead of placing it pixel for pixel -
+/// which is exactly the blur this port used to produce. `SaveDC`/`RestoreDC`
+/// is the documented way to put the mapping back untouched, including the
+/// bits we never look at.
+struct DeviceUnits {
+    hdc: HDC,
+    saved: i32,
+}
+
+impl DeviceUnits {
+    fn of(hdc: HDC) -> DeviceUnits {
+        // SAFETY: `hdc` is the app's DC, live for the enclosing draw. Every
+        // change here is undone in `drop` by the matching RestoreDC.
+        let saved = unsafe { SaveDC(hdc) };
+        if saved != 0 {
+            let identity = XFORM { eM11: 1.0, eM12: 0.0, eM21: 0.0, eM22: 1.0, eDx: 0.0, eDy: 0.0 };
+            // SAFETY: as above; the transform is only meaningful in GM_ADVANCED,
+            // and SetGraphicsMode back to GM_COMPATIBLE needs it to be identity.
+            unsafe {
+                let _ = SetWorldTransform(hdc, &raw const identity);
+                let _ = SetGraphicsMode(hdc, GM_COMPATIBLE);
+                let _ = SetMapMode(hdc, MM_TEXT);
+            }
+        }
+        DeviceUnits { hdc, saved }
+    }
+}
+
+impl Drop for DeviceUnits {
+    fn drop(&mut self) {
+        if self.saved != 0 {
+            // SAFETY: restoring the state this guard saved on the same DC.
+            let _ = unsafe { RestoreDC(self.hdc, self.saved) };
+        }
     }
 }
 

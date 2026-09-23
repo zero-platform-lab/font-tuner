@@ -71,7 +71,13 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 
 **`TA_UPDATECP`** — 原点は引数の (x, y) ではなく DC の現在位置で、描画後にその位置が進む。`GetCurrentPositionEx` で取り、描画後に `MoveToEx` で進める（左揃えは GDI の実測幅ぶん進め、右揃えは戻し、中央揃えは動かさない。upstream と同じ）。0.1.7 までは引数の位置に描き、現在位置も動かさなかった（実測で x=120 のところを x=1 に描いていた）。
 
-**未対応の DC 属性** — MM_TEXT 以外のマップモードと、恒等でないワールド変換は読んでいない。upstream はズーム DC を変換して描く。こちらは何もしない。拡大縮小のかかった DC では位置や大きさがずれうる。**未検証**: 拡大した DC を作って素の GDI と比べる試験を書いたものの、試験側で拡大が反映されず判定できなかった。
+**論理座標と写像** — `ExtTextOutW` の座標・矩形・`lpDx` はすべて論理単位で、マップモード（`SetMapMode` + 窓/ビューポートの拡張）とワールド変換（`GM_ADVANCED` の `SetWorldTransform`）が効く。render-core はデバイスピクセルでラスタライズするので、写像のかかった DC ではランの全体をデバイス単位に換算してから描き、結果もデバイス単位で blit する（`xform.rs`、`dib.rs` の `DeviceUnits`）。
+
+写像は `LPtoDP` に 3 点通して復元する。gdi32 の未公開 export `GetTransform` は使わない（両者が一致することは実測で確認した）。線形部だけを見て、平行移動は見ない。正の軸平行スケール（`m12 == m21 == 0`、`m11 > 0`、`m22 > 0`）なら倍率を掛けて描き直し、回転・せん断・鏡像・退化した写像は素の `ExtTextOutW` に委ねる。upstream も同じ判断（`override.cpp` 1200-1217。その下の `GetMapMode` / `GetWorldTransform` を見るブロックはコメントアウトされた旧実装）。
+
+換算するもの: 原点（`LPtoDP`、平行移動込み）、アセント・ディセント・高さ・`em_px`（`sy` 倍）、幅と字間（`sx` 倍）、`ETO_OPAQUE` / `ETO_CLIPPED` の矩形、そして `lpDx`。`lpDx` は累積位置ベースで換算し、要素ごとに丸めて誤差を溜めない（upstream の `TransformlpDx` と同じ）。`TA_UPDATECP` の現在位置だけは論理単位なので、GDI の論理実測幅で進める。
+
+`BitBlt` も論理座標を取るので、DIB の出し入れの前後で DC を `SaveDC` → `MM_TEXT` + `GM_COMPATIBLE` + 恒等変換 → `RestoreDC` に挟む。0.1.8 まではこれをしておらず、写像のかかった DC では位置と大きさだけ `BitBlt` の引き伸ばしで偶然合い、**調整したグリフが最近傍拡大で潰れていた**（実測: 2 倍の DC で出力の 2×2 ブロックが一様 96 / 混在 0。素の GDI は同条件で混在 105）。素の GDI より悪い状態だった。
 
 **背景モード** — GDI は `SetBkMode(OPAQUE)`（既定）のとき、文字を描きながらその文字ボックスを背景色で塗る。同じ場所に値を描き直して更新するアプリ（Process Explorer の数値列）はこれに頼っている。render-core は既存のピクセルの上に合成するだけなので、コア側で塗りを再現する必要がある。`ETO_OPAQUE`（`lprect` を塗る）に加えて `GetBkMode(hdc) == OPAQUE` なら文字ボックス（`d.x` から幅ぶん、ベースライン - `tmAscent` から `tmHeight`）を背景色で塗ってから描く。幅は `dx` 配列があればその合計、無ければ `GetTextExtentPoint*` の実測。upstream も同じ判定（`override.cpp`: `fillrect || GetBkMode(hdc) == OPAQUE`）。これを見ていなかった 0.1.3 までは、Process Explorer の CPU 列などで古い数字が残って二重に見えた。
 

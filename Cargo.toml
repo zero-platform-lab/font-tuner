@@ -10,7 +10,7 @@ exclude = ["render-core", "render-inject", "loader"]
 # MSI. Bump it for every release - Windows Installer replaces a versioned file
 # only when the new version is higher.
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 
 [package]
 name = "font-tuner"

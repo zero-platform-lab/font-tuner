@@ -34,6 +34,7 @@ mod gdi_metrics;
 mod hook;
 mod profile;
 mod state;
+mod xform;
 
 use profile::{load_profile, reload_profile, RELOAD_MSG, RELOAD_MSG_NAME, SELF_HINST};
 use state::{RenderState, RENDER};

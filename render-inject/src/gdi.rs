@@ -27,6 +27,7 @@ use crate::dib::Dib;
 use crate::hook::install_hook;
 use crate::log;
 use crate::state::{orig, RenderState, CAPTURED, RENDER};
+use crate::xform;
 
 /// `ExtTextOutW(hdc, x, y, options, lprect, lpString, c, lpDx)`.
 type FnEto = unsafe extern "system" fn(HDC, i32, i32, u32, *const RECT, *const u16, u32, *const i32) -> BOOL;
@@ -219,13 +220,22 @@ fn draw_run(st: &mut RenderState, canvas: &mut Canvas, d: &Draw<'_>, ink: Ink, p
 
 /// Returns `Some(())` if we handled the draw, `None` to fall back to GDI.
 fn render_into_dc(d: &Draw<'_>) -> Option<()> {
+    // The DC's logical-to-device mapping. `None` means a rotation, shear or
+    // mirror, which render-core cannot lay out - GDI draws those itself.
+    let map = xform::mapping(d.hdc)?;
     let (tm, sz) = measure(d)?;
     // SAFETY: attribute reads on the app's DC.
     let (color, align, bk, bk_mode, extra) = unsafe {
         (GetTextColor(d.hdc).0, GetTextAlign(d.hdc).0, GetBkColor(d.hdc).0, GetBkMode(d.hdc), GetTextCharacterExtra(d.hdc))
     };
     // `SetTextCharacterExtra` widens every advance, on top of any lpDx.
-    let layout = Layout { dx: d.dx, extra };
+    // Both are logical units, so a scaled DC needs them converted; the
+    // converted `lpDx` has to be owned for the rest of the draw.
+    let device_dx = (!map.is_identity()).then(|| d.dx.map(|dx| map.device_dx(dx))).flatten();
+    let layout = Layout {
+        dx: device_dx.as_deref().or(d.dx),
+        extra: map.len_x(extra),
+    };
     // `TA_UPDATECP`: the origin is the DC's current position, not the (x, y)
     // arguments (which GDI ignores then), and the position advances by the
     // run afterwards. Without this the run landed at the arguments - x=1
@@ -243,26 +253,33 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     // centre-aligned text lands a whole string width away (measured: a
     // TA_RIGHT run drew at x..x+w instead of x-w..x). Same as upstream
     // (override.cpp `switch (horiz)` / `switch (vert)`).
-    let width = text_width(d, sz, layout);
+    // From here on everything is device pixels: that is what render-core
+    // rasterises in, and what the DIB is blitted back as. The origin goes
+    // through LPtoDP (translation included); lengths scale by the factors.
+    let (dox, doy) = map.to_device(ox, oy);
+    let (ascent, descent, height) = (map.len_y(tm.tmAscent), map.len_y(tm.tmDescent), map.len_y(tm.tmHeight));
+    let width = text_width(d, SIZE { cx: map.len_x(sz.cx), cy: map.len_y(sz.cy) }, layout);
     let left = match align & TA_HORZ_MASK {
-        TA_RIGHT => ox - width,
-        TA_CENTER => ox - width / 2,
-        _ => ox,
+        TA_RIGHT => dox - width,
+        TA_CENTER => dox - width / 2,
+        _ => dox,
     };
     let baseline = match align & TA_VERT_MASK {
-        TA_BASELINE => oy,
-        TA_BOTTOM => oy - tm.tmDescent,
-        _ => oy + tm.tmAscent,
+        TA_BASELINE => doy,
+        TA_BOTTOM => doy - descent,
+        _ => doy + ascent,
     };
 
     // Text-extent region, unioned with the rect so opaque fill / clip fit.
-    let (mut rx, mut ry) = (left, baseline - tm.tmAscent);
-    let (mut right, mut bottom) = (left + width + 6, ry + tm.tmHeight + 4);
-    if let Some((l, t, r, b)) = d.rect_tuple() {
-        rx = rx.min(l);
-        ry = ry.min(t);
-        right = right.max(r);
-        bottom = bottom.max(b);
+    let (mut rx, mut ry) = (left, baseline - ascent);
+    let (mut right, mut bottom) = (left + width + 6, ry + height + 4);
+    if let Some(rect) = d.rect_tuple() {
+        let (left_px, top_px) = map.to_device(rect.0, rect.1);
+        let (right_px, bottom_px) = map.to_device(rect.2, rect.3);
+        rx = rx.min(left_px);
+        ry = ry.min(top_px);
+        right = right.max(right_px);
+        bottom = bottom.max(bottom_px);
     }
 
     // Offscreen DIB seeded with the DC's current pixels; render-core draws
@@ -270,12 +287,15 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     let mut dib = Dib::new(d.hdc, right - rx, bottom - ry)?;
     dib.copy_from(d.hdc, rx, ry);
     let mut canvas = dib.canvas();
-    if let Some((l, t, r, b)) = d.rect_tuple() {
+    if let Some(rect) = d.rect_tuple() {
+        let (left_px, top_px) = map.to_device(rect.0, rect.1);
+        let (right_px, bottom_px) = map.to_device(rect.2, rect.3);
+        let box_px = (left_px - rx, top_px - ry, right_px - rx, bottom_px - ry);
         if d.options & ETO_OPAQUE != 0 {
-            canvas.fill_rect((l - rx, t - ry, r - rx, b - ry), rgb(bk));
+            canvas.fill_rect(box_px, rgb(bk));
         }
         if d.options & ETO_CLIPPED != 0 {
-            canvas.set_clip(Some((l - rx, t - ry, r - rx, b - ry)));
+            canvas.set_clip(Some(box_px));
         }
     }
     // `SetBkMode(OPAQUE)` — GDI's default — fills the text box with the
@@ -284,14 +304,14 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     // render-core composites over what is there, so do the fill ourselves.
     // Upstream does the same (override.cpp: `fillrect || GetBkMode == OPAQUE`).
     if bk_mode == OPAQUE.0.cast_signed() {
-        let (bx, by) = (left - rx, baseline - ry - tm.tmAscent);
-        canvas.fill_rect((bx, by, bx + width, by + tm.tmHeight), rgb(bk));
+        let (bx, by) = (left - rx, baseline - ry - ascent);
+        canvas.fill_rect((bx, by, bx + width, by + height), rgb(bk));
     }
     let ink = Ink { fg: rgb(color) };
     let pen = (left - rx, baseline - ry);
     // The render lock serialises every draw; it is held for this one
     // statement, while render-core touches the shared face.
-    let px = em_px(&tm);
+    let px = map.len_y(em_px(&tm));
     RENDER.lock().ok()?.as_mut().and_then(|st| draw_run(st, &mut canvas, d, ink, pen, px, layout))?;
     dib.blit(&canvas);
 
@@ -309,6 +329,8 @@ fn render_into_dc(d: &Draw<'_>) -> Option<()> {
     // width (the app measured with that, not with the tuned glyphs).
     // Upstream does the same: right-aligned moves back, centred does not move.
     if align & TA_UPDATECP != 0 {
+        // The current position is logical, so advance by GDI's own logical
+        // measurement rather than the device width used for drawing.
         let nx = match align & TA_HORZ_MASK {
             TA_RIGHT => ox - sz.cx,
             TA_CENTER => ox,
