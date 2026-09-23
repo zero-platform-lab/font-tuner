@@ -9,14 +9,13 @@
 //! boundary; the rendering after that is safe code.
 
 use core::ffi::c_void;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+use std::sync::{Mutex, Once, OnceLock};
 
-use render_core::render::{glyph_run_coverage_lcd, render_placed, Ink};
-use render_core::{Aa, Profile};
+use render_core::render::{render_placed, Ink, RenderedRun};
+use render_core::{Aa, GlyphStyle, Placed, Profile};
 use windows::core::{Interface, HRESULT};
 use windows::Win32::Foundation::{E_FAIL, RECT};
 use windows::Win32::Graphics::DirectWrite::{
@@ -29,7 +28,7 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 
 use crate::dib::Dib;
-use crate::hook::{patch_slot, VTABLE_PATCH_LOCK};
+use crate::hook::patch_slot;
 use crate::layout::{self, Mapping};
 use crate::log;
 use crate::state::{orig, round_i32, RenderState, CAPTURED, RENDER};
@@ -51,6 +50,14 @@ pub(crate) struct DwRendering {
     pub(crate) params: IDWriteRenderingParams,
     /// For DirectWrite (`GetDWRenderingParams`).
     pub(crate) dw_params: IDWriteRenderingParams,
+    /// `GetDWParams()->RenderingMode` / `RenderingMode1` / `GridFitMode`,
+    /// for the glyph-run analyses DirectWrite still makes.
+    pub(crate) dw_mode: i32,
+    pub(crate) dw_mode1: i32,
+    pub(crate) grid_fit: i32,
+    /// `DWRITE_TEXT_ANTIALIAS_MODE` for new glyph-run analyses: greyscale
+    /// (1) for a greyscale profile, else ClearType (0). See `cgra2_detour`.
+    pub(crate) dw_aa: i32,
     /// `D2D1_TEXT_ANTIALIAS_MODE`: greyscale for a greyscale profile, else
     /// DEFAULT (ClearType).
     pub(crate) aa_mode: i32,
@@ -108,7 +115,16 @@ fn build_dw_rendering(p: &Profile) -> Option<DwRendering> {
         want
     };
     let dw_params = custom_params(&f, &dw_want)?;
-    Some(DwRendering { params, dw_params, aa_mode, grid_fit_disabled: grid_fit == DWRITE_GRID_FIT_MODE_DISABLED })
+    Some(DwRendering {
+        params,
+        dw_params,
+        dw_mode: dw_want.mode.0,
+        dw_mode1: dw_want.mode1.0,
+        grid_fit: grid_fit.0,
+        dw_aa: i32::from(!p.aa.is_lcd()),
+        aa_mode,
+        grid_fit_disabled: grid_fit == DWRITE_GRID_FIT_MODE_DISABLED,
+    })
 }
 
 /// The arguments to `CreateCustomRenderingParams`, in the union of the four
@@ -377,7 +393,21 @@ unsafe fn set_transform(this: *mut c_void, m: &DWRITE_MATRIX) -> bool {
     }
 }
 
-// ---- CreateGlyphRunAnalysis → CreateAlphaTexture (Chromium/Skia, VS Code) ----
+// ---- CreateGlyphRunAnalysis → GetAlphaTextureBounds / CreateAlphaTexture ----
+//
+// Apps that composite glyphs themselves (WPF, measured; Chromium/Skia, which
+// cannot load this DLL) ask DirectWrite for a glyph-run *analysis* and then
+// for its alpha texture. Every creation is laid out here (`layout.rs`) and
+// remembered by the analysis's address; its bounds and texture then come
+// from render-core, so the caller's buffer is sized from the same glyphs it
+// is filled with.
+//
+// Runs we cannot rasterise (a rotated or skewed transform) are left to
+// DirectWrite, created the way upstream's `IMPL_CreateGlyphRunAnalysis{,2,3}`
+// create them: with the profile's rendering mode and grid fit, and the
+// 1/65535 transform nudge when grid fitting is off, each step falling back to
+// the app's own arguments. Upstream's `IMPL_GetAlphaBlendParams` is ported
+// too: the blend values the caller composites with come from the profile.
 
 /// `IDWriteFactory::CreateGlyphRunAnalysis(run, pixelsPerDip, transform,
 /// renderingMode, measuringMode, baselineX, baselineY, out)`.
@@ -390,44 +420,140 @@ type FnCreateGlyphRunAnalysis = unsafe extern "system" fn(
 type FnCreateGlyphRunAnalysis2 = unsafe extern "system" fn(
     *mut c_void, *const DWRITE_GLYPH_RUN, *const DWRITE_MATRIX, i32, i32, i32, i32, f32, f32, *mut *mut c_void,
 ) -> HRESULT;
-/// `IDWriteGlyphRunAnalysis::CreateAlphaTexture(textureType, bounds, alphaValues, bufferSize)`.
+/// `IDWriteGlyphRunAnalysis::GetAlphaTextureBounds(textureType, bounds)` (slot 3).
+type FnGetAlphaTextureBounds = unsafe extern "system" fn(*mut c_void, i32, *mut RECT) -> HRESULT;
+/// `IDWriteGlyphRunAnalysis::CreateAlphaTexture(textureType, bounds, alphaValues, bufferSize)` (slot 4).
 type FnCreateAlphaTexture = unsafe extern "system" fn(*mut c_void, i32, *const RECT, *mut u8, u32) -> HRESULT;
+/// `IDWriteGlyphRunAnalysis::GetAlphaBlendParams(renderingParams, gamma,
+/// enhancedContrast, clearTypeLevel)` (slot 5).
+type FnGetAlphaBlendParams = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut f32, *mut f32, *mut f32) -> HRESULT;
 
 static ORIG_CGRA: OnceLock<FnCreateGlyphRunAnalysis> = OnceLock::new();
 static ORIG_CGRA2: OnceLock<FnCreateGlyphRunAnalysis2> = OnceLock::new();
 static ORIG_CGRA3: OnceLock<FnCreateGlyphRunAnalysis2> = OnceLock::new();
-/// Published before the vtable write, so `cat_detour` (which can only run
-/// once that write has happened) always finds it.
+static ORIG_GATB: OnceLock<FnGetAlphaTextureBounds> = OnceLock::new();
 static ORIG_CAT: OnceLock<FnCreateAlphaTexture> = OnceLock::new();
-/// Set *after* the vtable write. `patch_cat_vtable`'s lock-free fast path
-/// keys off this, not `ORIG_CAT`: between the two stores another thread
-/// would otherwise see "patched", skip, and get an untuned texture.
-static CAT_PATCHED: AtomicBool = AtomicBool::new(false);
-/// Analysis object address → the run it was made from.
-static ANALYSES: Mutex<Option<HashMap<usize, RunInfo>>> = Mutex::new(None);
-/// Analyses never followed by a CreateAlphaTexture would leak an entry each;
-/// past this many, the map is cleared (in-flight ones then draw untuned).
-const ANALYSES_CAP: usize = 4096;
-/// `DWRITE_TEXTURE_CLEARTYPE_3x1`.
-const TEXTURE_CLEARTYPE_3X1: i32 = 1;
+static ORIG_GABP: OnceLock<FnGetAlphaBlendParams> = OnceLock::new();
+/// The analysis vtable is patched from the first analysis any overload
+/// creates, once; `Once` also keeps two threads from both capturing a slot
+/// that already holds our detour.
+static ANALYSIS_VTABLE: Once = Once::new();
 
-struct RunInfo {
-    bytes: Vec<u8>,
-    index: u32,
-    glyphs: Vec<u16>,
-    px: i32,
-    baseline: (i32, i32),
+const SLOT_CGRA: usize = 23;
+const SLOT_CGRA2: usize = 30;
+const SLOT_CGRA3: usize = 31;
+const SLOT_GATB: usize = 3;
+const SLOT_CAT: usize = 4;
+const SLOT_GABP: usize = 5;
+/// `DWRITE_RENDERING_MODE_ALIASED` and `DWRITE_RENDERING_MODE1_ALIASED`.
+const MODE_ALIASED: i32 = 1;
+/// `DWRITE_GRID_FIT_MODE_DEFAULT` and `DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE`.
+const GRID_FIT_DEFAULT: i32 = 0;
+const AA_CLEARTYPE: i32 = 0;
+/// `DWRITE_TEXTURE_ALIASED_1x1` (one byte per pixel) and
+/// `DWRITE_TEXTURE_CLEARTYPE_3x1` (three).
+const TEXTURE_ALIASED_1X1: i32 = 0;
+const TEXTURE_CLEARTYPE_3X1: i32 = 1;
+/// The skew upstream adds to take DirectWrite off its grid-fitted path.
+const NUDGE: f32 = 1.0 / 65535.0;
+const IDENTITY: DWRITE_MATRIX = DWRITE_MATRIX { m11: 1.0, m12: 0.0, m21: 0.0, m22: 1.0, dx: 0.0, dy: 0.0 };
+
+/// An analysis we rasterise: the face (kept alive by the clone), the glyphs
+/// in device pixels, and the run once rendered (greyscale or not).
+struct Analysis {
+    face: IDWriteFontFace,
+    glyphs: Vec<Placed>,
+    style: GlyphStyle,
+    rendered: Option<(bool, RenderedRun)>,
+}
+
+/// Analysis address → what it was made from. An address is reused only after
+/// the analysis is released, and every creation passes a hook here that
+/// overwrites or removes its entry, so a stale entry is never read. Analyses
+/// are never announced as released, so the oldest entries are dropped past
+/// `ANALYSES_CAP` (an evicted analysis then falls back to DirectWrite for
+/// both its bounds and its texture, which stay consistent).
+struct Analyses {
+    map: HashMap<usize, Analysis>,
+    order: VecDeque<usize>,
+}
+
+// SAFETY: the only non-Send member is the IDWriteFontFace, and DirectWrite's
+// shared-factory objects are free-threaded; it is used only under the mutex.
+unsafe impl Send for Analyses {}
+
+static ANALYSES: Mutex<Option<Analyses>> = Mutex::new(None);
+const ANALYSES_CAP: usize = 256;
+
+/// `transform` with upstream's grid-fit nudge applied, written to `m`
+/// (identity plus the nudge when there is no transform).
+///
+/// # Safety
+/// `transform` must be null or point at a live matrix.
+unsafe fn nudged(transform: *const DWRITE_MATRIX, m: &mut DWRITE_MATRIX) -> *const DWRITE_MATRIX {
+    // SAFETY: per the contract above.
+    *m = unsafe { transform.as_ref() }.copied().unwrap_or(IDENTITY);
+    m.m12 += NUDGE;
+    m.m21 += NUDGE;
+    m
+}
+
+/// Method `slot` of COM object `obj`, typed as `F`.
+///
+/// # Safety
+/// `obj` must be a live COM object whose vtable has `slot`, and `F` that
+/// method's exact function-pointer type.
+unsafe fn method<F: Copy>(obj: *mut c_void, slot: usize) -> F {
+    // SAFETY: per the contract above.
+    unsafe {
+        let vtbl = *obj.cast::<*const *const ()>();
+        std::mem::transmute_copy::<*const (), F>(&*vtbl.add(slot))
+    }
 }
 
 unsafe extern "system" fn cgra_detour(
     this: *mut c_void, run: *const DWRITE_GLYPH_RUN, ppd: f32, transform: *const DWRITE_MATRIX, rmode: i32, mmode: i32,
     bx: f32, by: f32, out: *mut *mut c_void,
 ) -> HRESULT {
-    // SAFETY: arguments forwarded untouched; `run`/`out` are then inspected
-    // under DirectWrite's contract for this call.
+    let dw = dw_rendering();
+    // SAFETY: `this` is the factory the app called; the other arguments are
+    // the app's, forwarded under DirectWrite's contract for this call.
     unsafe {
-        let hr = (orig(&ORIG_CGRA))(this, run, ppd, transform, rmode, mmode, bx, by, out);
-        record_analysis(hr, run, (bx, by), out);
+        // Upstream: prefer the Factory2 overload (called through the vtable,
+        // so it lands in `cgra2_detour`) with pixelsPerDip folded into the
+        // transform; else the profile's rendering mode here; else the app's
+        // own arguments.
+        let mut hr = E_FAIL;
+        if rmode != MODE_ALIASED {
+            if let Some(f2) = IDWriteFactory::from_raw_borrowed(&this).and_then(|f| f.cast::<IDWriteFactory2>().ok()) {
+                let m = match transform.as_ref() {
+                    Some(t) => DWRITE_MATRIX {
+                        m11: t.m11 * ppd,
+                        m12: t.m12 * ppd,
+                        m21: t.m21 * ppd,
+                        m22: t.m22 * ppd,
+                        dx: t.dx * ppd,
+                        dy: t.dy * ppd,
+                    },
+                    None => DWRITE_MATRIX { m11: ppd, m22: ppd, ..Default::default() },
+                };
+                let f: FnCreateGlyphRunAnalysis2 = method(f2.as_raw(), SLOT_CGRA2);
+                let aa = dw.as_ref().map_or(AA_CLEARTYPE, |d| d.dw_aa);
+                hr = f(f2.as_raw(), run, &raw const m, rmode, mmode, GRID_FIT_DEFAULT, aa, bx, by, out);
+            }
+        }
+        if let Some(d) = dw.as_ref().filter(|_| hr.is_err() && rmode != MODE_ALIASED) {
+            let mut m = IDENTITY;
+            let pm = if d.grid_fit_disabled { nudged(transform, &mut m) } else { transform };
+            hr = (orig(&ORIG_CGRA))(this, run, ppd, pm, d.dw_mode, mmode, bx, by, out);
+        }
+        if hr.is_err() {
+            hr = (orig(&ORIG_CGRA))(this, run, ppd, transform, rmode, mmode, bx, by, out);
+        }
+        // Factory 1's transform is in DIPs, scaled by pixelsPerDip after it
+        // (measured: ppd 1.5 with a (10, 5) translation puts the origin at
+        // (75, 97.5)).
+        adopt_analysis(hr, out, run, transform, ppd, (bx, by), mmode);
         hr
     }
 }
@@ -436,10 +562,42 @@ unsafe extern "system" fn cgra2_detour(
     this: *mut c_void, run: *const DWRITE_GLYPH_RUN, transform: *const DWRITE_MATRIX, rmode: i32, mmode: i32, grid: i32,
     aa: i32, bx: f32, by: f32, out: *mut *mut c_void,
 ) -> HRESULT {
+    let dw = dw_rendering();
+    // The profile decides the antialiasing, as it does for GDI text: a
+    // greyscale profile gets a greyscale analysis, whose only texture is the
+    // 1x1 one. (Upstream keeps the app's mode.) A ClearType 3x1 texture holds
+    // coverage at three subpixel positions, and callers shift it by
+    // subpixels to place glyphs at fractional positions (WPF does, measured),
+    // so a greyscale look cannot be delivered through it.
+    let aa_p = dw.as_ref().map_or(aa, |d| d.dw_aa);
     // SAFETY: as in `cgra_detour`.
     unsafe {
-        let hr = (orig(&ORIG_CGRA2))(this, run, transform, rmode, mmode, grid, aa, bx, by, out);
-        record_analysis(hr, run, (bx, by), out);
+        // Upstream: prefer the Factory3 overload (-> `cgra3_detour`); else the
+        // profile's rendering mode and grid fit here; else the app's modes with
+        // the grid-fit nudge; else the app's own arguments.
+        let mut hr = E_FAIL;
+        if rmode != MODE_ALIASED {
+            if let Some(f3) = IDWriteFactory::from_raw_borrowed(&this).and_then(|f| f.cast::<IDWriteFactory3>().ok()) {
+                let f: FnCreateGlyphRunAnalysis2 = method(f3.as_raw(), SLOT_CGRA3);
+                hr = f(f3.as_raw(), run, transform, rmode, mmode, grid, aa_p, bx, by, out);
+            }
+        }
+        if let Some(d) = dw.as_ref() {
+            if hr.is_err() && rmode != MODE_ALIASED {
+                hr = (orig(&ORIG_CGRA2))(this, run, transform, d.dw_mode, mmode, d.grid_fit, aa_p, bx, by, out);
+            }
+            if hr.is_err() {
+                let mut m = IDENTITY;
+                let pm = if d.grid_fit_disabled { nudged(transform, &mut m) } else { transform };
+                hr = (orig(&ORIG_CGRA2))(this, run, pm, rmode, mmode, grid, aa_p, bx, by, out);
+            }
+        }
+        if hr.is_err() {
+            hr = (orig(&ORIG_CGRA2))(this, run, transform, rmode, mmode, grid, aa, bx, by, out);
+        }
+        // Factories 2 and 3 take no pixelsPerDip: it is in the transform,
+        // whose translation is in pixels.
+        adopt_analysis(hr, out, run, transform, 1.0, (bx, by), mmode);
         hr
     }
 }
@@ -448,127 +606,198 @@ unsafe extern "system" fn cgra3_detour(
     this: *mut c_void, run: *const DWRITE_GLYPH_RUN, transform: *const DWRITE_MATRIX, rmode1: i32, mmode: i32, grid: i32,
     aa: i32, bx: f32, by: f32, out: *mut *mut c_void,
 ) -> HRESULT {
+    let dw = dw_rendering();
+    // The profile's antialiasing, as in `cgra2_detour`.
+    let aa_p = dw.as_ref().map_or(aa, |d| d.dw_aa);
     // SAFETY: as in `cgra_detour`.
     unsafe {
-        let hr = (orig(&ORIG_CGRA3))(this, run, transform, rmode1, mmode, grid, aa, bx, by, out);
-        record_analysis(hr, run, (bx, by), out);
+        // Upstream: the profile's rendering mode and grid fit; else the app's
+        // modes with the grid-fit nudge; else the app's own arguments.
+        let mut hr = E_FAIL;
+        if let Some(d) = dw.as_ref() {
+            if rmode1 != MODE_ALIASED {
+                hr = (orig(&ORIG_CGRA3))(this, run, transform, d.dw_mode1, mmode, d.grid_fit, aa_p, bx, by, out);
+            }
+            if hr.is_err() {
+                let mut m = IDENTITY;
+                let pm = if d.grid_fit_disabled { nudged(transform, &mut m) } else { transform };
+                hr = (orig(&ORIG_CGRA3))(this, run, pm, rmode1, mmode, grid, aa_p, bx, by, out);
+            }
+        }
+        if hr.is_err() {
+            hr = (orig(&ORIG_CGRA3))(this, run, transform, rmode1, mmode, grid, aa, bx, by, out);
+        }
+        adopt_analysis(hr, out, run, transform, 1.0, (bx, by), mmode);
         hr
     }
 }
 
-/// After any CreateGlyphRunAnalysis overload: remember the run behind the new
-/// analysis object and make sure its CreateAlphaTexture is ours.
+/// After a successful creation: make sure the analysis vtable is ours, then
+/// remember the run behind the new analysis — or forget whatever an earlier
+/// analysis at the same address left, when this run is DirectWrite's to draw.
 ///
 /// # Safety
-/// `run` and `out` are the call's arguments, valid for its duration.
-unsafe fn record_analysis(hr: HRESULT, run: *const DWRITE_GLYPH_RUN, baseline: (f32, f32), out: *mut *mut c_void) {
-    if !hr.is_ok() {
+/// The arguments are the creation call's: `out` holds the new analysis when
+/// `hr` succeeded, and `run` / `transform` are live for the call.
+unsafe fn adopt_analysis(
+    hr: HRESULT, out: *mut *mut c_void, run: *const DWRITE_GLYPH_RUN, transform: *const DWRITE_MATRIX, ppd: f32,
+    baseline: (f32, f32), mmode: i32,
+) {
+    if hr.is_err() {
         return;
     }
-    // SAFETY: per the contract above; `*out` is the new analysis object.
-    let (analysis, g) = unsafe {
-        let Some(analysis) = out.as_ref().copied().filter(|p| !p.is_null()) else { return };
-        let Some(g) = run.as_ref().and_then(|r| GlyphRun::borrow(r)) else { return };
-        (analysis, g)
-    };
-    let Some((bytes, index)) = font_bytes(g.face) else { return };
-    let info = RunInfo {
-        bytes,
-        index,
-        glyphs: g.glyphs.to_vec(),
-        px: g.px,
-        baseline: (round_i32(baseline.0), round_i32(baseline.1)),
-    };
-    if let Ok(mut m) = ANALYSES.lock() {
-        let map = m.get_or_insert_with(HashMap::new);
-        if map.len() >= ANALYSES_CAP {
-            map.clear();
-        }
-        map.insert(analysis.addr(), info);
-    }
-    patch_cat_vtable(analysis);
-}
-
-/// Patch `CreateAlphaTexture` (slot 4) in the analysis object's vtable, once.
-fn patch_cat_vtable(analysis: *mut c_void) {
-    if CAT_PATCHED.load(Ordering::Acquire) {
-        return; // fast path, no lock once patched
-    }
-    let _guard = VTABLE_PATCH_LOCK.lock();
-    if CAT_PATCHED.load(Ordering::Acquire) {
-        return; // re-check under the lock
-    }
-    // SAFETY: `analysis` is a live COM object, so its first word is its
-    // vtable and slot 4 is CreateAlphaTexture; the transmute types the
-    // previous slot value, which is that method.
-    let patched = unsafe {
-        let vtbl = *analysis.cast::<*mut *const ()>();
-        patch_slot(vtbl.add(4), cat_detour as *const (), |old| {
-            let _ = ORIG_CAT.set(std::mem::transmute::<*const (), FnCreateAlphaTexture>(old));
+    // SAFETY: per the contract above.
+    let Some(analysis) = (unsafe { out.as_ref() }).copied().filter(|p| !p.is_null()) else { return };
+    ANALYSIS_VTABLE.call_once(|| {
+        // SAFETY: `analysis` is live; slots 3-5 are the methods the types name.
+        unsafe { patch_analysis_vtable(analysis) };
+    });
+    // SAFETY: per the contract above.
+    let entry = unsafe {
+        let m = transform.as_ref().copied().unwrap_or(IDENTITY);
+        run.as_ref().zip(Mapping::new(&m, ppd)).and_then(|(r, map)| {
+            let face = r.fontFace.as_ref()?.clone();
+            let geo = layout::lay_out(r, baseline, &map, mmode)?;
+            Some(Analysis { face, glyphs: geo.glyphs, style: geo.style, rendered: None })
         })
     };
-    if patched {
-        CAT_PATCHED.store(true, Ordering::Release);
-        log("hook installed on CreateAlphaTexture");
+    let Ok(mut guard) = ANALYSES.lock() else { return };
+    let all = guard.get_or_insert_with(|| Analyses { map: HashMap::new(), order: VecDeque::new() });
+    let key = analysis.addr();
+    match entry {
+        Some(e) => {
+            if all.map.insert(key, e).is_none() {
+                all.order.push_back(key);
+            }
+            while all.map.len() > ANALYSES_CAP {
+                let Some(old) = all.order.pop_front() else { break };
+                all.map.remove(&old);
+            }
+        }
+        None => {
+            if all.map.remove(&key).is_some() {
+                all.order.retain(|&k| k != key);
+            }
+        }
     }
 }
 
-unsafe extern "system" fn cat_detour(this: *mut c_void, tex_type: i32, bounds: *const RECT, alpha: *mut u8, size: u32) -> HRESULT {
-    let filled = if tex_type == TEXTURE_CLEARTYPE_3X1 {
-        // SAFETY: DirectWrite's contract for CreateAlphaTexture — `bounds`
-        // is one RECT and `alpha` holds `size` bytes, for the call's duration.
-        unsafe {
-            bounds.as_ref().zip((!alpha.is_null()).then(|| core::slice::from_raw_parts_mut(alpha, size as usize)))
+/// Patch GetAlphaTextureBounds (3), CreateAlphaTexture (4) and
+/// GetAlphaBlendParams (5) in the analysis vtable.
+///
+/// # Safety
+/// `analysis` must be a live `IDWriteGlyphRunAnalysis`.
+unsafe fn patch_analysis_vtable(analysis: *mut c_void) {
+    // SAFETY: a live COM object's first word is its vtable; each transmute
+    // types the slot's previous value, which is the method that slot names.
+    unsafe {
+        let vtbl = *analysis.cast::<*mut *const ()>();
+        let ok = patch_slot(vtbl.add(SLOT_GATB), gatb_detour as *const (), |old| {
+            let _ = ORIG_GATB.set(std::mem::transmute::<*const (), FnGetAlphaTextureBounds>(old));
+        }) && patch_slot(vtbl.add(SLOT_CAT), cat_detour as *const (), |old| {
+            let _ = ORIG_CAT.set(std::mem::transmute::<*const (), FnCreateAlphaTexture>(old));
+        }) && patch_slot(vtbl.add(SLOT_GABP), gabp_detour as *const (), |old| {
+            let _ = ORIG_GABP.set(std::mem::transmute::<*const (), FnGetAlphaBlendParams>(old));
+        });
+        log(if ok { "hook installed on IDWriteGlyphRunAnalysis (3 slots)" } else { "IDWriteGlyphRunAnalysis hook failed" });
+    }
+}
+
+unsafe extern "system" fn gatb_detour(this: *mut c_void, ty: i32, bounds: *mut RECT) -> HRESULT {
+    // SAFETY: the app's arguments, forwarded; `bounds` is its out-parameter.
+    unsafe {
+        let hr = (orig(&ORIG_GATB))(this, ty, bounds);
+        // DirectWrite answers an empty rectangle for the texture type this
+        // analysis does not produce (1x1 for ClearType, 3x1 for greyscale or
+        // aliased — measured) and for a run with no ink; keep those as-is.
+        let Some(b) = bounds.as_mut().filter(|b| hr.is_ok() && b.right > b.left && b.bottom > b.top) else { return hr };
+        if let Some(ours) = with_rendered(this.addr(), ty, |r, _| r.bounds) {
+            *b = ours.map_or_else(RECT::default, |(left, top, right, bottom)| RECT { left, top, right, bottom });
         }
-        .is_some_and(|(b, alpha)| cat_fill(this.addr(), b, alpha).is_some())
-    } else {
-        false
+        hr
+    }
+}
+
+unsafe extern "system" fn cat_detour(this: *mut c_void, ty: i32, bounds: *const RECT, alpha: *mut u8, size: u32) -> HRESULT {
+    let channels = match ty {
+        TEXTURE_CLEARTYPE_3X1 => 3,
+        TEXTURE_ALIASED_1X1 => 1,
+        _ => 0,
     };
+    // SAFETY: DirectWrite's contract for CreateAlphaTexture — `bounds` is one
+    // RECT and `alpha` holds `size` bytes, for the call's duration.
+    let target = unsafe { bounds.as_ref().zip((!alpha.is_null()).then(|| core::slice::from_raw_parts_mut(alpha, size as usize))) };
+    let filled = channels > 0
+        && target.is_some_and(|(b, out)| {
+            let (w, h) = (usize::try_from(b.right - b.left).unwrap_or(0), usize::try_from(b.bottom - b.top).unwrap_or(0));
+            w * h * channels == out.len()
+                && with_rendered(this.addr(), ty, |r, bgr| {
+                    out.copy_from_slice(&r.coverage((b.left, b.top, b.right, b.bottom), channels, bgr));
+                })
+                .is_some()
+        });
     if filled {
+        if !CAPTURED.swap(true, Ordering::SeqCst) {
+            log("substituted CreateAlphaTexture via render-core");
+        }
         return HRESULT(0);
     }
     // SAFETY: arguments forwarded untouched.
-    unsafe { (orig(&ORIG_CAT))(this, tex_type, bounds, alpha, size) }
+    unsafe { (orig(&ORIG_CAT))(this, ty, bounds, alpha, size) }
 }
 
-/// Fill `alpha` (a `w*h*3` ClearType 3x1 texture) with render-core coverage
-/// for the run captured for analysis `this`. The captured run is consumed:
-/// an analysis produces its texture once, and the map must not grow for
-/// the life of the process.
-fn cat_fill(this: usize, bounds: &RECT, alpha: &mut [u8]) -> Option<()> {
-    let width = usize::try_from(bounds.right - bounds.left).ok()?;
-    let height = usize::try_from(bounds.bottom - bounds.top).ok()?;
-    if width == 0 || height == 0 || width * height * 3 != alpha.len() {
-        return None;
-    }
-    let info = ANALYSES.lock().ok()?.as_mut()?.remove(&this)?;
-    let coverage = RENDER.lock().ok()?.as_mut().and_then(|st| coverage_for(st, &info, bounds, width, height))?;
-    if !CAPTURED.swap(true, Ordering::SeqCst) {
-        if let Some(tmp) = std::env::var_os("TEMP") {
-            let p = PathBuf::from(tmp).join("render-inject-analysis.txt");
-            let _ = std::fs::write(p, format!("analysis substituted: {width}x{height}, glyphs={}", info.glyphs.len()));
-            log("substituted CreateAlphaTexture via render-core");
+/// Run `f` on analysis `key`'s run rendered for texture `ty`, rendering it
+/// on first use: greyscale for the 1x1 texture, and subpixel (LCD) coverage
+/// for the ClearType 3x1 one — its three values are coverage at three
+/// subpixel positions, so even a greyscale profile renders LCD here (a
+/// greyscale profile normally never gets a 3x1 texture; see
+/// `cgra2_detour`). `None` when the analysis is not ours or cannot be rendered —
+/// the caller then leaves it to DirectWrite (and a failed render forgets the
+/// analysis, so its bounds and texture both stay DirectWrite's).
+fn with_rendered<T>(key: usize, ty: i32, f: impl FnOnce(&RenderedRun, bool) -> T) -> Option<T> {
+    let mut guard = ANALYSES.lock().ok()?;
+    let all = guard.as_mut()?;
+    let a = all.map.get_mut(&key)?;
+    let grey = ty == TEXTURE_ALIASED_1X1;
+    // Lock order: ANALYSES, then RENDER (nothing takes them the other way).
+    let mut render = RENDER.lock().ok()?;
+    let st = render.as_mut()?;
+    let profile = if grey {
+        Profile { aa: Aa::Grey, ..st.profile }
+    } else if st.profile.aa.is_lcd() {
+        st.profile
+    } else {
+        Profile { aa: Aa::LcdRgb, ..st.profile }
+    };
+    if a.rendered.as_ref().is_none_or(|(g, _)| *g != grey) {
+        if reface(st, &a.face, "dw").is_none() {
+            all.map.remove(&key);
+            return None;
         }
+        a.rendered = Some((grey, render_placed(&st.ft, &profile, &a.glyphs, &a.style)));
     }
-    alpha.copy_from_slice(&coverage);
-    Some(())
+    let bgr = render_core::ft::is_bgr(profile.aa);
+    let out = a.rendered.as_ref().map(|(_, r)| f(r, bgr));
+    drop(render);
+    drop(guard);
+    out
 }
 
-/// Render `info`'s run as LCD coverage with the shared face.
-fn coverage_for(st: &mut RenderState, info: &RunInfo, bounds: &RECT, width: usize, height: usize) -> Option<Vec<u8>> {
-    // Key on the font identity (face index + file length), not the analysis
-    // object address: addresses are recycled, so keying on the analysis
-    // would reuse a stale face when a freed pointer is handed to another font.
-    let key = format!("dwa:{}:{}", info.index, info.bytes.len());
-    if st.font_key.as_deref() != Some(key.as_str()) {
-        st.ft.reface_memory_index(&info.bytes, i64::from(info.index)).ok()?;
-        st.font_key = Some(key);
-        st.font_face = None;
+unsafe extern "system" fn gabp_detour(this: *mut c_void, rp: *mut c_void, gamma: *mut f32, contrast: *mut f32, level: *mut f32) -> HRESULT {
+    // Upstream's `IMPL_GetAlphaBlendParams`: the blend values for the
+    // profile's rendering params, else for the app's.
+    let dw = dw_rendering();
+    // SAFETY: arguments are the app's, forwarded; `dw` keeps the params alive.
+    unsafe {
+        let mut hr = E_FAIL;
+        if let Some(d) = dw.as_ref() {
+            hr = (orig(&ORIG_GABP))(this, d.dw_params.as_raw(), gamma, contrast, level);
+        }
+        if hr.is_err() {
+            hr = (orig(&ORIG_GABP))(this, rp, gamma, contrast, level);
+        }
+        hr
     }
-    // Force LCD subpixel for the CLEARTYPE_3x1 texture, keep the profile's hinting.
-    let lcd = Profile { aa: Aa::LcdRgb, ..st.profile };
-    let pen = (info.baseline.0 - bounds.left, info.baseline.1 - bounds.top);
-    Some(glyph_run_coverage_lcd(&st.ft, &lcd, &info.glyphs, info.px, pen, width, height))
 }
 
 // ---- setup ----
@@ -595,20 +824,23 @@ pub(crate) fn setup_dwrite_hook() {
             log("hook installed on DrawGlyphRun");
         }
         let fvtbl = *factory.as_raw().cast::<*mut *const ()>();
-        patch_slot(fvtbl.add(23), cgra_detour as *const (), |old| {
+        if patch_slot(fvtbl.add(SLOT_CGRA), cgra_detour as *const (), |old| {
             let _ = ORIG_CGRA.set(std::mem::transmute::<*const (), FnCreateGlyphRunAnalysis>(old));
-        });
-        log("hook installed on CreateGlyphRunAnalysis");
-        if factory.cast::<IDWriteFactory2>().is_ok() {
-            patch_slot(fvtbl.add(30), cgra2_detour as *const (), |old| {
+        }) {
+            log("hook installed on CreateGlyphRunAnalysis");
+        }
+        if factory.cast::<IDWriteFactory2>().is_ok()
+            && patch_slot(fvtbl.add(SLOT_CGRA2), cgra2_detour as *const (), |old| {
                 let _ = ORIG_CGRA2.set(std::mem::transmute::<*const (), FnCreateGlyphRunAnalysis2>(old));
-            });
+            })
+        {
             log("hook installed on IDWriteFactory2::CreateGlyphRunAnalysis");
         }
-        if factory.cast::<IDWriteFactory3>().is_ok() {
-            patch_slot(fvtbl.add(31), cgra3_detour as *const (), |old| {
+        if factory.cast::<IDWriteFactory3>().is_ok()
+            && patch_slot(fvtbl.add(SLOT_CGRA3), cgra3_detour as *const (), |old| {
                 let _ = ORIG_CGRA3.set(std::mem::transmute::<*const (), FnCreateGlyphRunAnalysis2>(old));
-            });
+            })
+        {
             log("hook installed on IDWriteFactory3::CreateGlyphRunAnalysis");
         }
     }

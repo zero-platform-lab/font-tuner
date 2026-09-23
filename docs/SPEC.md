@@ -35,7 +35,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 * **仕組み** — GDI `ExtTextOutW` は **retour**（純 Rust、iced-x86 逆アセンブラ）のインライン detour でフックする。DirectWrite/Direct2D の入口は COM vtable を直接パッチする。MinHook/Detours は使わない。
 * **スレッド安全なパッチ** — retour は対象の先頭バイトを書き換える間、他スレッドを止めない。そこで `install_hook` はパッチの前後でプロセス内の他スレッドを全部凍結し（`CreateToolhelp32Snapshot` + `SuspendThread`）、後で再開する。MinHook が内部で閉じている窓と同じ。
 * **アタッチは一度だけ** — WH_GETMESSAGE のマップと別のロードで、DLL が 1 プロセス内に 2 つのモジュールインスタンスになりうる。プロセスごとの名前付きミューテックス（`Local\FontTuner.Attached.<pid>`）で最初のアタッチだけがフックするようにし、2 度目のアタッチが自分のジャンプの上に detour を張ってトランポリンを壊すのを防ぐ。
-* **一度きりの vtable パッチ**（CreateAlphaTexture、Direct2D の全生成スロットとテキストスロット）はミューテックスで直列化し、その下で再確認する。さもないと競合する 2 スレッドが両方ともパッチ済みスロットから「元の関数」を捕まえ、detour が自分自身を呼ぶ → 無限再帰。Direct2D のスロットは (vtable, slot) を鍵にした 1 つのマップで管理する。レンダーターゲットのクラスごとに vtable が違うため。
+* **一度きりの vtable パッチ**は直列化する。対象は解析オブジェクトの 3 スロット（`GetAlphaTextureBounds` / `CreateAlphaTexture` / `GetAlphaBlendParams`）と、Direct2D の全生成スロットとテキストスロット。解析オブジェクトは `Once` で、Direct2D はミューテックスの下で再確認する。さもないと競合する 2 スレッドが両方ともパッチ済みスロットから「元の関数」を捕まえ、detour が自分自身を呼ぶ → 無限再帰。Direct2D のスロットは (vtable, slot) を鍵にした 1 つのマップで管理する。レンダーターゲットのクラスごとに vtable が違うため。
 * **Direct2D への到達** — `render-inject/src/d2d.rs` が upstream の生成チェーンを辿る。入口は `D2D1CreateFactory`・`D2D1CreateDevice`・`D2D1CreateDeviceContext` の 3 つ。`D2D1CreateFactory` からは `CreateHwnd/DC/WicBitmapRenderTarget` と `ID2D1Factory1..7::CreateDevice` に至る。`D2D1CreateDevice` からは `ID2D1Device..6::CreateDeviceContext` に至る。各ターゲットで `CreateCompatibleRenderTarget`（12）・`DrawGlyphRun`（29）・記述付きの overload（82）・`SetTextAntialiasMode`（34）・`SetTextRenderingParams`（36）をパッチする。12 はオフスクリーンのビットマップターゲットを生成時にフックするため。フォント処理の前に `GetDC` を試すので、DC を貸せないターゲットは試行以上のコストがかからない。GDI DC を貸せるターゲットはランを render-core で描く。貸せないターゲット（DXGI サーフェス: スワップチェーン、コンポジション）は OS に描かせる。その際、プロファイルの `[DirectWrite]` `IDWriteRenderingParams` と、`AntiAliasMode` から導いたアンチエイリアスモードを渡す。`HintingMode=1` のときは upstream と同じ 1/65535 の変換ずらしも加える。スロット番号は `windows` クレートの vtable 定義で照合した。
 * **再入**はスレッドごとに（`thread_local`）ガードする。あるスレッドの描画が、別スレッドの描画を未調整の GDI 経路に落とすことはない。
 * **トレイのフック設置ガード**（`Hook::install`、`src/stale.rs`）— `LoadLibraryW` の前に確認する。コアをロードするとトレイ自身に常駐固定とフックがかかるためだ。トレイは 2 点を見る。(a) ディスク上のファイルからコアの `GetMsgProc` が RVA `0x1000` にあること。(b) 同じパスのコアを `GetMsgProc` が別の場所にある状態で保持する動作中プロセスが無いこと。(b) の判定は Toolhelp のモジュール走査とそのイメージの export テーブルの `ReadProcessMemory` で行う。モジュールはあるがイメージを読めないプロセスは stale 扱いにする（その間に終了していれば除く）。別ディレクトリから読み込んだコピー（`loader` ハーネス）は問題ない。Windows はフック DLL をパスで解決し、インストール済みのものを別イメージとしてマップし、アタッチ一度きりミューテックスが 2 つ目を不活性にするからだ。どちらの確認が失敗してもエラーを出してフックを張らない。(b) ではメッセージが該当プログラムを列挙し、サインアウトして入り直す（または再起動する）よう促す。コアが常駐固定なので、それが stale なイメージを消す唯一の方法だからだ。トレイが開けないプロセス（別ユーザーやより高い整合性レベル）はトレイのフックも届かないので、飛ばしても安全。
@@ -91,6 +91,18 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 * `blackBoxRect` には描いたインクの矩形を返す（ビットマップの外へ出た分も含め、切り詰めない）。インクが無いランはベースライン原点の空矩形を返す。DirectWrite と同じ。
 
 実測（`verify/dwrite-probe`、Yu Gothic UI・24 DIP の 25 ケース）: インクの上下左右の端はすべて素の DirectWrite と 1px 以内に収まった。残る 1px は FreeType のヒンティングによる字形の差。0.1.10 までは advances・offsets・RTL・縦書き・pixelsPerDip・変換・合成をすべて無視していた。どのケースも同じ位置に同じ大きさで描いたうえ、`blackBoxRect` を書かずに S_OK を返していた（呼び出し側が再描画範囲を失う）。
+
+**DirectWrite の解析経路** — グリフを自分で合成するアプリは、`IDWriteFactory{,2,3}::CreateGlyphRunAnalysis` で解析オブジェクトを作る。そして `GetAlphaTextureBounds` で範囲を聞き、`CreateAlphaTexture` で濃淡を受け取る。WPF がこの経路を通ることを実測で確かめた（Chromium/Skia も通るが、署名の壁（1.3）で注入できない）。生成のたびに、ランを上と同じ規則で配置し、解析オブジェクトのアドレスで覚える。範囲と濃淡は render-core で作るので、呼び出し側が確保するバッファの大きさと中身が同じグリフから決まる。
+
+* 変換: Factory1 の変換は DIP 単位で、そのあと pixelsPerDip で拡大される（実測: pixelsPerDip 1.5・平行移動 (10, 5) で原点が (75, 97.5)）。Factory2 / 3 には pixelsPerDip が無く、変換に畳み込まれていて、平行移動はピクセル単位。
+* テクスチャの種類: 解析オブジェクトが作るのは 1 種類だけ。ClearType なら 3x1、グレースケールか aliased なら 1x1 で、もう一方の範囲は空になる（実測）。DirectWrite 自身が空を返す範囲（作らない種類、インクの無いラン）は空のまま返す。
+* 3x1 の 3 つの値は、同じ濃さの 3 回ではなく、**横 3 倍の解像度でサブピクセルごとに測った濃さ**。呼び出し側はこれをサブピクセル単位でずらし、グリフを小数ピクセルの位置に置く（WPF で実測）。グレーを 3 回並べて渡すと、ずらしたところに赤とシアンのにじみが出た。そこで 3x1 には FreeType の LCD の濃淡を渡す。
+* そのうえでアンチエイリアスはプロファイルが決める（GDI と同じ）。グレースケールのプロファイルでは解析オブジェクトをグレースケールで作らせ（Factory2 / 3 の `antialiasMode`）、1x1 のグレーの濃淡で描かせる。LCD のプロファイルでは ClearType で作らせる。upstream はアプリの指定のままにする。ここは upstream と違う判断。
+* 覚えておく数は 256 まで（古い順に捨てる）。フォントはファイルの中身ではなく `IDWriteFontFace` の参照で持つ。0.1.10 までは解析オブジェクト 1 つごとにフォントファイルを丸ごと複製して 4096 件まで持っていた（日本語フォントは 1 ファイル 10〜20MB）。捨てた解析オブジェクトは、範囲と濃淡の両方が DirectWrite のものに戻る。同じアドレスを再利用した解析オブジェクトは、生成時に必ず上書きか削除をするので、古い記録を読むことはない。
+
+実測（`verify/dwrite-probe`、Factory1 と Factory3 の ClearType / グレースケール、25 ケース）: 濃淡の上下左右の端はすべて素の DirectWrite と 1px 以内。WPF（検証用のアプリ）でも、行の位置・右から左の文字・太字・斜体が素の WPF と揃った。0.1.10 までは advances などを無視していたので、WPF で右から左の行が丸ごと消え、行末の文字が欠けていた（"Wavy" が "Wav"）。
+
+自前で描けない解析オブジェクト（回転・せん断の変換など）は DirectWrite に作らせる。upstream の `IMPL_CreateGlyphRunAnalysis{,2,3}` と同じく、プロファイルの描画モード・グリッドフィット（`HintingMode=1` なら 1/65535 のずらし）で作らせ、拒まれたらアプリの引数に戻す。`GetAlphaBlendParams` は upstream と同じく、プロファイルの params に対する合成の値を返す。
 
 自前で描けないラン（上記の変換、フォントファイルを読めない、プロファイルが無い）は DirectWrite に描かせる。そのときは upstream の `IMPL_BitmapRenderTarget_DrawGlyphRun` と同じく、アプリの rendering params の代わりにプロファイルの `[DirectWrite]` の params を渡す。`HintingMode=1` なら 1/65535 の変換ずらしも加える。DirectWrite が拒めば、ずらしなし、次にアプリの params のままで呼び直す。
 

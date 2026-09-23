@@ -28,7 +28,8 @@ FreeType 自体はフォークの `freetype64.lib` を変更せず再利用す�
                                            TextOutW/TextOutA/ExtTextOutA もここに来る）
       gdi32!GetGlyphOutlineW/A をフック    （ClipBoxFix: メトリクスのみの問い合わせを補正）
       共有 vtable の IDWriteBitmapRenderTarget::DrawGlyphRun をパッチ
-      IDWriteFactory{,2,3}::CreateGlyphRunAnalysis をパッチ（→ CreateAlphaTexture）
+      IDWriteFactory{,2,3}::CreateGlyphRunAnalysis をパッチ（→ 解析オブジェクトの
+        GetAlphaTextureBounds / CreateAlphaTexture / GetAlphaBlendParams）
       d2d1!D2D1CreateFactory / D2D1CreateDevice / D2D1CreateDeviceContext をフックし、
         ID2D1Factory1..7::CreateDevice → ID2D1Device..6::CreateDeviceContext →
         全ターゲットで DrawGlyphRun (29) / 記述付き DrawGlyphRun (82) /
@@ -49,7 +50,7 @@ FreeType 自体はフォークの `freetype64.lib` を変更せず再利用す�
 描画はミューテックスで直列化する（共有 FreeType face 1 つ、描画ごとに reface）。
 フックは **retour**（純 Rust、iced-x86 逆アセンブラ）で、MinHook/Detours ではない。
 retour はパッチ中に他スレッドを止めないので、`install_hook` がバイトパッチの前後で
-他スレッドを凍結する。一度きりの vtable パッチはミューテックスで直列化し、2 つの
+他スレッドを凍結する。一度きりの vtable パッチはミューテックスか `Once` で直列化し、2 つの
 スレッドが同時に「元の関数」を捕まえて再帰するのを防ぐ。
 
 ## 動くもの
@@ -88,7 +89,7 @@ retour はパッチ中に他スレッドを止めないので、`install_hook` �
 | GDI `ExtTextOutA` / `TextOutW` / `TextOutA` | あり | **自前フック不要でカバー**: Windows 11 (26200) では 3 つとも我々のインライン detour が張る `ExtTextOutW` 入口に来る（プローブハーネスで確認） |
 | GDI `GetGlyphOutlineW` / `GetGlyphOutlineA`（upstream の "ClipBoxFix"） | あり | **完了**（`gdi_metrics.rs`。`[Experimental] ClipBoxFix`、既定オン。プロセス別の `[Experimental@exe]` 節は未適用） |
 | DirectWrite `IDWriteBitmapRenderTarget::DrawGlyphRun`（vtbl 3） | あり | **完了** |
-| DirectWrite `CreateGlyphRunAnalysis` → `CreateAlphaTexture`（Chromium/Skia、VS Code）、`IDWriteFactory2`/`3` の overload 含む | あり | **完了** |
+| DirectWrite `CreateGlyphRunAnalysis` → `GetAlphaTextureBounds` / `CreateAlphaTexture` / `GetAlphaBlendParams`（WPF で実測。Chromium/Skia も通るが注入できない）、`IDWriteFactory2`/`3` の overload 含む | あり | **完了**（範囲と濃淡は render-core。描けない変換は upstream と同じくプロファイルの描画モードで OS に作らせる） |
 | Direct2D `ID2D1RenderTarget::DrawGlyphRun`（vtbl 29） | あり | **完了**（`D2D1CreateFactory` → RT 生成 → vtable ごとのパッチ経由） |
 | Direct2D `DrawGlyphRun1`（vtbl 82）/ `ID2D1DeviceContext` | あり | **完了**（`D2D1CreateDevice`、`D2D1CreateDeviceContext`、`ID2D1Factory1..7::CreateDevice`、`ID2D1Device..6::CreateDeviceContext`）。GDI DC を貸せる所は render-core、そうでなければ upstream の rendering-params 経路 |
 | Direct2D `SetTextAntialiasMode` (34) / `SetTextRenderingParams` (36) をプロファイルに強制 | あり | **完了** |

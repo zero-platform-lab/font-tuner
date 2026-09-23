@@ -20,14 +20,6 @@ use windows::Win32::System::Threading::{
 
 use crate::log;
 
-/// Serialises the one-time vtable patches (CreateAlphaTexture, D2D factory
-/// render-target creation). Without it two threads racing the first call both
-/// pass the `is_null()`/`is_none()` check and both patch the slot; the loser
-/// then captures the "original" from a slot already holding our detour, so the
-/// detour calls itself — infinite recursion, host crash. (The D2D DrawGlyphRun
-/// path already guards with SLOT_ORIG's mutex; these paths did not.)
-pub(crate) static VTABLE_PATCH_LOCK: Mutex<()> = Mutex::new(());
-
 /// Installed inline detours, kept alive for the life of the process (the DLL
 /// pins itself, so they are never disabled). retour patches the target's first
 /// bytes non-atomically and does NOT stop other threads while doing so, so a

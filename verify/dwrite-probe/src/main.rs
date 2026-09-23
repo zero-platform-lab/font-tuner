@@ -22,8 +22,12 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_SIMULATIONS_BOLD, DWRITE_FONT_SIMULATIONS_NONE, DWRITE_FONT_SIMULATIONS_OBLIQUE,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_OFFSET,
     DWRITE_GLYPH_RUN, DWRITE_MATRIX, DWRITE_MEASURING_MODE, DWRITE_MEASURING_MODE_GDI_CLASSIC,
-    DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_MEASURING_MODE_NATURAL, IDWriteFactory3, IDWriteGlyphRunAnalysis, DWRITE_GRID_FIT_MODE_DEFAULT,
+    DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_TEXTURE_ALIASED_1x1,
+    DWRITE_TEXTURE_CLEARTYPE_3x1, DWRITE_TEXTURE_TYPE, DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE,
+    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
+use windows::core::Interface;
 use windows::Win32::Graphics::Gdi::{GetPixel, HDC};
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
@@ -107,8 +111,105 @@ fn main() -> windows::core::Result<()> {
                 save_bmp(hdc, &format!("{dir}\\{}.bmp", case.name.replace(' ', "_")));
             }
         }
+
+        // The glyph-run analysis path: bounds per texture type, and where the
+        // coverage in the texture actually is.
+        println!("--- analysis (f1: pixelsPerDip argument; f3: transform only, ClearType / greyscale)");
+        let f3: Option<IDWriteFactory3> = factory.cast().ok();
+        for case in cases() {
+            let face = if case.sim == DWRITE_FONT_SIMULATIONS_NONE { face.clone() } else { simulated(&factory, &face, case.sim)? };
+            let glyphs = glyph_indices(&face, case.text)?;
+            let advances: Vec<f32> = case.advances.map_or_else(Vec::new, |a| vec![a; glyphs.len()]);
+            let offsets: Vec<DWRITE_GLYPH_OFFSET> = case
+                .offset
+                .map(|(ax, asc)| vec![DWRITE_GLYPH_OFFSET { advanceOffset: ax, ascenderOffset: asc }; glyphs.len()])
+                .unwrap_or_default();
+            let run = DWRITE_GLYPH_RUN {
+                fontFace: std::mem::ManuallyDrop::new(Some(face.clone())),
+                fontEmSize: case.em,
+                glyphCount: glyphs.len() as u32,
+                glyphIndices: glyphs.as_ptr(),
+                glyphAdvances: if advances.is_empty() { std::ptr::null() } else { advances.as_ptr() },
+                glyphOffsets: if offsets.is_empty() { std::ptr::null() } else { offsets.as_ptr() },
+                isSideways: case.sideways.into(),
+                bidiLevel: case.bidi,
+            };
+            let a1 = factory.CreateGlyphRunAnalysis(
+                &run,
+                case.ppd,
+                Some(&raw const case.transform),
+                DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+                case.mode,
+                BASELINE.0,
+                BASELINE.1,
+            );
+            print_analysis(&format!("{} f1", case.name), a1);
+            if let Some(f3) = &f3 {
+                // Factory 3 takes no pixelsPerDip: fold it into the transform.
+                let t = &case.transform;
+                let p = case.ppd;
+                let m = DWRITE_MATRIX { m11: t.m11 * p, m12: t.m12 * p, m21: t.m21 * p, m22: t.m22 * p, dx: t.dx * p, dy: t.dy * p };
+                for (tag, aa) in [("f3 ct", DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE), ("f3 grey", DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE)] {
+                    let a3 = f3.CreateGlyphRunAnalysis(
+                        &run,
+                        Some(&raw const m),
+                        DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+                        case.mode,
+                        DWRITE_GRID_FIT_MODE_DEFAULT,
+                        aa,
+                        BASELINE.0,
+                        BASELINE.1,
+                    );
+                    print_analysis(&format!("{} {tag}", case.name), a3);
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Bounds of each texture type, and the extent of coverage above 60 in it.
+unsafe fn print_analysis(name: &str, a: windows::core::Result<IDWriteGlyphRunAnalysis>) {
+    let a = match a {
+        Ok(a) => a,
+        Err(e) => {
+            println!("{name:<28} create failed {e:?}");
+            return;
+        }
+    };
+    let mut line = format!("{name:<28}");
+    for (tag, ty, bpp) in [("1x1", DWRITE_TEXTURE_ALIASED_1x1, 1usize), ("3x1", DWRITE_TEXTURE_CLEARTYPE_3x1, 3)] {
+        let ty: DWRITE_TEXTURE_TYPE = ty;
+        // SAFETY: a live analysis; the buffer is sized from the bounds.
+        let r = unsafe { a.GetAlphaTextureBounds(ty) }.unwrap_or_default();
+        let (w, h) = ((r.right - r.left).max(0) as usize, (r.bottom - r.top).max(0) as usize);
+        if w == 0 || h == 0 {
+            line += &format!(" {tag}=empty");
+            continue;
+        }
+        let mut buf = vec![0u8; w * h * bpp];
+        // SAFETY: as above.
+        let ok = unsafe { a.CreateAlphaTexture(ty, &raw const r, &mut buf) }.is_ok();
+        let spread = if bpp == 3 {
+            buf.chunks(3).map(|c| c.iter().max().unwrap() - c.iter().min().unwrap()).max().unwrap_or(0)
+        } else {
+            0
+        };
+        let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+        for y in 0..h {
+            for x in 0..w {
+                if buf[(y * w + x) * bpp..(y * w + x + 1) * bpp].iter().any(|&v| v > 60) {
+                    x0 = x0.min(x as i32 + r.left);
+                    x1 = x1.max(x as i32 + r.left);
+                    y0 = y0.min(y as i32 + r.top);
+                    y1 = y1.max(y as i32 + r.top);
+                }
+            }
+        }
+        let err = if ok { "" } else { " ERR" };
+        line += &format!(" {tag}=({},{})-({},{}){err} cov=x{x0}..{x1} y{y0}..{y1} spread={spread}", r.left, r.top, r.right, r.bottom);
+    }
+    println!("{line}");
 }
 
 struct Case {
@@ -159,6 +260,7 @@ fn cases() -> Vec<Case> {
         Case { name: "ppd 1.5", ppd: 1.5, ..base },
         Case { name: "scale 2", transform: DWRITE_MATRIX { m11: 2.0, m22: 2.0, ..IDENTITY }, ..base },
         Case { name: "translate 10,5", transform: DWRITE_MATRIX { dx: 10.0, dy: 5.0, ..IDENTITY }, ..base },
+        Case { name: "ppd 1.5 + translate", ppd: 1.5, transform: DWRITE_MATRIX { dx: 10.0, dy: 5.0, ..IDENTITY }, ..base },
         Case { name: "rotate 30", transform: rot(30.0), ..base },
         Case { name: "em 13.5", em: 13.5, advances: None, ..base },
         Case { name: "japanese", text: "日本語の文字", advances: None, ..base },
