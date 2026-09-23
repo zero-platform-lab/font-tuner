@@ -32,6 +32,7 @@ mod dwrite;
 mod gdi;
 mod gdi_metrics;
 mod hook;
+mod layout;
 mod profile;
 mod state;
 mod xform;

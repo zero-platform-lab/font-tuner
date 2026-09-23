@@ -15,32 +15,42 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use render_core::render::{draw_glyphs_onto, glyph_run_coverage_lcd, Layout, Ink};
+use render_core::render::{glyph_run_coverage_lcd, render_placed, Ink};
 use render_core::{Aa, Profile};
 use windows::core::{Interface, HRESULT};
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{E_FAIL, RECT};
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFactory1, IDWriteFactory2,
     IDWriteFactory3, IDWriteFontFace, IDWriteFontFile, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE, DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_GRID_FIT_MODE_DISABLED,
     DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_MATRIX, DWRITE_PIXEL_GEOMETRY, DWRITE_PIXEL_GEOMETRY_BGR,
     DWRITE_PIXEL_GEOMETRY_FLAT, DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE, DWRITE_RENDERING_MODE1,
+    DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
 };
 
 use crate::dib::Dib;
 use crate::hook::{patch_slot, VTABLE_PATCH_LOCK};
+use crate::layout::{self, Mapping};
 use crate::log;
 use crate::state::{orig, round_i32, RenderState, CAPTURED, RENDER};
 
-// ---- Rendering params for the text Direct2D draws itself ----
+// ---- Rendering params for the text the OS still draws ----
 
-/// What Direct2D gets told to do for text we cannot rasterise ourselves: the
-/// profile's `[DirectWrite]` values as `IDWriteRenderingParams`, plus the
-/// antialias mode and grid-fit choice derived the way upstream does
-/// (`Params::Params` in `directwrite.cpp`). Rebuilt on every profile load.
+/// What DirectWrite / Direct2D get told to do for text we do not rasterise
+/// ourselves: the profile's `[DirectWrite]` values as
+/// `IDWriteRenderingParams`, plus the antialias mode and grid-fit choice
+/// derived the way upstream does (`Params::Params` in `directwrite.cpp`).
+/// Rebuilt on every profile load.
+///
+/// Upstream keeps two sets: `GetD2DParams` passes the rendering mode
+/// through, `GetDWParams` (the DirectWrite hooks) swaps mode 6 (outline)
+/// for natural symmetric, because "DW rendering in mode6 is horrible".
 #[derive(Clone)]
 pub(crate) struct DwRendering {
+    /// For Direct2D (`GetD2DRenderingParams`).
     pub(crate) params: IDWriteRenderingParams,
+    /// For DirectWrite (`GetDWRenderingParams`).
+    pub(crate) dw_params: IDWriteRenderingParams,
     /// `D2D1_TEXT_ANTIALIAS_MODE`: greyscale for a greyscale profile, else
     /// DEFAULT (ClearType).
     pub(crate) aa_mode: i32,
@@ -82,9 +92,6 @@ fn build_dw_rendering(p: &Profile) -> Option<DwRendering> {
         1 => DWRITE_GRID_FIT_MODE_DISABLED,
         _ => DWRITE_GRID_FIT_MODE_ENABLED,
     };
-    // RenderingMode is passed through as upstream's D2D params do (its
-    // GetD2DParams keeps 6 = OUTLINE; only its analysis-path params remap 6
-    // to natural symmetric, and that path is rendered by us, not DirectWrite).
     let want = ParamsWanted {
         gamma: p.dw.gamma,
         contrast: p.dw.contrast,
@@ -95,11 +102,18 @@ fn build_dw_rendering(p: &Profile) -> Option<DwRendering> {
         grid_fit,
     };
     let params = custom_params(&f, &want)?;
-    Some(DwRendering { params, aa_mode, grid_fit_disabled: grid_fit == DWRITE_GRID_FIT_MODE_DISABLED })
+    let dw_want = if p.dw.rendering_mode == 6 {
+        ParamsWanted { mode: DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, mode1: DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, ..want }
+    } else {
+        want
+    };
+    let dw_params = custom_params(&f, &dw_want)?;
+    Some(DwRendering { params, dw_params, aa_mode, grid_fit_disabled: grid_fit == DWRITE_GRID_FIT_MODE_DISABLED })
 }
 
 /// The arguments to `CreateCustomRenderingParams`, in the union of the four
 /// factory generations' signatures.
+#[derive(Clone, Copy)]
 struct ParamsWanted {
     gamma: f32,
     contrast: f32,
@@ -167,28 +181,24 @@ impl GlyphRun<'_> {
         Some(GlyphRun { face, glyphs, advances, px: round_i32(r.fontEmSize) })
     }
 
-    /// The cache key for this run's face: its address (pinned by the clone
-    /// `RenderState` keeps) plus the face index.
-    pub(crate) fn face_key(&self, prefix: &str) -> String {
-        format!("{prefix}:{:x}:{}", self.face.as_raw().addr(), self.face_index())
-    }
-
-    pub(crate) fn face_index(&self) -> u32 {
-        // SAFETY: a COM getter on a live face.
-        unsafe { self.face.GetIndex() }
-    }
-
     /// Make `st`'s FreeType face this run's font, unless it already is.
     pub(crate) fn reface(&self, st: &mut RenderState, prefix: &str) -> Option<()> {
-        let key = self.face_key(prefix);
-        if st.font_key.as_deref() != Some(key.as_str()) {
-            let (bytes, index) = font_bytes(self.face)?;
-            st.ft.reface_memory_index(&bytes, i64::from(index)).ok()?;
-            st.font_key = Some(key);
-            st.font_face = Some(self.face.clone());
-        }
-        Some(())
+        reface(st, self.face, prefix)
     }
+}
+
+/// Make `st`'s FreeType face `face`'s font, unless it already is. Keyed on
+/// the face's address (pinned by the clone `RenderState` keeps) and index.
+pub(crate) fn reface(st: &mut RenderState, face: &IDWriteFontFace, prefix: &str) -> Option<()> {
+    // SAFETY: a COM getter on a live face.
+    let key = format!("{prefix}:{:x}:{}", face.as_raw().addr(), unsafe { face.GetIndex() });
+    if st.font_key.as_deref() != Some(key.as_str()) {
+        let (bytes, index) = font_bytes(face)?;
+        st.ft.reface_memory_index(&bytes, i64::from(index)).ok()?;
+        st.font_key = Some(key);
+        st.font_face = Some(face.clone());
+    }
+    Some(())
 }
 
 /// The font-file bytes + face index behind a DirectWrite font face.
@@ -228,17 +238,20 @@ unsafe extern "system" fn dgr_detour(
 ) -> HRESULT {
     // SAFETY: `this` is the render target the call was made on, `run` is
     // DirectWrite's argument (null-checked); both live for the call.
-    let handled = unsafe {
+    let drawn = unsafe {
         IDWriteBitmapRenderTarget::from_raw_borrowed(&this)
             .zip(run.as_ref())
-            .and_then(|(brt, r)| GlyphRun::borrow(r).map(|g| (brt, g)))
-            .is_some_and(|(brt, g)| dgr_render(brt, &g, (bx, by), color).is_some())
+            .and_then(|(brt, r)| dgr_render(brt, r, (bx, by), mm, color))
     };
-    if handled {
+    if let Some(ink) = drawn {
+        // SAFETY: `bbox` is null or the caller's RECT, live for the call.
+        if let Some(b) = unsafe { bbox.as_mut() } {
+            *b = ink;
+        }
         return HRESULT(0); // S_OK
     }
-    // SAFETY: arguments forwarded untouched.
-    unsafe { (orig(&ORIG_DGR))(this, bx, by, mm, run, rp, color, bbox) }
+    // SAFETY: the app's own arguments, forwarded.
+    unsafe { dgr_os(this, bx, by, mm, run, rp, color, bbox) }
 }
 
 /// `textColor` is a `COLORREF`.
@@ -247,33 +260,121 @@ fn rgb(colorref: u32) -> [u8; 3] {
     [r, g, b]
 }
 
-fn dgr_render(brt: &IDWriteBitmapRenderTarget, g: &GlyphRun<'_>, baseline: (f32, f32), color: u32) -> Option<()> {
+/// Rasterise `run` into the render target's bitmap with render-core, laid
+/// out as DirectWrite would (`layout.rs`). Returns the ink rectangle for
+/// `blackBoxRect`, or `None` to leave the run to DirectWrite (a rotated or
+/// skewed target transform, an unreadable font, no render state).
+fn dgr_render(brt: &IDWriteBitmapRenderTarget, run: &DWRITE_GLYPH_RUN, baseline: (f32, f32), mm: i32, color: u32) -> Option<RECT> {
+    let face = run.fontFace.as_ref()?;
     // SAFETY: getters on a live render target.
-    let (hdc, size) = unsafe { (brt.GetMemoryDC(), brt.GetSize().ok()?) };
-    if size.cx <= 0 || size.cy <= 0 {
-        return None;
+    let (hdc, size, ppd, m) = unsafe {
+        let mut m = DWRITE_MATRIX::default();
+        brt.GetCurrentTransform(&raw mut m).ok()?;
+        (brt.GetMemoryDC(), brt.GetSize().ok()?, brt.GetPixelsPerDip(), m)
+    };
+    let map = Mapping::new(&m, ppd)?;
+    // SAFETY: `run` is DirectWrite's argument, live for the call.
+    let geo = unsafe { layout::lay_out(run, baseline, &map, mm) }?;
+    // The render lock serialises every draw; held until the bitmap is written.
+    let mut guard = RENDER.lock().ok()?;
+    let st = guard.as_mut()?;
+    reface(st, face, "dw")?;
+    let rendered = render_placed(&st.ft, &st.profile, &geo.glyphs, &geo.style);
+    let Some(ink) = rendered.bounds else {
+        // No ink (spaces): DirectWrite reports the empty rectangle at the
+        // baseline origin.
+        let (x, y) = geo.origin;
+        return Some(RECT { left: x, top: y, right: x, bottom: y });
+    };
+    // Only the part inside the bitmap is read back and written; the reported
+    // rectangle is not clipped (DirectWrite's is not either).
+    let (left, top, right, bottom) = (ink.0.max(0), ink.1.max(0), ink.2.min(size.cx), ink.3.min(size.cy));
+    if left < right && top < bottom {
+        let mut dib = Dib::new(hdc, right - left, bottom - top)?;
+        dib.copy_from(hdc, left, top);
+        let mut canvas = dib.canvas();
+        rendered.draw_onto(&mut canvas, (left, top), &st.tables, &st.profile, Ink { fg: rgb(color) });
+        dib.blit(&canvas);
+        dib.copy_to(hdc, left, top);
     }
-    let mut dib = Dib::new(hdc, size.cx, size.cy)?;
-    dib.copy_from(hdc, 0, 0);
-    let mut canvas = dib.canvas();
-    let pen = (round_i32(baseline.0), round_i32(baseline.1));
-    // The render lock serialises every draw; held for this statement only.
-    RENDER.lock().ok()?.as_mut().and_then(|st| {
-        g.reface(st, "dw")?;
-        let RenderState { ft, tables, profile, .. } = st;
-        draw_glyphs_onto(&mut canvas, ft, tables, profile, Ink { fg: rgb(color) }, g.glyphs, g.px, pen, Layout::default());
-        Some(())
-    })?;
-    dib.blit(&canvas);
+    drop(guard);
     if !CAPTURED.swap(true, Ordering::SeqCst) {
-        if let Some(tmp) = std::env::var_os("TEMP") {
-            let p = PathBuf::from(tmp).join("render-inject-dwrite.png");
-            let _ = canvas.save(&p.to_string_lossy());
-            log(&format!("captured DirectWrite render to {}", p.display()));
-        }
+        log(&format!("substituted DirectWrite DrawGlyphRun via render-core ({} glyphs)", geo.glyphs.len()));
     }
-    dib.copy_to(hdc, 0, 0);
-    Some(())
+    Some(RECT { left: ink.0, top: ink.1, right: ink.2, bottom: ink.3 })
+}
+
+/// Hand the run back to DirectWrite the way upstream's
+/// `IMPL_BitmapRenderTarget_DrawGlyphRun` does: the profile's rendering
+/// params in place of the app's, and - with grid fitting off - a transform
+/// nudged by 1/65535 so DirectWrite stops snapping stems. Each step falls
+/// back to the next if DirectWrite refuses it; the last is the app's call
+/// unchanged.
+///
+/// # Safety
+/// The arguments must be those of a `DrawGlyphRun` call on `this`.
+#[allow(clippy::too_many_arguments)] // DrawGlyphRun's own eight parameters
+unsafe fn dgr_os(
+    this: *mut c_void, bx: f32, by: f32, mm: i32, run: *const DWRITE_GLYPH_RUN, rp: *mut c_void, color: u32, bbox: *mut RECT,
+) -> HRESULT {
+    // `dw` owns a reference to the params for the whole call: a profile
+    // reload may replace `DW_RENDERING` meanwhile, and the raw pointer
+    // handed to DirectWrite must not outlive its owner.
+    let dw = dw_rendering();
+    let params = dw.as_ref().map_or(rp, |d| d.dw_params.as_raw());
+    // SAFETY: per the contract above.
+    unsafe {
+        let mut hr = E_FAIL;
+        if dw.as_ref().is_some_and(|d| d.grid_fit_disabled) {
+            if let Some(prev) = nudge_transform(this) {
+                hr = (orig(&ORIG_DGR))(this, bx, by, mm, run, params, color, bbox);
+                set_transform(this, &prev);
+            }
+        }
+        if hr.is_err() {
+            hr = (orig(&ORIG_DGR))(this, bx, by, mm, run, params, color, bbox);
+        }
+        if hr.is_err() {
+            hr = (orig(&ORIG_DGR))(this, bx, by, mm, run, rp, color, bbox);
+        }
+        hr
+    }
+}
+
+/// `IDWriteBitmapRenderTarget::GetCurrentTransform` / `SetCurrentTransform`
+/// (vtable slots 4 and 5).
+type FnGetTransform = unsafe extern "system" fn(*mut c_void, *mut DWRITE_MATRIX) -> HRESULT;
+type FnSetTransform = unsafe extern "system" fn(*mut c_void, *const DWRITE_MATRIX) -> HRESULT;
+
+/// Tilt the render target's transform by 1/65535 (upstream's grid-fit
+/// nudge). Returns the transform to restore, or `None` if it was not changed.
+///
+/// # Safety
+/// `this` must be a live `IDWriteBitmapRenderTarget`.
+unsafe fn nudge_transform(this: *mut c_void) -> Option<DWRITE_MATRIX> {
+    // SAFETY: a live COM object's first word is its vtable; slots 4 and 5 are
+    // Get/SetCurrentTransform, whose signatures the types above name.
+    unsafe {
+        let vtbl = *this.cast::<*const *const ()>();
+        let get = std::mem::transmute::<*const (), FnGetTransform>(*vtbl.add(4));
+        let mut prev = DWRITE_MATRIX::default();
+        get(this, &raw mut prev).ok().ok()?;
+        let mut tilted = prev;
+        tilted.m12 += 1.0 / 65535.0;
+        tilted.m21 += 1.0 / 65535.0;
+        set_transform(this, &tilted).then_some(prev)
+    }
+}
+
+/// # Safety
+/// As `nudge_transform`.
+unsafe fn set_transform(this: *mut c_void, m: &DWRITE_MATRIX) -> bool {
+    // SAFETY: as in `nudge_transform`.
+    unsafe {
+        let vtbl = *this.cast::<*const *const ()>();
+        let set = std::mem::transmute::<*const (), FnSetTransform>(*vtbl.add(5));
+        set(this, m).is_ok()
+    }
 }
 
 // ---- CreateGlyphRunAnalysis → CreateAlphaTexture (Chromium/Skia, VS Code) ----

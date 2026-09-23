@@ -20,7 +20,7 @@
 
 use crate::config::Profile;
 use crate::filter::Tables;
-use crate::ft::{self, Ft, PIXEL_MODE_GRAY, PIXEL_MODE_LCD};
+use crate::ft::{self, Ft, GlyphStyle, PIXEL_MODE_GRAY, PIXEL_MODE_LCD};
 
 /// An RGB pixel buffer.
 pub struct Canvas {
@@ -263,6 +263,138 @@ pub fn glyph_run_coverage_lcd(ft: &Ft, profile: &Profile, glyphs: &[u16], px: i3
         }
     }
     cov
+}
+
+/// A glyph index at a device-pixel origin (where its baseline starts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub gi: u16,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// A pixel rectangle `(left, top, right, bottom)`, right and bottom exclusive.
+pub type Rect = (i32, i32, i32, i32);
+
+fn union(a: Option<Rect>, b: Rect) -> Rect {
+    match a {
+        None => b,
+        Some(a) => (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)),
+    }
+}
+
+/// Where glyph `g` placed at `at` covers, in the same pixel space as `at`.
+/// LCD bitmaps are three bytes per pixel, so their pixel width is a third.
+fn glyph_rect(g: &ft::Glyph, at: &Placed) -> Option<Rect> {
+    if g.rows == 0 || g.buffer.is_empty() {
+        return None;
+    }
+    let w = if g.pixel_mode == PIXEL_MODE_LCD { g.width / 3 } else { g.width };
+    let (l, t) = (at.x + g.left, at.y - g.top);
+    Some((l, t, l + w, t + g.rows))
+}
+
+/// One rasterised glyph, copied out of FreeType's slot so a whole run can be
+/// measured before it is drawn.
+struct OwnedGlyph {
+    at: Placed,
+    left: i32,
+    top: i32,
+    width: i32,
+    rows: i32,
+    pitch: i32,
+    pixel_mode: i32,
+    buffer: Vec<u8>,
+}
+
+impl OwnedGlyph {
+    fn view(&self) -> ft::Glyph<'_> {
+        ft::Glyph {
+            width: self.width, rows: self.rows, pitch: self.pitch, pixel_mode: self.pixel_mode,
+            left: self.left, top: self.top, advance_px: 0, buffer: &self.buffer,
+        }
+    }
+}
+
+/// A run rasterised once: its glyph bitmaps and the union of where they land.
+pub struct RenderedRun {
+    glyphs: Vec<OwnedGlyph>,
+    /// Ink bounds in the glyphs' pixel space; `None` when nothing has ink.
+    pub bounds: Option<Rect>,
+}
+
+/// Rasterise `glyphs` with `profile` in `style`.
+pub fn render_placed(ft: &Ft, profile: &Profile, glyphs: &[Placed], style: &GlyphStyle) -> RenderedRun {
+    ft.prepare(profile);
+    let mut out = RenderedRun { glyphs: Vec::with_capacity(glyphs.len()), bounds: None };
+    for at in glyphs {
+        let Some(g) = ft.render_glyph_styled(at.gi, style, profile) else { continue };
+        let Some(r) = glyph_rect(&g, at) else { continue };
+        out.bounds = Some(union(out.bounds, r));
+        out.glyphs.push(OwnedGlyph {
+            at: *at, left: g.left, top: g.top, width: g.width, rows: g.rows, pitch: g.pitch,
+            pixel_mode: g.pixel_mode, buffer: g.buffer.to_vec(),
+        });
+    }
+    out
+}
+
+impl RenderedRun {
+    /// Composite the run over `canvas`, whose top-left pixel sits at `origin`
+    /// in the glyphs' pixel space. `profile` must be the one it was rendered
+    /// with (it picks the greyscale or LCD blend and the subpixel order).
+    pub fn draw_onto(&self, canvas: &mut Canvas, origin: (i32, i32), tables: &Tables, profile: &Profile, ink: Ink) {
+        let (lcd, bgr) = (profile.aa.is_lcd(), ft::is_bgr(profile.aa));
+        for g in &self.glyphs {
+            let blit = Blit { tables, ink, pen_x: g.at.x - origin.0, base_y: g.at.y - origin.1, lcd, bgr };
+            blit_glyph(canvas, &blit, &g.view());
+        }
+    }
+
+    /// Raw coverage inside `rect` (the glyphs' pixel space), **no blend**,
+    /// for a caller that composites it itself (DirectWrite's
+    /// `CreateAlphaTexture`). `channels` is 3 for a ClearType 3x1 texture
+    /// (R, G, B per pixel in panel order; a greyscale glyph fills all three)
+    /// or 1 for an aliased 1x1 texture (LCD glyphs are averaged). `bgr` is
+    /// the profile's subpixel order. Overlapping glyphs keep the max.
+    pub fn coverage(&self, rect: Rect, channels: usize, bgr: bool) -> Vec<u8> {
+        let (w, h) = ((rect.2 - rect.0).max(0) as usize, (rect.3 - rect.1).max(0) as usize);
+        let mut cov = vec![0u8; w * h * channels];
+        for g in &self.glyphs {
+            let lcd = g.pixel_mode == PIXEL_MODE_LCD;
+            let gw = if lcd { g.width / 3 } else { g.width };
+            let (gl, gt) = (g.at.x + g.left, g.at.y - g.top);
+            for row in 0..g.rows {
+                let y = gt + row - rect.1;
+                if y < 0 || y as usize >= h {
+                    continue;
+                }
+                for col in 0..gw {
+                    let x = gl + col - rect.0;
+                    if x < 0 || x as usize >= w {
+                        continue;
+                    }
+                    let src = (row * g.pitch) as usize + if lcd { (col * 3) as usize } else { col as usize };
+                    let px = if lcd {
+                        let (a, b, c) = (g.buffer[src], g.buffer[src + 1], g.buffer[src + 2]);
+                        if bgr { [c, b, a] } else { [a, b, c] }
+                    } else {
+                        [g.buffer[src]; 3]
+                    };
+                    let o = (y as usize * w + x as usize) * channels;
+                    if channels == 3 {
+                        for k in 0..3 {
+                            cov[o + k] = cov[o + k].max(px[k]);
+                        }
+                    } else {
+                        let v = if lcd { ((u16::from(px[0]) + u16::from(px[1]) + u16::from(px[2])) / 3) as u8 } else { px[0] };
+                        cov[o] = cov[o].max(v);
+                    }
+                }
+            }
+        }
+        cov
+    }
 }
 
 /// Where and how to composite a glyph: the profile's tables, the ink, the pen

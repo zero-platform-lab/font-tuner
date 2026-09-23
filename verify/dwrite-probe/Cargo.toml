@@ -1,0 +1,30 @@
+# Measurement harness for the DirectWrite path: draws a glyph run through
+# `IDWriteBitmapRenderTarget::DrawGlyphRun` and reports what came back, so the
+# port can be compared against plain DirectWrite the way the GDI probes compare
+# against plain GDI.
+#
+# Its own workspace: never built by the shipped `cargo build` or build-msi.ps1.
+[workspace]
+
+[package]
+name = "dwrite-probe"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+]
+
+[dependencies]
+windows-core = "0.62"
+
+[profile.release]
+opt-level = "s"

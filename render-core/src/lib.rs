@@ -20,7 +20,8 @@ pub mod render;
 pub use config::{Aa, Profile};
 pub use filter::Tables;
 pub use ft::Ft;
-pub use render::{Canvas, Ink};
+pub use ft::GlyphStyle;
+pub use render::{Canvas, Ink, Placed, Rect, RenderedRun};
 
 /// Build the blend tables for a profile.
 pub fn tables_for(p: &Profile) -> Tables {

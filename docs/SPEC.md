@@ -58,7 +58,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | `ExtTextOutW` の横取り（`gdi.rs`） | `GetTextMetricsW`、`GetTextExtentPoint32W` / `GetTextExtentPointI`、`GetTextColor` / `GetTextAlign` / `GetBkColor`、`GetCurrentObject` + `GetObjectW`（`LOGFONTW`）、`GetFontData` | 引数の `hdc`・`text`（`count` 要素）・`dx`（非 null なら `count` 要素）・`lprect` は呼び出し元の契約どおり | 測れないラン（`GetTextExtent` 失敗、`cx <= 0`）と読めないフォント（`GetFontData` 失敗）は元の `ExtTextOutW`（トランポリン）に落とす。オフスクリーン DIB（`dib.rs`: `CreateDIBSection` + `BitBlt` の往復）に描き、`ETO_OPAQUE` / `ETO_CLIPPED` / 背景モードは DIB 側で再現する（下記） |
 | 再入 | `thread_local! IN_DETOUR: Cell<bool>` | 自分の GDI 呼び出しが自分の detour に入ることがある | スレッドごとにガードする。プロセス全体のフラグにすると、あるスレッドの描画中に他スレッドが未調整の GDI に落ちて窓ごとに見た目が違う |
 | 描画状態 | `static RENDER: Mutex<Option<RenderState>>`（`Ft` + `Tables` + `Profile` + 現在のフォント鍵） | — | 1 プロセスに FreeType ライブラリと面は 1 つ。描画はロックの下で直列。プロファイル再読み込みも同じロック |
-| DirectWrite（`dwrite.rs`） | `IDWriteBitmapRenderTarget::DrawGlyphRun`、`IDWriteFactory{,2,3}::CreateGlyphRunAnalysis` の vtable スロット | `windows` クレートの vtable 定義とスロット番号が一致すること（照合済み） | 一度きりのパッチはミューテックスで直列化。`IDWriteFontFace` の bytes + index で面を開き、その COM オブジェクトを `RenderState` が clone で保持してアドレスの再利用を防ぐ |
+| DirectWrite（`dwrite.rs`、`layout.rs`） | `IDWriteBitmapRenderTarget::DrawGlyphRun`、`IDWriteFactory{,2,3}::CreateGlyphRunAnalysis` の vtable スロット | `windows` クレートの vtable 定義とスロット番号が一致すること（照合済み）。ランの配列は `glyphCount` 要素（null の `glyphAdvances` / `glyphOffsets` は読まない） | 一度きりのパッチはミューテックスで直列化。`IDWriteFontFace` の bytes + index で面を開き、その COM オブジェクトを `RenderState` が clone で保持してアドレスの再利用を防ぐ。OS に描かせるときの params は、呼び出しの間 clone を持ち続ける（プロファイルの再読み込みで解放されないように） |
 | Direct2D（`d2d.rs`） | `D2D1CreateFactory` / `D2D1CreateDevice` / `D2D1CreateDeviceContext` と各ターゲットの vtable スロット 12 / 29 / 82 / 34 / 36 | 同上 | (vtable, slot) → 元関数のマップ `SLOT_ORIG` を 1 つのミューテックスで管理。`GetDC` を貸せないターゲットは OS に描かせる |
 | 自己常駐固定 | `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN)` | — | `DllMain(DLL_PROCESS_ATTACH)` で最初に行う。以降 `FreeLibrary` は no-op |
 | ログ | `%TEMP%\render-inject.log` に追記 | — | ロック付き。初回の描画結果を `render-inject-capture.png` に保存する（検証用） |
@@ -78,6 +78,21 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 写像は `LPtoDP` に 3 点通して復元する。gdi32 の未公開 export `GetTransform` は使わない（両者が一致することは実測で確認した）。線形部だけを見て、平行移動は見ない。正の軸平行スケール（`m12 == m21 == 0`、`m11 > 0`、`m22 > 0`）なら倍率を掛けて描き直し、回転・せん断・鏡像・退化した写像は素の `ExtTextOutW` に委ねる。upstream も同じ判断（`override.cpp` 1200-1217。その下の `GetMapMode` / `GetWorldTransform` を見るブロックはコメントアウトされた旧実装）。
 
 換算するもの: 原点（`LPtoDP`、平行移動込み）、アセント・ディセント・高さ・`em_px`（`sy` 倍）、幅と字間（`sx` 倍）、`ETO_OPAQUE` / `ETO_CLIPPED` の矩形、そして `lpDx`。`lpDx` は累積位置ベースで換算し、要素ごとに丸めて誤差を溜めない（upstream の `TransformlpDx` と同じ）。`TA_UPDATECP` の現在位置だけは論理単位なので、GDI の論理実測幅で進める。
+
+**DirectWrite のラン配置** — `IDWriteBitmapRenderTarget::DrawGlyphRun` はランを render-core で描く。グリフごとの位置は DirectWrite と同じ規則で決める（`layout.rs`）。規則はどれも素の DirectWrite と `verify/dwrite-probe` で突き合わせて確かめた。
+
+* ペンはベースライン原点から `glyphAdvances` ずつ進む。null ならフォント自身のアドバンスで進む。natural の計測モードはデザインメトリクス、GDI の計測モードは `GetGdiCompatibleGlyphMetrics` を使う。
+* `advanceOffset` は読む方向へ、`ascenderOffset` は上へずらす。
+* `bidiLevel` が奇数なら右から左へ進む。グリフは、ランのアドバンスではなく**そのグリフ自身のアドバンス**で右端をペンに合わせる。そのあとペンをランのアドバンスだけ左へ送る。正の `advanceOffset` は左へずらす（実測: 12 DIP 送りの "AVATo" で、インクの右端は原点の 1px 左）。
+* `isSideways` は各グリフを反時計回りに 90° 回し、縦のメトリクスで進める。縦の原点 `(advanceWidth / 2, verticalOriginY)` をペンに置くので、グリフはベースラインを中心に上下へ振り分けられる。
+* デバイスピクセル = pixelsPerDip ×（BRT の変換 × DIP 座標）。平行移動も DIP 単位。一様な正の拡大と平行移動だけを自前で扱う。回転・せん断・鏡像・縦横で違う拡大は DirectWrite に描かせる（下記）。
+* em サイズは 26.6 固定小数点で FreeType に渡す（`FT_Set_Char_Size`）。13.5 DIP のような小数の大きさも丸めない。
+* フォントの合成（`GetSimulations`）も再現する。斜体は横方向に 1/3 傾ける。太字は横に em/40、縦に em/60 太らせる（実測: Yu Gothic UI の "l" で、em 120 のとき傾き 29px / 高さ 89px、太字で幅 +3px・高さ +2px）。
+* `blackBoxRect` には描いたインクの矩形を返す（ビットマップの外へ出た分も含め、切り詰めない）。インクが無いランはベースライン原点の空矩形を返す。DirectWrite と同じ。
+
+実測（`verify/dwrite-probe`、Yu Gothic UI・24 DIP の 25 ケース）: インクの上下左右の端はすべて素の DirectWrite と 1px 以内に収まった。残る 1px は FreeType のヒンティングによる字形の差。0.1.10 までは advances・offsets・RTL・縦書き・pixelsPerDip・変換・合成をすべて無視していた。どのケースも同じ位置に同じ大きさで描いたうえ、`blackBoxRect` を書かずに S_OK を返していた（呼び出し側が再描画範囲を失う）。
+
+自前で描けないラン（上記の変換、フォントファイルを読めない、プロファイルが無い）は DirectWrite に描かせる。そのときは upstream の `IMPL_BitmapRenderTarget_DrawGlyphRun` と同じく、アプリの rendering params の代わりにプロファイルの `[DirectWrite]` の params を渡す。`HintingMode=1` なら 1/65535 の変換ずらしも加える。DirectWrite が拒めば、ずらしなし、次にアプリの params のままで呼び直す。
 
 `BitBlt` も論理座標を取るので、DIB の出し入れの前後で DC を `SaveDC` → `MM_TEXT` + `GM_COMPATIBLE` + 恒等変換 → `RestoreDC` に挟む。0.1.8 まではこれをしておらず、写像のかかった DC では位置と大きさだけ `BitBlt` の引き伸ばしで偶然合い、**調整したグリフが最近傍拡大で潰れていた**（実測: 2 倍の DC で出力の 2×2 ブロックが一様 96 / 混在 0。素の GDI は同条件で混在 105）。素の GDI より悪い状態だった。
 
@@ -103,7 +118,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 | `[General] Contrast` | カバレッジ曲線の指数（2.4） | 1.0 |
 | `[General] RenderWeight` | カバレッジ曲線の重み（2.4） | 1.0 |
 | `[General] NormalWeight` | アウトラインの太字化（26.6 固定小数。64 = 1px） | 0 |
-| `[DirectWrite] GammaValue` `Contrast` `ClearTypeLevel` `RenderingMode` | 自前でラスタライズできない Direct2D 描画に渡す `IDWriteRenderingParams`（1.2） | 2.5 |
+| `[DirectWrite] GammaValue` `Contrast` `ClearTypeLevel` `RenderingMode` | 自前でラスタライズできず OS に描かせる DirectWrite / Direct2D の描画に渡す `IDWriteRenderingParams`（1.2） | 2.5 |
 | `[Experimental] ClipBoxFix` | `GetGlyphOutline` のメトリクス補正（2.5） | 1 |
 
 ini が読めないときは組み込みの Clean Greyscale（`Profile::clean_greyscale`、出荷 ini と同じ値）に落ちる。
@@ -172,7 +187,7 @@ upstream はこれを固定小数点の整数で計算し、最後の段で切�
 
 ### 2.5 DirectWrite 節と ClipBoxFix
 
-`[DirectWrite]`（`GammaValue`・`Contrast`・`ClearTypeLevel`・`RenderingMode`）は、自前でラスタライズできないテキストに対して Direct2D へ指定する値（1.2）。既定は upstream に従う: gamma は一般の gamma から導出（`g² > 1.3 ? g²/2 : 0.7`）、contrast 1.0、ClearType level 1.0、mode 5。`GammaValue` が 0（グレースケール系プロファイルの出荷値）のときは「上書きしない」の意味で、導出 gamma にフォールバックする（DirectWrite は gamma > 0 を要求するため）。出荷プロファイルは全て `RenderingMode=2`（GDI_CLASSIC）で、GDI と DirectWrite のテキストを一致させる。
+`[DirectWrite]`（`GammaValue`・`Contrast`・`ClearTypeLevel`・`RenderingMode`）は、自前でラスタライズできないテキストに対して DirectWrite / Direct2D へ指定する値（1.2）。upstream と同じく 2 組作る。Direct2D 用は `RenderingMode` をそのまま渡す。DirectWrite 用は 6（アウトライン）を 5（natural symmetric）に読み替える（upstream `GetDWParams` の「DW rendering in mode6 is horrible」）。既定は upstream に従う: gamma は一般の gamma から導出（`g² > 1.3 ? g²/2 : 0.7`）、contrast 1.0、ClearType level 1.0、mode 5。`GammaValue` が 0（グレースケール系プロファイルの出荷値）のときは「上書きしない」の意味で、導出 gamma にフォールバックする（DirectWrite は gamma > 0 を要求するため）。出荷プロファイルは全て `RenderingMode=2`（GDI_CLASSIC）で、GDI と DirectWrite のテキストを一致させる。
 
 `[Experimental] ClipBoxFix`（既定 1）は、メトリクスのみの問い合わせで `GetGlyphOutline` が返すメトリクスを補正する。原点を `floor(1.5·DPI/96)` px 上げ、黒箱を同じだけ広げ、どちらもフォントの ascent/height で頭打ちにする。これで、そのメトリクスにグリフをクリップするアプリ（Java2D）が、太めに描かれたグリフを切り落とさない。
 

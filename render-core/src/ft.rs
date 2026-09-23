@@ -151,6 +151,8 @@ mod sys {
         pub fn FT_Done_Face(face: FT_Face) -> c_int;
         pub fn FT_Select_Charmap(face: FT_Face, encoding: c_uint) -> c_int;
         pub fn FT_Set_Pixel_Sizes(face: FT_Face, pixel_width: c_uint, pixel_height: c_uint) -> c_int;
+        pub fn FT_Set_Char_Size(face: FT_Face, char_width: c_long, char_height: c_long, horz_resolution: c_uint, vert_resolution: c_uint) -> c_int;
+        pub fn FT_Set_Transform(face: FT_Face, matrix: *mut FT_Matrix, delta: *mut FT_Vector);
         pub fn FT_Load_Glyph(face: FT_Face, glyph_index: c_uint, load_flags: i32) -> c_int;
         pub fn FT_Get_Char_Index(face: FT_Face, charcode: c_ulong) -> c_uint;
         pub fn FT_Outline_EmboldenXY(outline: *mut FT_Outline, xstrength: c_long, ystrength: c_long) -> c_int;
@@ -158,6 +160,16 @@ mod sys {
         pub fn FT_Library_SetLcdFilter(library: FT_Library, filter: c_uint) -> c_int;
         pub fn FT_Get_Sfnt_Name_Count(face: FT_Face) -> c_uint;
         pub fn FT_Get_Sfnt_Name(face: FT_Face, idx: c_uint, aname: *mut FT_SfntName) -> c_int;
+    }
+
+    /// `FT_Matrix` (fttypes.h): 16.16 fixed-point 2x2, applied as
+    /// `x' = xx*x + xy*y`, `y' = yx*x + yy*y` in FreeType's y-up space.
+    #[repr(C)]
+    pub struct FT_Matrix {
+        pub xx: c_long,
+        pub xy: c_long,
+        pub yx: c_long,
+        pub yy: c_long,
     }
 
     /// `FT_SfntName` (ftsnames.h): one entry of the OpenType `name` table.
@@ -176,7 +188,7 @@ use sys::{
     FT_Done_Face, FT_Done_FreeType, FT_Face, FT_Get_Char_Index, FT_Get_Sfnt_Name, FT_Get_Sfnt_Name_Count, FT_Init_FreeType, FT_Library,
     FT_Library_SetLcdFilter, FT_SfntName,
     FT_Load_Glyph, FT_New_Face, FT_New_Memory_Face, FT_Outline_EmboldenXY, FT_Render_Glyph, FT_Select_Charmap,
-    FT_Set_Pixel_Sizes, FT_ENCODING_UNICODE, FT_GLYPH_FORMAT_OUTLINE,
+    FT_Set_Pixel_Sizes, FT_Set_Char_Size, FT_Set_Transform, FT_Matrix, FT_ENCODING_UNICODE, FT_GLYPH_FORMAT_OUTLINE,
 };
 
 // FreeType constants (stable public ABI).
@@ -193,6 +205,36 @@ const FT_RENDER_MODE_LCD: i32 = 3;
 pub const PIXEL_MODE_GRAY: i32 = 2;
 /// FreeType `FT_PIXEL_MODE_LCD`.
 pub const PIXEL_MODE_LCD: i32 = 5;
+
+/// What a DirectWrite glyph run asks of a glyph beyond its index: a
+/// fractional em size, a sideways rotation and DirectWrite's synthetic styles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlyphStyle {
+    /// Em size in 1/64 pixel (26.6).
+    pub size_26_6: i64,
+    /// `isSideways`: the glyph is turned 90 degrees counter-clockwise.
+    pub sideways: bool,
+    /// `DWRITE_FONT_SIMULATIONS_BOLD`.
+    pub bold: bool,
+    /// `DWRITE_FONT_SIMULATIONS_OBLIQUE`.
+    pub oblique: bool,
+}
+
+impl GlyphStyle {
+    /// A plain glyph at `size_26_6`.
+    pub fn at(size_26_6: i64) -> GlyphStyle {
+        GlyphStyle { size_26_6, sideways: false, bold: false, oblique: false }
+    }
+}
+
+/// Horizontal shear of DirectWrite's oblique simulation, as `x += y * 1/3`.
+/// Measured against DirectWrite (verify/dwrite-probe, Yu Gothic UI "l"):
+/// 29px of lean over 89px of stem at em 120, 15 over 44 at em 60.
+const OBLIQUE_SHEAR_16_16: c_long = 0x1_0000 / 3;
+/// DirectWrite's bold simulation widens by about em/40 and heightens by about
+/// em/60 (measured the same way: +3 / +2 px at em 120, +2 / +1 at em 60).
+const BOLD_X_DIV: i64 = 40;
+const BOLD_Y_DIV: i64 = 60;
 
 /// A rendered glyph: coverage bitmap plus placement.
 pub struct Glyph<'a> {
@@ -405,18 +447,61 @@ impl Ft {
         self.emit(gi as c_uint, px, p)
     }
 
+    /// Render glyph `gi` the way a DirectWrite run asks for it: at a
+    /// fractional size, turned sideways and/or with the synthetic styles.
+    /// The transform is reset afterwards, so `render`/`render_glyph` are
+    /// unaffected.
+    pub fn render_glyph_styled(&self, gi: u16, style: &GlyphStyle, p: &Profile) -> Option<Glyph<'_>> {
+        let face = self.face.get();
+        if face.is_null() || style.size_26_6 <= 0 { return None; }
+        // Shear first (the oblique lean is in the glyph's own frame), then
+        // the quarter turn: rotate(90 ccw) * shear.
+        let (mut xx, mut xy, mut yx, mut yy): (c_long, c_long, c_long, c_long) =
+            (0x1_0000, if style.oblique { OBLIQUE_SHEAR_16_16 } else { 0 }, 0, 0x1_0000);
+        if style.sideways {
+            (xx, xy, yx, yy) = (-yx, -yy, xx, xy);
+        }
+        let mut m = FT_Matrix { xx, xy, yx, yy };
+        let mut identity = FT_Matrix { xx: 0x1_0000, xy: 0, yx: 0, yy: 0x1_0000 };
+        let bold = style.bold.then_some((style.size_26_6 / BOLD_X_DIV, style.size_26_6 / BOLD_Y_DIV));
+        // SAFETY: `face` is live; the matrix pointers are valid for the calls
+        // and FreeType copies them.
+        unsafe {
+            if FT_Set_Char_Size(face, 0, style.size_26_6 as c_long, 72, 72) != 0 { return None; }
+            FT_Set_Transform(face, &raw mut m, std::ptr::null_mut());
+        }
+        let g = self.load_render(gi as c_uint, p, bold);
+        // SAFETY: as above.
+        unsafe { FT_Set_Transform(face, &raw mut identity, std::ptr::null_mut()); }
+        g
+    }
+
     /// Load + render glyph `gi` into the face's slot and wrap the bitmap.
     fn emit(&self, gi: c_uint, px: i32, p: &Profile) -> Option<Glyph<'_>> {
+        let face = self.face.get();
+        if face.is_null() { return None; }
+        // SAFETY: face is a live FT_Face from FreeType.
+        if unsafe { FT_Set_Pixel_Sizes(face, 0, px as c_uint) } != 0 { return None; }
+        self.load_render(gi, p, None)
+    }
+
+    /// Load + render `gi` at the face's current size and transform. `bold` is
+    /// DirectWrite's synthetic emboldening (x, y strength in 26.6), applied
+    /// on top of the profile's own.
+    fn load_render(&self, gi: c_uint, p: &Profile, bold: Option<(i64, i64)>) -> Option<Glyph<'_>> {
         let face = self.face.get();
         if face.is_null() { return None; }
         let (flags, render_mode) = Self::flags(p);
         // SAFETY: face is a live FT_Face from FreeType; slot is owned by it.
         unsafe {
-            if FT_Set_Pixel_Sizes(face, 0, px as c_uint) != 0 { return None; }
             if FT_Load_Glyph(face, gi, flags) != 0 { return None; }
             let slot = (*face).glyph;
-            if (*slot).format == FT_GLYPH_FORMAT_OUTLINE && p.embolden != 0 {
-                FT_Outline_EmboldenXY(&raw mut (*slot).outline, p.embolden as c_long, p.embolden as c_long);
+            if (*slot).format == FT_GLYPH_FORMAT_OUTLINE {
+                let (bx, by) = bold.unwrap_or((0, 0));
+                let (ex, ey) = (p.embolden as i64 + bx, p.embolden as i64 + by);
+                if ex != 0 || ey != 0 {
+                    FT_Outline_EmboldenXY(&raw mut (*slot).outline, ex as c_long, ey as c_long);
+                }
             }
             if FT_Render_Glyph(slot, render_mode as c_uint) != 0 { return None; }
             let s = &*slot;

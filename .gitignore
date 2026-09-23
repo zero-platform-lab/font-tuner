@@ -1,4 +1,5 @@
 /target
+/verify/*/target/
 /build/lib/
 /build/stage/
 /build/pkg/
