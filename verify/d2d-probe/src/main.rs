@@ -12,6 +12,10 @@
 //!
 //! Keep the tray stopped (AGENTS.md: verify with the tray off). A second
 //! argument writes each case's bitmap as `<dir>/<case>.bmp`.
+//!
+//! With `D2D_TARGET=dxgi` the target is instead a Direct2D device context
+//! on a Direct3D 11 texture (the DXGI-surface setup WinUI / composition apps
+//! use), read back through a staging texture.
 
 use core::ffi::c_void;
 
@@ -38,6 +42,16 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HDC,
 };
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Graphics::Direct2D::{D2D1CreateDeviceContext, ID2D1DeviceContext};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows::Win32::Graphics::Dxgi::IDXGISurface;
 use windows_numerics::{Matrix3x2, Vector2};
 
 const W: i32 = 480;
@@ -96,15 +110,23 @@ fn main() -> windows::core::Result<()> {
         let mut bits: *mut c_void = std::ptr::null_mut();
         let dib = CreateDIBSection(Some(hdc), &raw const bmi, DIB_RGB_COLORS, &raw mut bits, None, 0)?;
         SelectObject(hdc, dib.into());
-        let pixels = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (W * H * 4) as usize);
+        let dib_pixels = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (W * H * 4) as usize);
+        let mut dxgi_pixels = vec![0u8; (W * H * 4) as usize];
 
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
-            ..Default::default()
+        let dxgi = std::env::var("D2D_TARGET").is_ok_and(|v| v == "dxgi");
+        let (rt, readback) = if dxgi {
+            let (rt, rb) = dxgi_target()?;
+            println!("target: device context on a D3D11 texture");
+            (rt, Some(rb))
+        } else {
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
+                ..Default::default()
+            };
+            let dcrt: ID2D1DCRenderTarget = factory.CreateDCRenderTarget(&raw const props)?;
+            dcrt.BindDC(hdc, &RECT { left: 0, top: 0, right: W, bottom: H })?;
+            (dcrt.cast()?, None)
         };
-        let dcrt: ID2D1DCRenderTarget = factory.CreateDCRenderTarget(&raw const props)?;
-        dcrt.BindDC(hdc, &RECT { left: 0, top: 0, right: W, bottom: H })?;
-        let rt: ID2D1RenderTarget = dcrt.cast()?;
         let ctx = Ctx { rt, dw, face, format };
 
         for (name, draw) in cases() {
@@ -116,6 +138,13 @@ fn main() -> windows::core::Result<()> {
             let r = draw(&ctx);
             let e = ctx.rt.EndDraw(None, None);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let pixels: &[u8] = match &readback {
+                Some(rb) => {
+                    rb.read(&mut dxgi_pixels);
+                    &dxgi_pixels
+                }
+                None => dib_pixels,
+            };
             println!("{:<22} {} {} {ms:.1}ms", name, if r.is_ok() && e.is_ok() { "ok " } else { "ERR" }, ink(pixels));
             if let Some(dir) = &dump {
                 save_bmp(pixels, &format!("{dir}\\{}.bmp", name.replace(' ', "_")));
@@ -124,6 +153,74 @@ fn main() -> windows::core::Result<()> {
         let _ = hdc;
     }
     Ok(())
+}
+
+/// A D3D11 texture, its staging copy, and the context that copies between them.
+struct Readback {
+    ctx: ID3D11DeviceContext,
+    tex: ID3D11Texture2D,
+    staging: ID3D11Texture2D,
+}
+
+impl Readback {
+    /// Copy the texture into `out` as top-down BGRA rows of `W` pixels.
+    fn read(&self, out: &mut [u8]) {
+        // SAFETY: D3D11 calls on live objects; the mapped rows are read within
+        // the map, each `RowPitch` bytes apart and at least `W * 4` long.
+        unsafe {
+            self.ctx.CopyResource(&self.staging, &self.tex);
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            if self.ctx.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&raw mut m)).is_err() {
+                return;
+            }
+            let row = (W * 4) as usize;
+            for y in 0..H as usize {
+                let src = std::slice::from_raw_parts(m.pData.cast::<u8>().add(y * m.RowPitch as usize), row);
+                out[y * row..(y + 1) * row].copy_from_slice(src);
+            }
+            self.ctx.Unmap(&self.staging, 0);
+        }
+    }
+}
+
+/// A Direct2D device context on a `W`x`H` BGRA D3D11 texture (hardware, else
+/// WARP), and a way to read the texture back.
+unsafe fn dxgi_target() -> windows::core::Result<(ID2D1RenderTarget, Readback)> {
+    unsafe {
+        let (mut dev, mut ctx) = (None, None);
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        if D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, Some(&mut ctx))
+            .is_err()
+        {
+            D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, Some(&mut ctx))?;
+        }
+        let (dev, ctx) = (dev.expect("device"), ctx.expect("context"));
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: W as u32,
+            Height: H as u32,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        let mut tex = None;
+        dev.CreateTexture2D(&raw const desc, None, Some(&mut tex))?;
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            ..desc
+        };
+        let mut staging = None;
+        dev.CreateTexture2D(&raw const staging_desc, None, Some(&mut staging))?;
+        let tex = tex.expect("texture");
+        let surface: IDXGISurface = tex.cast()?;
+        let dc: ID2D1DeviceContext = D2D1CreateDeviceContext(&surface, None)?;
+        Ok((dc.cast()?, Readback { ctx, tex, staging: staging.expect("staging") }))
+    }
 }
 
 fn cases() -> Vec<(&'static str, Draw)> {

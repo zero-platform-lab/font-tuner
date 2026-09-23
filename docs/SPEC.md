@@ -125,7 +125,7 @@ font-tuner.exe ──(SetWindowsHookExW WH_GETMESSAGE, グローバル)──▶
 * `ENABLE_COLOR_FONT` でカラーグリフを含むレイアウト（カラーの層に分けるのは Direct2D 自身のレイアウト描画だけ）
 * フォントファイルを読めないラン
 
-実測（`verify/d2d-probe`、DC 用の描画先、25 ケース）: インクの端はすべて素の Direct2D と 1px 以内。クリップ・グラデーション・半透明のブラシ・不透明度 50% のレイヤー・範囲ごとの色・下線と取り消し線・右から左の段落・折り返し・`CLIP` 付きのレイアウト・カラー絵文字が素の Direct2D と揃った。Notepad++ 8.9.8（Scintilla の DirectWrite モードと DirectWrite DC モード）でも自前で描かれ、見た目がコアの GDI 経路と揃った。
+実測（`verify/d2d-probe`、25 ケース）: DC 用の描画先と、Direct3D 11 のテクスチャ（DXGI サーフェス）上のデバイスコンテキスト（`D2D_TARGET=dxgi`。WinUI / コンポジション系の描画先の作り方）の両方で、インクの端はすべて素の Direct2D と 1px 以内。クリップ・グラデーション・半透明のブラシ・不透明度 50% のレイヤー・範囲ごとの色・下線と取り消し線・右から左の段落・折り返し・`CLIP` 付きのレイアウト・カラー絵文字が素の Direct2D と揃った。Notepad++ 8.9.8（Scintilla の DirectWrite モードと DirectWrite DC モード）でも自前で描かれ、見た目がコアの GDI 経路と揃った。
 
 速さは次の「フォントとグリフのキャッシュ」を参照。
 
